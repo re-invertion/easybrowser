@@ -2,6 +2,7 @@
 ## Non negotiable principles:
 - No ads, no tracking, no telemetry.
 - No unnecessary features, no bloat.
+- 
 - Every string is in Polish!
 - Always use the `Atkinson Hyperlegible` font across the whole interface.
 

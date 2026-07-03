@@ -4,20 +4,27 @@
 :root {
   font-family: "Atkinson Hyperlegible", sans-serif;
   color: #111827;
-  background: #f8fafc;
+  background: transparent;
 }
 
 body {
   margin: 0;
   min-width: 320px;
-  min-height: 100vh;
-  background:
-    radial-gradient(circle at top left, rgba(255, 255, 255, 0.92), transparent 34%),
-    linear-gradient(180deg, #f8fafc 0%, #eef3f9 100%);
+  height: 100vh;
+  overflow: hidden;
+  background: transparent;
 }
 
 #root {
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
+  background: transparent;
+}
+
+.app-shell {
+  background:
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.92), transparent 34%),
+    linear-gradient(180deg, #f8fafc 0%, #eef3f9 100%);
 }
 
 .font-google {
@@ -38,4 +45,70 @@ body {
 .focus-ring:focus-visible {
   outline: 3px solid #fbbf24;
   outline-offset: 2px;
+}
+
+.app-drag-region {
+  -webkit-app-region: drag;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.app-drag-handle {
+  -webkit-app-region: drag;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grab;
+}
+
+.app-drag-handle:active {
+  cursor: grabbing;
+}
+
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.window-control-button {
+  display: flex;
+  height: 2rem;
+  width: 2rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  color: #64748b;
+  cursor: pointer;
+  transition:
+    background-color 160ms ease,
+    color 160ms ease;
+}
+
+.window-control-button:hover {
+  background: #f1f5f9;
+  color: #111827;
+}
+
+.window-control-button:focus-visible {
+  outline: 3px solid #fbbf24;
+  outline-offset: 2px;
+}
+
+.window-control-button-close:hover {
+  background: #ef4444;
+  color: #ffffff;
+}
+
+.window-control-line {
+  display: block;
+  height: 2px;
+  width: 0.75rem;
+  border-radius: 9999px;
+  background: currentColor;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
 }
