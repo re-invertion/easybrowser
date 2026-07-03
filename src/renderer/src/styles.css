@@ -53,14 +53,14 @@ body {
   -webkit-user-select: none;
 }
 
-.app-drag-handle {
+.app-drag-surface {
   -webkit-app-region: drag;
   user-select: none;
   -webkit-user-select: none;
   cursor: grab;
 }
 
-.app-drag-handle:active {
+.app-drag-surface:active {
   cursor: grabbing;
 }
 

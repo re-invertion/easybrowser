@@ -12,9 +12,26 @@ declare global {
     error: string | null
   }
 
+  type UserProfile = {
+    id: string
+    initials: string
+    name: string
+    description: string
+    createdAt: string
+  }
+
+  type UserState = {
+    users: UserProfile[]
+    activeUserId: string | null
+  }
+
   interface Window {
     easybrowser: {
       version: string
+      getUserState: () => Promise<UserState>
+      selectUser: (userId: string) => Promise<UserState>
+      clearActiveUser: () => Promise<UserState>
+      createUser: (name: string) => Promise<UserState>
       navigate: (value: string) => Promise<void>
       goHome: () => Promise<void>
       goBack: () => Promise<void>

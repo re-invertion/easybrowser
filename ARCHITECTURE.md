@@ -2,7 +2,6 @@
 ## Non negotiable principles:
 - No ads, no tracking, no telemetry.
 - No unnecessary features, no bloat.
-- 
 - Every string is in Polish!
 - Always use the `Atkinson Hyperlegible` font across the whole interface.
 
@@ -33,3 +32,4 @@ The goal is to create a simple and very secure browser for eldery and non techni
 - Reserve the primary blue for the main action on each screen.
 - Ensure keyboard focus is always visible with the amber focus ring.
 - Do not introduce alternate decorative UI fonts. Use `Atkinson Hyperlegible` consistently for headings, labels, inputs, and buttons.
+- Avoid any unnecessary texts or labels. Use clear and concise language. 

@@ -11,8 +11,28 @@ type BrowserState = {
   error: string | null
 }
 
+type UserProfile = {
+  id: string
+  initials: string
+  name: string
+  description: string
+  createdAt: string
+}
+
+type UserState = {
+  users: UserProfile[]
+  activeUserId: string | null
+}
+
 contextBridge.exposeInMainWorld('easybrowser', {
   version: '1.0.0',
+  getUserState: () => ipcRenderer.invoke('users:get-state') as Promise<UserState>,
+  selectUser: (userId: string) =>
+    ipcRenderer.invoke('users:select', userId) as Promise<UserState>,
+  clearActiveUser: () =>
+    ipcRenderer.invoke('users:clear-active') as Promise<UserState>,
+  createUser: (name: string) =>
+    ipcRenderer.invoke('users:create', name) as Promise<UserState>,
   navigate: (value: string) => ipcRenderer.invoke('browser:navigate', value),
   goHome: () => ipcRenderer.invoke('browser:home'),
   goBack: () => ipcRenderer.invoke('browser:back'),
