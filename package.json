@@ -1,0 +1,33 @@
+{
+  "name": "easybrowser",
+  "version": "1.0.0",
+  "description": "Simple, secure, AI-powered browser for elderly and non-technical people.",
+  "main": "./out/main/index.js",
+  "author": "re-invertion",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "dev": "sh -c 'unset ELECTRON_RUN_AS_NODE DISPLAY; export XDG_SESSION_TYPE=wayland ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_LOGGING=1; if [ -d /mnt/wslg/runtime-dir ]; then export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir; export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}; fi; exec electron-vite dev -- --enable-features=UseOzonePlatform --ozone-platform=wayland'",
+    "dev:xvfb": "env -u ELECTRON_RUN_AS_NODE xvfb-run -a ./node_modules/.bin/electron-vite dev",
+    "build": "tsc --noEmit && electron-vite build",
+    "preview": "sh -c 'unset ELECTRON_RUN_AS_NODE DISPLAY; export XDG_SESSION_TYPE=wayland ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_LOGGING=1; if [ -d /mnt/wslg/runtime-dir ]; then export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir; export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}; fi; exec electron-vite preview -- --enable-features=UseOzonePlatform --ozone-platform=wayland'"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.11",
+    "@types/node": "^24.0.10",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.4.1",
+    "autoprefixer": "^10.4.21",
+    "electron": "^37.2.0",
+    "electron-vite": "^3.1.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.11",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}
