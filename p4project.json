@@ -2,7 +2,7 @@
   "name": "easybrowser",
   "description": "Simple, secure, AI-powered browser for elderly and non-technical people.",
   "type": "desktop app",
-  "publicity": "private",
+  "publicity": "public",
   "languages": ["TypeScript"],
   "repository_url": "https://github.com/re-invertion/easybrowser",
   "version": "1.0.0"
