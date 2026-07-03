@@ -314,7 +314,9 @@ function App() {
           >
             <div className="flex h-12 items-center justify-between border-b border-app-tile-border px-4">
               <div className="app-drag-region min-w-0 flex flex-1 items-center gap-3 pr-4 select-none">
-                <p className="truncate text-sm font-bold text-app-text">Przegladarka</p>
+                <p className="truncate text-sm font-bold text-app-text">
+                  Przegladarka
+                </p>
                 <div className="app-drag-surface flex h-8 flex-1 items-center justify-center rounded-full border border-dashed border-slate-200 bg-slate-50/70 px-3">
                   <span className="app-drag-label text-xs font-medium text-slate-400">
                     Przeciągnij okno
@@ -370,6 +372,9 @@ function App() {
                   className="min-w-[320px] flex-1 rounded-full border border-app-tile-border bg-app-tile px-4 py-2"
                   onSubmit={handleSearchSubmit}
                 >
+                  <label className="sr-only" htmlFor="browser-address">
+                    Adres strony lub wyszukiwanie
+                  </label>
                   <div className="flex items-center gap-2">
                     <input
                       id="browser-address"
@@ -431,7 +436,9 @@ function App() {
           <header className="border-b border-app-tile-border bg-app-tile shadow-[0_10px_30px_rgba(148,163,184,0.12)]">
             <div className="flex h-12 items-center justify-between px-4">
               <div className="app-drag-region min-w-0 flex flex-1 items-center gap-3 pr-4 select-none">
-                <p className="truncate text-sm font-bold text-app-text">Przegladarka</p>
+                <p className="truncate text-sm font-bold text-app-text">
+                  Przegladarka
+                </p>
                 <div className="app-drag-surface flex h-8 flex-1 items-center justify-center rounded-full border border-dashed border-slate-200 bg-slate-50/70 px-3">
                   <span className="app-drag-label text-xs font-medium text-slate-400">
                     Przeciągnij okno
@@ -522,7 +529,9 @@ function App() {
         <header className="border-b border-app-tile-border bg-app-tile shadow-[0_10px_30px_rgba(148,163,184,0.12)]">
           <div className="flex h-12 items-center justify-between px-4">
             <div className="app-drag-region min-w-0 flex flex-1 items-center gap-3 pr-4 select-none">
-              <p className="truncate text-sm font-bold text-app-text">Przegladarka</p>
+              <p className="truncate text-sm font-bold text-app-text">
+                Przegladarka
+              </p>
               <div className="app-drag-surface flex h-8 flex-1 items-center justify-center rounded-full border border-dashed border-slate-200 bg-slate-50/70 px-3">
                 <span className="app-drag-label text-xs font-medium text-slate-400">
                   Przeciągnij okno

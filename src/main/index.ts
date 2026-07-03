@@ -169,9 +169,7 @@ function loadUserKeyStore(): UserKeyStore {
 }
 
 function assertSecureUserKeyStorageAvailable(): void {
-  const isAvailable = safeStorage.isEncryptionAvailable()
-
-  if (!isAvailable) {
+  if (!safeStorage.isEncryptionAvailable()) {
     throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
   }
 
@@ -202,6 +200,15 @@ function hasStoredUserDataKey(userId: string): boolean {
   return typeof keyStore[userId] === 'string' && keyStore[userId].length > 0
 }
 
+function getUserState() {
+  const store = loadUserStore()
+
+  return {
+    users: store.users,
+    activeUserId: store.activeUserId
+  }
+}
+
 function getActiveUserPartition(): string | null {
   const store = loadUserStore()
 
@@ -210,15 +217,6 @@ function getActiveUserPartition(): string | null {
   }
 
   return buildUserPartition(store.activeUserId)
-}
-
-function getUserState() {
-  const store = loadUserStore()
-
-  return {
-    users: store.users,
-    activeUserId: store.activeUserId
-  }
 }
 
 function normalizeAddress(value: string): string {
@@ -340,9 +338,9 @@ function ensureBrowserView(): WebContentsView {
 
   if (browserView) {
     const currentPartition = browserView.webContents.session.getStoragePath()
-    const nextSession = session.fromPartition(activePartition).getStoragePath()
+    const nextPartition = session.fromPartition(activePartition).getStoragePath()
 
-    if (currentPartition === nextSession) {
+    if (currentPartition === nextPartition) {
       return browserView
     }
 
@@ -414,6 +412,9 @@ function createMainWindow(): void {
   mainWindow.on('resize', updateBrowserBounds)
   mainWindow.on('maximize', sendBrowserState)
   mainWindow.on('unmaximize', sendBrowserState)
+  mainWindow.webContents.once('did-finish-load', () => {
+    sendBrowserState()
+  })
 
   if (process.env.ELECTRON_RENDERER_URL) {
     void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -558,6 +559,7 @@ app.whenReady().then(() => {
   const store = loadUserStore()
   store.activeUserId = null
   saveUserStore(store)
+
   createMainWindow()
 
   app.on('activate', () => {
