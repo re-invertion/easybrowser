@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+build/
+.cache/
+.DS_Store
+Thumbs.db
+.next/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
