@@ -2,7 +2,9 @@ import {
   app,
   BrowserWindow,
   clipboard,
+  dialog,
   ipcMain,
+  type MessageBoxOptions,
   safeStorage,
   session,
   shell,
@@ -48,6 +50,7 @@ let userStore: UserStore | null = null
 let userKeyStore: UserKeyStore | null = null
 
 const DEFAULT_USERS: UserProfile[] = []
+const DEV_PLAIN_KEY_PREFIX = 'dev-plain:'
 
 const BROWSER_INPUT_RING_CSS = `
   input:focus,
@@ -65,6 +68,9 @@ const BROWSER_INPUT_RING_CSS = `
 `
 
 const GOOGLE_HOME_URL = 'https://www.google.pl/?hl=pl&gl=PL&pws=0'
+const ALLOWED_BROWSER_PERMISSION_ORIGINS = new Set<string>([])
+const ALLOWED_BROWSER_PROTOCOLS = new Set(['https:', 'http:'])
+const grantedMediaPermissionOrigins = new Set<string>()
 
 function getUserStorePath(): string {
   return path.join(app.getPath('userData'), 'users.json')
@@ -93,6 +99,103 @@ function getInitials(value: string): string {
 
 function buildUserPartition(userId: string): string {
   return `persist:easybrowser-user-${userId}`
+}
+
+function isAllowedPermissionOrigin(rawUrl: string): boolean {
+  try {
+    const parsedUrl = new URL(rawUrl)
+    return parsedUrl.protocol === 'https:' && ALLOWED_BROWSER_PERMISSION_ORIGINS.has(parsedUrl.origin)
+  } catch {
+    return false
+  }
+}
+
+function getSecureOrigin(rawUrl: string): string | null {
+  try {
+    const parsedUrl = new URL(rawUrl)
+
+    if (parsedUrl.protocol !== 'https:') {
+      return null
+    }
+
+    return parsedUrl.origin
+  } catch {
+    return null
+  }
+}
+
+function isSafeBrowserUrl(rawUrl: string): boolean {
+  try {
+    const parsedUrl = new URL(rawUrl)
+    return ALLOWED_BROWSER_PROTOCOLS.has(parsedUrl.protocol)
+  } catch {
+    return false
+  }
+}
+
+async function requestMediaPermission(rawUrl: string, permission: string): Promise<boolean> {
+  const origin = getSecureOrigin(rawUrl)
+
+  if (!origin || permission !== 'media') {
+    return false
+  }
+
+  if (grantedMediaPermissionOrigins.has(origin) || ALLOWED_BROWSER_PERMISSION_ORIGINS.has(origin)) {
+    return true
+  }
+
+  const dialogOptions: MessageBoxOptions = {
+    type: 'warning',
+    buttons: ['Nie zezwalaj', 'Zezwalaj'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: 'Prośba o dostęp',
+    message: 'Ta strona prosi o dostęp do kamery lub mikrofonu.',
+    detail: `${origin}\n\nZezwolić tej stronie na użycie kamery lub mikrofonu?`
+  }
+
+  const result = mainWindow
+    ? await dialog.showMessageBox(mainWindow, dialogOptions)
+    : await dialog.showMessageBox(dialogOptions)
+
+  if (result.response !== 1) {
+    return false
+  }
+
+  grantedMediaPermissionOrigins.add(origin)
+  return true
+}
+
+function configureUserSessionSecurity(partition: string) {
+  const targetSession = session.fromPartition(partition)
+
+  targetSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const requestingUrl = details.requestingUrl || webContents.getURL()
+
+    if (permission === 'media') {
+      void requestMediaPermission(requestingUrl, permission)
+        .then((allowed) => {
+          callback(allowed)
+        })
+        .catch(() => {
+          callback(false)
+        })
+      return
+    }
+
+    callback(isAllowedPermissionOrigin(requestingUrl))
+  })
+
+  targetSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
+    if (permission === 'media') {
+      return grantedMediaPermissionOrigins.has(requestingOrigin)
+    }
+
+    return isAllowedPermissionOrigin(requestingOrigin)
+  })
+
+  return targetSession
 }
 
 function normalizeStore(store: UserStore): UserStore {
@@ -170,6 +273,10 @@ function loadUserKeyStore(): UserKeyStore {
 
 function assertSecureUserKeyStorageAvailable(): void {
   if (!safeStorage.isEncryptionAvailable()) {
+    if (!app.isPackaged) {
+      return
+    }
+
     throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
   }
 
@@ -177,6 +284,10 @@ function assertSecureUserKeyStorageAvailable(): void {
     const backend = safeStorage.getSelectedStorageBackend()
 
     if (backend === 'basic_text' || backend === 'unknown') {
+      if (!app.isPackaged) {
+        return
+      }
+
       throw new Error(
         'Brak bezpiecznego systemowego magazynu kluczy. Skonfiguruj keyring systemowy.'
       )
@@ -185,19 +296,97 @@ function assertSecureUserKeyStorageAvailable(): void {
 }
 
 function createAndStoreUserDataKey(userId: string): void {
-  assertSecureUserKeyStorageAvailable()
-
   const dataKey = randomBytes(32).toString('base64')
-  const encryptedDataKey = safeStorage.encryptString(dataKey)
   const keyStore = loadUserKeyStore()
+  let storedValue: string
 
-  keyStore[userId] = encryptedDataKey.toString('base64')
+  try {
+    assertSecureUserKeyStorageAvailable()
+
+    if (safeStorage.isEncryptionAvailable()) {
+      const encryptedDataKey = safeStorage.encryptString(dataKey)
+      storedValue = encryptedDataKey.toString('base64')
+    } else if (!app.isPackaged) {
+      storedValue = `${DEV_PLAIN_KEY_PREFIX}${dataKey}`
+    } else {
+      throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
+    }
+  } catch (error) {
+    if (app.isPackaged) {
+      throw error
+    }
+
+    storedValue = `${DEV_PLAIN_KEY_PREFIX}${dataKey}`
+  }
+
+  keyStore[userId] = storedValue
   saveUserKeyStore(keyStore)
 }
 
 function hasStoredUserDataKey(userId: string): boolean {
   const keyStore = loadUserKeyStore()
   return typeof keyStore[userId] === 'string' && keyStore[userId].length > 0
+}
+
+function removeStoredUserDataKey(userId: string): void {
+  const keyStore = loadUserKeyStore()
+
+  if (!(userId in keyStore)) {
+    return
+  }
+
+  delete keyStore[userId]
+  saveUserKeyStore(keyStore)
+}
+
+function destroyBrowserView(): void {
+  if (!browserView) {
+    return
+  }
+
+  if (mainWindow) {
+    mainWindow.contentView.removeChildView(browserView)
+  }
+
+  browserView.webContents.close()
+  browserView = null
+  browserCssKey = null
+}
+
+async function clearUserBrowsingData(userId: string): Promise<void> {
+  const partition = buildUserPartition(userId)
+  const targetSession = configureUserSessionSecurity(partition)
+  const storagePath = targetSession.getStoragePath()
+
+  if (browserView) {
+    const currentStoragePath = browserView.webContents.session.getStoragePath()
+
+    if (currentStoragePath === storagePath) {
+      destroyBrowserView()
+    }
+  }
+
+  try {
+    await targetSession.clearStorageData()
+  } catch {
+    // Continue cleanup even if the Chromium storage layer partially fails.
+  }
+
+  try {
+    await targetSession.clearCache()
+  } catch {
+    // Continue cleanup even if cache clearing is unavailable on this platform.
+  }
+
+  try {
+    targetSession.flushStorageData()
+  } catch {
+    // Best-effort flush before removing the on-disk partition directory.
+  }
+
+  if (storagePath && fs.existsSync(storagePath)) {
+    fs.rmSync(storagePath, { recursive: true, force: true })
+  }
 }
 
 function getUserState() {
@@ -227,7 +416,7 @@ function normalizeAddress(value: string): string {
   }
 
   if (/^https?:\/\//i.test(trimmed)) {
-    return trimmed
+    return isSafeBrowserUrl(trimmed) ? trimmed : GOOGLE_HOME_URL
   }
 
   if (/^[^\s]+\.[^\s]+$/.test(trimmed)) {
@@ -296,8 +485,19 @@ function wireBrowserView(view: WebContentsView): void {
   }
 
   view.webContents.setWindowOpenHandler(({ url }: { url: string }) => {
-    shell.openExternal(url)
+    if (isSafeBrowserUrl(url)) {
+      shell.openExternal(url)
+    }
+
     return { action: 'deny' }
+  })
+
+  view.webContents.on('will-navigate', (event, navigationUrl) => {
+    if (!isSafeBrowserUrl(navigationUrl)) {
+      event.preventDefault()
+      lastError = `Zablokowano niebezpieczny adres: ${navigationUrl}`
+      sendBrowserState()
+    }
   })
 
   view.webContents.on('did-start-loading', syncBrowserState)
@@ -338,16 +538,13 @@ function ensureBrowserView(): WebContentsView {
 
   if (browserView) {
     const currentPartition = browserView.webContents.session.getStoragePath()
-    const nextPartition = session.fromPartition(activePartition).getStoragePath()
+    const nextPartition = configureUserSessionSecurity(activePartition).getStoragePath()
 
     if (currentPartition === nextPartition) {
       return browserView
     }
 
-    mainWindow.contentView.removeChildView(browserView)
-    browserView.webContents.close()
-    browserView = null
-    browserCssKey = null
+    destroyBrowserView()
   }
 
   const nextBrowserView = new WebContentsView({
@@ -359,6 +556,7 @@ function ensureBrowserView(): WebContentsView {
     }
   })
 
+  configureUserSessionSecurity(activePartition)
   browserView = nextBrowserView
   mainWindow.contentView.addChildView(nextBrowserView)
   wireBrowserView(nextBrowserView)
@@ -389,8 +587,7 @@ function createMainWindow(): void {
     height: 840,
     minWidth: 960,
     minHeight: 640,
-    backgroundColor: '#00000000',
-    transparent: true,
+    backgroundColor: '#f8fafc',
     frame: false,
     autoHideMenuBar: true,
     title: 'Easybrowser',
@@ -405,7 +602,10 @@ function createMainWindow(): void {
   mainWindow.maximize()
 
   mainWindow.webContents.setWindowOpenHandler(({ url }: { url: string }) => {
-    shell.openExternal(url)
+    if (isSafeBrowserUrl(url)) {
+      shell.openExternal(url)
+    }
+
     return { action: 'deny' }
   })
 
@@ -493,6 +693,30 @@ ipcMain.handle('users:create', (_event, name: string) => {
     updateBrowserBounds()
     sendBrowserState()
   }
+
+  return getUserState()
+})
+
+ipcMain.handle('users:delete', async (_event, userId: string) => {
+  const store = loadUserStore()
+
+  if (!store.users.some((user) => user.id === userId)) {
+    throw new Error('Nie znaleziono użytkownika.')
+  }
+
+  store.users = store.users.filter((user) => user.id !== userId)
+
+  if (store.activeUserId === userId) {
+    store.activeUserId = null
+  }
+
+  await clearUserBrowsingData(userId)
+  removeStoredUserDataKey(userId)
+  saveUserStore(store)
+  browserMode = 'home'
+  lastError = null
+  updateBrowserBounds()
+  sendBrowserState()
 
   return getUserState()
 })

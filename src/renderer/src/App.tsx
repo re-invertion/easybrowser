@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useRef, useState } from 'react'
+import { FiAlertTriangle, FiMoreVertical, FiTrash2, FiX } from 'react-icons/fi'
 
 type ViewMode = 'home' | 'browser'
 
@@ -115,6 +116,8 @@ function App() {
   const [copyNoticeVisible, setCopyNoticeVisible] = useState(false)
   const [isAddingUser, setIsAddingUser] = useState(false)
   const [newUserName, setNewUserName] = useState('')
+  const [openUserMenuId, setOpenUserMenuId] = useState<string | null>(null)
+  const [userPendingDeletion, setUserPendingDeletion] = useState<UserProfile | null>(null)
 
   const selectedUser = users.find((user) => user.id === selectedUserId) ?? null
 
@@ -180,6 +183,32 @@ function App() {
     }
   }, [mode, canGoBack, canGoForward, inputValue, isMaximized])
 
+  useEffect(() => {
+    if (!openUserMenuId) {
+      return
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target
+
+      if (!(target instanceof HTMLElement)) {
+        return
+      }
+
+      if (target.closest(`[data-user-menu-root="${openUserMenuId}"]`)) {
+        return
+      }
+
+      setOpenUserMenuId(null)
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown)
+
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown)
+    }
+  }, [openUserMenuId])
+
   const applyUserState = (state: UserState) => {
     setUsers(state.users)
     setSelectedUserId(state.activeUserId)
@@ -244,6 +273,19 @@ function App() {
     }
   }
 
+  const handleDeleteUser = async (userId: string) => {
+    try {
+      const state = await window.easybrowser.deleteUser(userId)
+      applyUserState(state)
+      setOpenUserMenuId(null)
+      setUserPendingDeletion(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się usunąć użytkownika.'
+      )
+    }
+  }
+
   const goHome = async () => {
     await window.easybrowser.goHome()
     setInputValue('')
@@ -286,6 +328,10 @@ function App() {
     void window.easybrowser.closeWindow()
   }
 
+  const closeDeleteModal = () => {
+    setUserPendingDeletion(null)
+  }
+
   if (isLoadingUsers) {
     return (
       <main className="flex h-screen overflow-hidden bg-app text-app-text">
@@ -299,13 +345,7 @@ function App() {
   if (mode === 'browser') {
     return (
       <main className="flex h-screen overflow-hidden bg-app text-app-text">
-        <div
-          className={`app-shell flex h-full w-full flex-col overflow-hidden ${
-            isMaximized
-              ? 'rounded-none border-0 shadow-none'
-              : 'rounded-[14px] border border-app-tile-border shadow-[0_18px_50px_rgba(148,163,184,0.18)]'
-          }`}
-        >
+        <div className="app-shell flex h-full w-full flex-col overflow-hidden border-0 shadow-none">
           <header
             ref={(node) => {
               browserChromeRef.current = node
@@ -388,7 +428,7 @@ function App() {
                     <div className="relative flex shrink-0 items-center">
                       <button
                         aria-label="Kopiuj adres strony"
-                        className="focus-ring flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-app-text"
+                      className="focus-ring flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-app-text"
                         type="button"
                         onClick={copyCurrentUrl}
                       >
@@ -426,13 +466,7 @@ function App() {
   if (selectedUser) {
     return (
       <main className="flex h-screen overflow-hidden bg-app text-app-text">
-        <div
-          className={`app-shell flex h-full w-full flex-col overflow-hidden ${
-            isMaximized
-              ? 'rounded-none border-0 shadow-none'
-              : 'rounded-[14px] border border-app-tile-border shadow-[0_18px_50px_rgba(148,163,184,0.18)]'
-          }`}
-        >
+        <div className="app-shell flex h-full w-full flex-col overflow-hidden border-0 shadow-none">
           <header className="border-b border-app-tile-border bg-app-tile shadow-[0_10px_30px_rgba(148,163,184,0.12)]">
             <div className="flex h-12 items-center justify-between px-4">
               <div className="app-drag-region min-w-0 flex flex-1 items-center gap-3 pr-4 select-none">
@@ -494,7 +528,7 @@ function App() {
                     value={inputValue}
                     onChange={(event) => setInputValue(event.target.value)}
                     placeholder="Wpisz, czego szukasz"
-                    className="focus-ring min-w-0 w-full rounded-full bg-transparent px-3 py-2 text-base text-app-text placeholder:text-slate-400 focus:outline-none sm:px-4 sm:py-3 sm:text-lg md:text-xl"
+                  className="focus-ring min-w-0 w-full rounded-full bg-transparent px-3 py-2 text-base text-app-text placeholder:text-slate-400 focus:outline-none sm:px-4 sm:py-3 sm:text-lg md:text-xl"
                   />
                 </div>
               </form>
@@ -518,14 +552,8 @@ function App() {
   }
 
   return (
-    <main className="flex h-screen overflow-hidden bg-app text-app-text">
-      <div
-        className={`app-shell flex h-full w-full flex-col overflow-hidden ${
-          isMaximized
-            ? 'rounded-none border-0 shadow-none'
-            : 'rounded-[14px] border border-app-tile-border shadow-[0_18px_50px_rgba(148,163,184,0.18)]'
-        }`}
-      >
+      <main className="flex h-screen overflow-hidden bg-app text-app-text">
+      <div className="app-shell relative flex h-full w-full flex-col overflow-hidden border-0 shadow-none">
         <header className="border-b border-app-tile-border bg-app-tile shadow-[0_10px_30px_rgba(148,163,184,0.12)]">
           <div className="flex h-12 items-center justify-between px-4">
             <div className="app-drag-region min-w-0 flex flex-1 items-center gap-3 pr-4 select-none">
@@ -571,11 +599,44 @@ function App() {
                   <button
                     key={user.id}
                     type="button"
-                    className="focus-ring w-full max-w-[244px] rounded-[24px] border border-app-tile-border bg-app-tile p-5 text-left shadow-[0_14px_34px_rgba(148,163,184,0.12)] transition hover:-translate-y-0.5 hover:shadow-[0_18px_40px_rgba(148,163,184,0.16)] sm:w-[244px]"
+                    className="focus-ring relative w-full max-w-[244px] rounded-[24px] border border-app-tile-border bg-app-tile p-5 text-left shadow-[0_14px_34px_rgba(148,163,184,0.12)] transition hover:-translate-y-0.5 hover:shadow-[0_18px_40px_rgba(148,163,184,0.16)] sm:w-[244px]"
                     onClick={() => {
                       void handleSelectUser(user.id)
                     }}
                   >
+                    <div className="absolute top-3 right-3" data-user-menu-root={user.id}>
+                      <button
+                        type="button"
+                        aria-label={`Opcje użytkownika ${user.name}`}
+                        className="focus-ring flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-app-text"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setOpenUserMenuId((currentId) =>
+                            currentId === user.id ? null : user.id
+                          )
+                        }}
+                      >
+                        <FiMoreVertical aria-hidden="true" className="h-4 w-4" />
+                      </button>
+
+                      {openUserMenuId === user.id ? (
+                        <div className="absolute top-[calc(100%+0.35rem)] right-0 z-20 min-w-[172px] rounded-2xl border border-app-tile-border bg-app-tile p-2 shadow-[0_18px_40px_rgba(148,163,184,0.18)]">
+                          <button
+                            type="button"
+                            className="focus-ring flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm font-medium text-red-600 transition hover:bg-red-50"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              setOpenUserMenuId(null)
+                              setUserPendingDeletion(user)
+                            }}
+                          >
+                            <FiTrash2 aria-hidden="true" className="h-4 w-4 shrink-0" />
+                            Usuń użytkownika
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+
                     <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-100 text-lg font-bold text-app-text">
                       {user.initials}
                     </div>
@@ -650,6 +711,66 @@ function App() {
             )}
           </div>
         </section>
+
+        {userPendingDeletion ? (
+          <div
+            className="absolute inset-0 z-[200] flex items-center justify-center bg-slate-950/30 px-4 backdrop-blur-[2px]"
+            onClick={closeDeleteModal}
+          >
+            <div
+              className="w-full max-w-md rounded-[28px] border border-red-200 bg-white p-6 shadow-[0_28px_80px_rgba(15,23,42,0.24)]"
+              onClick={(event) => {
+                event.stopPropagation()
+              }}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex items-start gap-4">
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-red-50 text-red-600">
+                    <FiAlertTriangle aria-hidden="true" className="h-6 w-6" />
+                  </div>
+
+                  <div>
+                    <h2 className="text-xl font-bold text-app-text">
+                      Czy na pewno chcesz usunąć użytkownika?
+                    </h2>
+                    <p className="mt-2 text-sm leading-6 text-slate-500">
+                      Użytkownik <span className="font-bold text-app-text">{userPendingDeletion.name}</span>{' '}
+                      zostanie usunięty razem z jego danymi przeglądania.
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  aria-label="Zamknij okno potwierdzenia"
+                  className="focus-ring flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-app-text"
+                  onClick={closeDeleteModal}
+                >
+                  <FiX aria-hidden="true" className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="mt-6 flex flex-wrap justify-end gap-3">
+                <button
+                  type="button"
+                  className="focus-ring rounded-full border border-app-tile-border px-5 py-3 text-sm font-bold text-app-text"
+                  onClick={closeDeleteModal}
+                >
+                  Anuluj
+                </button>
+                <button
+                  type="button"
+                  className="focus-ring rounded-full bg-red-600 px-5 py-3 text-sm font-bold text-white transition hover:bg-red-700"
+                  onClick={() => {
+                    void handleDeleteUser(userPendingDeletion.id)
+                  }}
+                >
+                  Usuń użytkownika
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
     </main>
   )

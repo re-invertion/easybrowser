@@ -4,7 +4,7 @@
 :root {
   font-family: "Atkinson Hyperlegible", sans-serif;
   color: #111827;
-  background: transparent;
+  background: #f8fafc;
 }
 
 body {
@@ -12,13 +12,13 @@ body {
   min-width: 320px;
   height: 100vh;
   overflow: hidden;
-  background: transparent;
+  background: #f8fafc;
 }
 
 #root {
   height: 100vh;
   overflow: hidden;
-  background: transparent;
+  background: #f8fafc;
 }
 
 .app-shell {

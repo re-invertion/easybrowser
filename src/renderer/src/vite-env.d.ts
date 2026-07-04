@@ -32,6 +32,7 @@ declare global {
       selectUser: (userId: string) => Promise<UserState>
       clearActiveUser: () => Promise<UserState>
       createUser: (name: string) => Promise<UserState>
+      deleteUser: (userId: string) => Promise<UserState>
       navigate: (value: string) => Promise<void>
       goHome: () => Promise<void>
       goBack: () => Promise<void>

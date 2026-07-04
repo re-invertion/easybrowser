@@ -33,6 +33,8 @@ contextBridge.exposeInMainWorld('easybrowser', {
     ipcRenderer.invoke('users:clear-active') as Promise<UserState>,
   createUser: (name: string) =>
     ipcRenderer.invoke('users:create', name) as Promise<UserState>,
+  deleteUser: (userId: string) =>
+    ipcRenderer.invoke('users:delete', userId) as Promise<UserState>,
   navigate: (value: string) => ipcRenderer.invoke('browser:navigate', value),
   goHome: () => ipcRenderer.invoke('browser:home'),
   goBack: () => ipcRenderer.invoke('browser:back'),
