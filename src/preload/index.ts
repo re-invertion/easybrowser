@@ -9,6 +9,8 @@ type BrowserState = {
   canGoForward: boolean
   isMaximized: boolean
   error: string | null
+  hasMicrophoneAccess: boolean
+  hasCameraAccess: boolean
 }
 
 type UserProfile = {

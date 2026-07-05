@@ -4,6 +4,9 @@ dist-electron/
 out/
 .vite/
 .cache/
+coverage/
+*.tsbuildinfo
+*.log
 .env
 .env.*
 !.env.example
@@ -12,3 +15,5 @@ Thumbs.db
 npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*
+.idea/
+.vscode/

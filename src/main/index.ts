@@ -2,9 +2,7 @@ import {
   app,
   BrowserWindow,
   clipboard,
-  dialog,
   ipcMain,
-  type MessageBoxOptions,
   safeStorage,
   session,
   shell,
@@ -39,15 +37,20 @@ type UserStore = {
 }
 
 type UserKeyStore = Record<string, string>
+type MediaAccessType = 'audio' | 'video'
+type UserMediaPermissionStore = Record<string, Record<string, MediaAccessType[]>>
 
 let mainWindow: BrowserWindow | null = null
 let browserView: WebContentsView | null = null
+let permissionPromptWindow: BrowserWindow | null = null
 let browserMode: BrowserMode = 'home'
 let lastError: string | null = null
 let browserChromeHeight = 122
 let browserCssKey: string | null = null
 let userStore: UserStore | null = null
 let userKeyStore: UserKeyStore | null = null
+let userMediaPermissionStore: UserMediaPermissionStore | null = null
+const pendingMediaPermissionRequests = new Map<string, Promise<PermissionPromptAction>>()
 
 const DEFAULT_USERS: UserProfile[] = []
 const DEV_PLAIN_KEY_PREFIX = 'dev-plain:'
@@ -70,7 +73,58 @@ const BROWSER_INPUT_RING_CSS = `
 const GOOGLE_HOME_URL = 'https://www.google.pl/?hl=pl&gl=PL&pws=0'
 const ALLOWED_BROWSER_PERMISSION_ORIGINS = new Set<string>([])
 const ALLOWED_BROWSER_PROTOCOLS = new Set(['https:', 'http:'])
-const grantedMediaPermissionOrigins = new Set<string>()
+
+type PermissionPromptAction = 'allow' | 'deny' | 'leave'
+
+function normalizeMediaTypes(mediaTypes: readonly MediaAccessType[] | undefined): MediaAccessType[] {
+  const nextMediaTypes = new Set<MediaAccessType>()
+
+  for (const mediaType of mediaTypes ?? []) {
+    if (mediaType === 'audio' || mediaType === 'video') {
+      nextMediaTypes.add(mediaType)
+    }
+  }
+
+  if (nextMediaTypes.size === 0) {
+    return ['audio', 'video']
+  }
+
+  return Array.from(nextMediaTypes).sort()
+}
+
+function getMediaPermissionPromptText(mediaTypes: readonly MediaAccessType[]): {
+  title: string
+  message: string
+} {
+  const hasAudio = mediaTypes.includes('audio')
+  const hasVideo = mediaTypes.includes('video')
+
+  if (hasAudio && hasVideo) {
+    return {
+      title: 'Ta strona prosi o dostęp do kamery i mikrofonu.',
+      message: 'Zezwolić tej stronie na użycie kamery i mikrofonu?'
+    }
+  }
+
+  if (hasVideo) {
+    return {
+      title: 'Ta strona prosi o dostęp do kamery.',
+      message: 'Zezwolić tej stronie na użycie kamery?'
+    }
+  }
+
+  return {
+    title: 'Ta strona prosi o dostęp do mikrofonu.',
+    message: 'Zezwolić tej stronie na użycie mikrofonu?'
+  }
+}
+
+function buildMediaPermissionRequestKey(
+  origin: string,
+  mediaTypes: readonly MediaAccessType[]
+): string {
+  return `${origin}|${mediaTypes.join(',')}`
+}
 
 function getUserStorePath(): string {
   return path.join(app.getPath('userData'), 'users.json')
@@ -99,6 +153,98 @@ function getInitials(value: string): string {
 
 function buildUserPartition(userId: string): string {
   return `persist:easybrowser-user-${userId}`
+}
+
+function getActiveUserId(): string | null {
+  return loadUserStore().activeUserId
+}
+
+function loadUserMediaPermissionStore(): UserMediaPermissionStore {
+  if (userMediaPermissionStore) {
+    return userMediaPermissionStore
+  }
+
+  userMediaPermissionStore = {}
+  return userMediaPermissionStore
+}
+
+function getGrantedMediaTypes(userId: string | null, origin: string): MediaAccessType[] {
+  if (!userId) {
+    return []
+  }
+
+  const store = loadUserMediaPermissionStore()
+  return store[userId]?.[origin] ?? []
+}
+
+function hasGrantedMediaPermission(
+  userId: string | null,
+  origin: string,
+  mediaTypes?: readonly MediaAccessType[]
+): boolean {
+  const grantedMediaTypes = new Set(getGrantedMediaTypes(userId, origin))
+
+  if (grantedMediaTypes.size === 0) {
+    return false
+  }
+
+  if (!mediaTypes || mediaTypes.length === 0) {
+    return true
+  }
+
+  return mediaTypes.every((mediaType) => grantedMediaTypes.has(mediaType))
+}
+
+function getGrantedMediaAccessState(userId: string | null, rawUrl: string): {
+  hasMicrophoneAccess: boolean
+  hasCameraAccess: boolean
+} {
+  const origin = getSecureOrigin(rawUrl)
+
+  if (!origin) {
+    return {
+      hasMicrophoneAccess: false,
+      hasCameraAccess: false
+    }
+  }
+
+  const grantedMediaTypes = new Set(getGrantedMediaTypes(userId, origin))
+
+  return {
+    hasMicrophoneAccess: grantedMediaTypes.has('audio'),
+    hasCameraAccess: grantedMediaTypes.has('video')
+  }
+}
+
+function grantMediaPermission(
+  userId: string | null,
+  origin: string,
+  mediaTypes: readonly MediaAccessType[]
+): void {
+  if (!userId) {
+    return
+  }
+
+  const store = loadUserMediaPermissionStore()
+  const nextUserPermissions = { ...(store[userId] ?? {}) }
+  const nextMediaTypes = new Set(nextUserPermissions[origin] ?? [])
+
+  for (const mediaType of mediaTypes) {
+    nextMediaTypes.add(mediaType)
+  }
+
+  nextUserPermissions[origin] = Array.from(nextMediaTypes).sort()
+  store[userId] = nextUserPermissions
+}
+
+function clearUserMediaPermissions(userId: string): void {
+  const store = loadUserMediaPermissionStore()
+
+  if (!(userId in store)) {
+    return
+  }
+
+  delete store[userId]
 }
 
 function isAllowedPermissionOrigin(rawUrl: string): boolean {
@@ -133,38 +279,348 @@ function isSafeBrowserUrl(rawUrl: string): boolean {
   }
 }
 
-async function requestMediaPermission(rawUrl: string, permission: string): Promise<boolean> {
-  const origin = getSecureOrigin(rawUrl)
+function buildPermissionPromptHtml(mediaTypes: readonly MediaAccessType[]): string {
+  const promptText = getMediaPermissionPromptText(mediaTypes)
 
-  if (!origin || permission !== 'media') {
+  return `<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Prośba o dostęp</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: "Atkinson Hyperlegible", system-ui, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(15, 23, 42, 0.34);
+        color: #111827;
+      }
+
+      .backdrop {
+        width: 100%;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+
+      .card {
+        width: min(100%, 520px);
+        border-radius: 28px;
+        border: 1px solid #cbd5e1;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: 0 32px 80px rgba(15, 23, 42, 0.22);
+        padding: 28px;
+      }
+
+      .eyebrow {
+        margin: 0 0 12px;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: #64748b;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 30px;
+        line-height: 1.15;
+      }
+
+      p {
+        margin: 14px 0 0;
+        font-size: 17px;
+        line-height: 1.55;
+        color: #475569;
+      }
+
+      .actions {
+        margin-top: 24px;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 12px;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 14px 20px;
+        font: inherit;
+        font-size: 15px;
+        font-weight: 700;
+        cursor: pointer;
+        transition: transform 140ms ease, background-color 140ms ease, color 140ms ease;
+      }
+
+      button:focus-visible {
+        outline: 3px solid #fbbf24;
+        outline-offset: 2px;
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+      }
+
+      .secondary {
+        background: #ffffff;
+        color: #111827;
+        border: 1px solid #cbd5e1;
+      }
+
+      .danger {
+        background: #fff1f2;
+        color: #b91c1c;
+        border: 1px solid #fecdd3;
+      }
+
+      .primary {
+        background: #1e3a8a;
+        color: #ffffff;
+      }
+
+      @media (max-width: 640px) {
+        .card {
+          padding: 22px;
+          border-radius: 24px;
+        }
+
+        h1 {
+          font-size: 26px;
+        }
+
+        .actions {
+          justify-content: stretch;
+        }
+
+        .actions button {
+          width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="backdrop">
+      <section class="card" role="dialog" aria-modal="true" aria-labelledby="title">
+        <p class="eyebrow">Prośba o dostęp</p>
+        <h1 id="title">${promptText.title}</h1>
+        <p>${promptText.message}</p>
+
+        <div class="actions">
+          <button class="danger" id="leave" type="button">Opuść stronę</button>
+          <button class="secondary" id="deny" type="button">Nie zezwalaj</button>
+          <button class="primary" id="allow" type="button" autofocus>Zezwalaj</button>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const leaveButton = document.getElementById('leave');
+      const denyButton = document.getElementById('deny');
+      const allowButton = document.getElementById('allow');
+
+      const resolvePrompt = (decision) => {
+        const url = 'easybrowser-permission://' + decision;
+        window.location.href = url;
+      };
+
+      leaveButton?.addEventListener('click', () => resolvePrompt('leave'));
+      denyButton?.addEventListener('click', () => resolvePrompt('deny'));
+      allowButton?.addEventListener('click', () => resolvePrompt('allow'));
+
+      window.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          resolvePrompt('deny');
+        }
+      });
+    </script>
+  </body>
+</html>`
+}
+
+function updatePermissionPromptBounds(): void {
+  if (!mainWindow || !permissionPromptWindow) {
+    return
+  }
+
+  permissionPromptWindow.setBounds(mainWindow.getBounds())
+}
+
+function leaveCurrentPage(): void {
+  if (browserView?.webContents.isLoading()) {
+    browserView.webContents.stop()
+  }
+
+  browserMode = 'home'
+  lastError = null
+  updateBrowserBounds()
+  sendBrowserState()
+}
+
+async function showMediaPermissionPrompt(
+  mediaTypes: readonly MediaAccessType[]
+): Promise<PermissionPromptAction> {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return 'deny'
+  }
+
+  const parentWindow = mainWindow
+
+  return await new Promise<PermissionPromptAction>((resolve) => {
+    let settled = false
+
+    const finish = (decision: PermissionPromptAction) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+
+      if (permissionPromptWindow && !permissionPromptWindow.isDestroyed()) {
+        permissionPromptWindow.destroy()
+      }
+
+      permissionPromptWindow = null
+      resolve(decision)
+    }
+
+    const promptWindow = new BrowserWindow({
+      parent: parentWindow,
+      modal: true,
+      frame: false,
+      transparent: true,
+      backgroundColor: '#00000000',
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      closable: true,
+      show: false,
+      skipTaskbar: true,
+      hasShadow: false,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true
+      }
+    })
+
+    permissionPromptWindow = promptWindow
+    updatePermissionPromptBounds()
+
+    promptWindow.webContents.setWindowOpenHandler(() => {
+      return { action: 'deny' }
+    })
+
+    promptWindow.webContents.on('will-navigate', (event, navigationUrl) => {
+      if (navigationUrl === 'easybrowser-permission://allow') {
+        event.preventDefault()
+        finish('allow')
+        return
+      }
+
+      if (navigationUrl === 'easybrowser-permission://deny') {
+        event.preventDefault()
+        finish('deny')
+        return
+      }
+
+      if (navigationUrl === 'easybrowser-permission://leave') {
+        event.preventDefault()
+        finish('leave')
+        return
+      }
+
+      event.preventDefault()
+    })
+
+    promptWindow.on('closed', () => {
+      finish('deny')
+    })
+
+    promptWindow.once('ready-to-show', () => {
+      updatePermissionPromptBounds()
+      promptWindow.show()
+      promptWindow.focus()
+    })
+
+    const promptHtml = buildPermissionPromptHtml(mediaTypes)
+    void promptWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(promptHtml)}`)
+  })
+}
+
+async function requestMediaPermission(
+  rawUrl: string,
+  permission: string,
+  mediaTypes: readonly MediaAccessType[] | undefined
+): Promise<boolean> {
+  const origin = getSecureOrigin(rawUrl)
+  const activeUserId = getActiveUserId()
+
+  if (!origin || permission !== 'media' || !activeUserId) {
     return false
   }
 
-  if (grantedMediaPermissionOrigins.has(origin) || ALLOWED_BROWSER_PERMISSION_ORIGINS.has(origin)) {
+  const normalizedMediaTypes = normalizeMediaTypes(mediaTypes)
+
+  if (
+    hasGrantedMediaPermission(activeUserId, origin, normalizedMediaTypes) ||
+    ALLOWED_BROWSER_PERMISSION_ORIGINS.has(origin)
+  ) {
     return true
   }
 
-  const dialogOptions: MessageBoxOptions = {
-    type: 'warning',
-    buttons: ['Nie zezwalaj', 'Zezwalaj'],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-    title: 'Prośba o dostęp',
-    message: 'Ta strona prosi o dostęp do kamery lub mikrofonu.',
-    detail: `${origin}\n\nZezwolić tej stronie na użycie kamery lub mikrofonu?`
+  const requestKey = buildMediaPermissionRequestKey(origin, normalizedMediaTypes)
+  const pendingRequest = pendingMediaPermissionRequests.get(requestKey)
+
+  if (pendingRequest) {
+    const decision = await pendingRequest
+
+    if (decision === 'leave') {
+      leaveCurrentPage()
+    }
+
+    return decision === 'allow'
   }
 
-  const result = mainWindow
-    ? await dialog.showMessageBox(mainWindow, dialogOptions)
-    : await dialog.showMessageBox(dialogOptions)
+  const permissionRequest = showMediaPermissionPrompt(normalizedMediaTypes)
+  pendingMediaPermissionRequests.set(requestKey, permissionRequest)
 
-  if (result.response !== 1) {
-    return false
+  try {
+    const decision = await permissionRequest
+
+    if (decision === 'allow') {
+      grantMediaPermission(activeUserId, origin, normalizedMediaTypes)
+      sendBrowserState()
+    }
+
+    if (decision === 'leave') {
+      leaveCurrentPage()
+    }
+
+    return decision === 'allow'
+  } finally {
+    pendingMediaPermissionRequests.delete(requestKey)
   }
-
-  grantedMediaPermissionOrigins.add(origin)
-  return true
 }
 
 function configureUserSessionSecurity(partition: string) {
@@ -174,7 +630,9 @@ function configureUserSessionSecurity(partition: string) {
     const requestingUrl = details.requestingUrl || webContents.getURL()
 
     if (permission === 'media') {
-      void requestMediaPermission(requestingUrl, permission)
+      const mediaTypes = 'mediaTypes' in details ? details.mediaTypes : undefined
+
+      void requestMediaPermission(requestingUrl, permission, mediaTypes)
         .then((allowed) => {
           callback(allowed)
         })
@@ -187,9 +645,13 @@ function configureUserSessionSecurity(partition: string) {
     callback(isAllowedPermissionOrigin(requestingUrl))
   })
 
-  targetSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
+  targetSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin, details) => {
     if (permission === 'media') {
-      return grantedMediaPermissionOrigins.has(requestingOrigin)
+      const mediaType = details.mediaType
+      const requestedMediaTypes =
+        mediaType === 'audio' || mediaType === 'video' ? [mediaType] : undefined
+
+      return hasGrantedMediaPermission(getActiveUserId(), requestingOrigin, requestedMediaTypes)
     }
 
     return isAllowedPermissionOrigin(requestingOrigin)
@@ -451,6 +913,8 @@ function sendBrowserState(): void {
     return
   }
 
+  const mediaAccessState = getGrantedMediaAccessState(getActiveUserId(), browserView?.webContents.getURL() ?? '')
+
   mainWindow.webContents.send('browser:state', {
     mode: browserMode,
     url: browserView?.webContents.getURL() ?? '',
@@ -459,7 +923,9 @@ function sendBrowserState(): void {
     canGoBack: browserView?.webContents.canGoBack() ?? false,
     canGoForward: browserView?.webContents.canGoForward() ?? false,
     isMaximized: mainWindow.isMaximized(),
-    error: lastError
+    error: lastError,
+    hasMicrophoneAccess: mediaAccessState.hasMicrophoneAccess,
+    hasCameraAccess: mediaAccessState.hasCameraAccess
   })
 }
 
@@ -610,8 +1076,12 @@ function createMainWindow(): void {
   })
 
   mainWindow.on('resize', updateBrowserBounds)
+  mainWindow.on('resize', updatePermissionPromptBounds)
+  mainWindow.on('move', updatePermissionPromptBounds)
   mainWindow.on('maximize', sendBrowserState)
+  mainWindow.on('maximize', updatePermissionPromptBounds)
   mainWindow.on('unmaximize', sendBrowserState)
+  mainWindow.on('unmaximize', updatePermissionPromptBounds)
   mainWindow.webContents.once('did-finish-load', () => {
     sendBrowserState()
   })
@@ -712,6 +1182,7 @@ ipcMain.handle('users:delete', async (_event, userId: string) => {
 
   await clearUserBrowsingData(userId)
   removeStoredUserDataKey(userId)
+  clearUserMediaPermissions(userId)
   saveUserStore(store)
   browserMode = 'home'
   lastError = null

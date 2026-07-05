@@ -1,7 +1,12 @@
 import { FormEvent, useEffect, useRef, useState } from 'react'
-import { FiAlertTriangle, FiMoreVertical, FiTrash2, FiX } from 'react-icons/fi'
+import { FiAlertTriangle, FiCamera, FiMic, FiMoreVertical, FiTrash2, FiX } from 'react-icons/fi'
 
 type ViewMode = 'home' | 'browser'
+
+type BrowserAccessIndicatorState = {
+  hasMicrophoneAccess: boolean
+  hasCameraAccess: boolean
+}
 
 const GOOGLE_HOME_URL = 'https://www.google.pl/?hl=pl&gl=PL&pws=0'
 
@@ -99,6 +104,43 @@ function WindowControls({
   )
 }
 
+function BrowserAccessIndicator({
+  hasMicrophoneAccess,
+  hasCameraAccess
+}: BrowserAccessIndicatorState) {
+  if (!hasMicrophoneAccess && !hasCameraAccess) {
+    return null
+  }
+
+  if (hasMicrophoneAccess && hasCameraAccess) {
+    return (
+      <div className="flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-bold text-emerald-800">
+        <div className="flex items-center gap-1.5 text-emerald-700">
+          <FiCamera aria-hidden="true" className="h-4 w-4" />
+          <FiMic aria-hidden="true" className="h-4 w-4" />
+        </div>
+        <span>Ta strona korzysta z mikrofonu i kamery</span>
+      </div>
+    )
+  }
+
+  if (hasCameraAccess) {
+    return (
+      <div className="flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-bold text-emerald-800">
+        <FiCamera aria-hidden="true" className="h-4 w-4 text-emerald-700" />
+        <span>Ta strona korzysta z kamery</span>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-bold text-emerald-800">
+      <FiMic aria-hidden="true" className="h-4 w-4 text-emerald-700" />
+      <span>Ta strona korzysta z mikrofonu</span>
+    </div>
+  )
+}
+
 function App() {
   const browserChromeRef = useRef<HTMLElement | null>(null)
   const [mode, setMode] = useState<ViewMode>('home')
@@ -113,6 +155,8 @@ function App() {
   const [canGoBack, setCanGoBack] = useState(false)
   const [canGoForward, setCanGoForward] = useState(false)
   const [isMaximized, setIsMaximized] = useState(false)
+  const [hasMicrophoneAccess, setHasMicrophoneAccess] = useState(false)
+  const [hasCameraAccess, setHasCameraAccess] = useState(false)
   const [copyNoticeVisible, setCopyNoticeVisible] = useState(false)
   const [isAddingUser, setIsAddingUser] = useState(false)
   const [newUserName, setNewUserName] = useState('')
@@ -139,12 +183,14 @@ function App() {
     const unsubscribe = window.easybrowser.onBrowserStateChange((state: BrowserState) => {
       setMode(state.mode)
       setCurrentUrl(state.url || GOOGLE_HOME_URL)
-      setInputValue(state.url || '')
+      setInputValue(state.mode === 'browser' ? state.url || '' : '')
       setPageTitle(state.title || 'Easybrowser')
       setIsLoading(state.isLoading)
       setCanGoBack(state.canGoBack)
       setCanGoForward(state.canGoForward)
       setIsMaximized(state.isMaximized)
+      setHasMicrophoneAccess(state.hasMicrophoneAccess)
+      setHasCameraAccess(state.hasCameraAccess)
       setErrorMessage(state.error)
     })
 
@@ -372,10 +418,10 @@ function App() {
               />
             </div>
 
-            <div className="mx-auto flex w-full max-w-7xl flex-col gap-3 px-4 py-4">
-              <div className="flex flex-wrap items-center gap-3">
+            <div className="mx-auto flex w-full max-w-7xl flex-col gap-2 px-4 py-2.5">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
-                  className="focus-ring rounded-full border border-app-tile-border bg-app-tile px-4 py-3 text-sm font-bold text-app-text disabled:cursor-not-allowed disabled:opacity-40"
+                  className="focus-ring rounded-full border border-app-tile-border bg-app-tile px-4 py-2 text-sm font-bold text-app-text disabled:cursor-not-allowed disabled:opacity-40"
                   type="button"
                   onClick={navigateBack}
                   disabled={!canGoBack}
@@ -384,7 +430,7 @@ function App() {
                 </button>
 
                 <button
-                  className="focus-ring rounded-full border border-app-tile-border bg-app-tile px-4 py-3 text-sm font-bold text-app-text disabled:cursor-not-allowed disabled:opacity-40"
+                  className="focus-ring rounded-full border border-app-tile-border bg-app-tile px-4 py-2 text-sm font-bold text-app-text disabled:cursor-not-allowed disabled:opacity-40"
                   type="button"
                   onClick={navigateForward}
                   disabled={!canGoForward}
@@ -393,7 +439,7 @@ function App() {
                 </button>
 
                 <button
-                  className="focus-ring rounded-full border border-app-tile-border bg-app-tile px-4 py-3 text-sm font-bold text-app-text"
+                  className="focus-ring rounded-full border border-app-tile-border bg-app-tile px-4 py-2 text-sm font-bold text-app-text"
                   type="button"
                   onClick={reloadPage}
                 >
@@ -401,7 +447,7 @@ function App() {
                 </button>
 
                 <button
-                  className="focus-ring rounded-full border border-app-tile-border bg-slate-50 px-4 py-3 text-sm font-bold text-app-text hover:bg-slate-100"
+                  className="focus-ring rounded-full border border-app-tile-border bg-slate-50 px-4 py-2 text-sm font-bold text-app-text hover:bg-slate-100"
                   type="button"
                   onClick={goHome}
                 >
@@ -409,7 +455,7 @@ function App() {
                 </button>
 
                 <form
-                  className="min-w-[320px] flex-1 rounded-full border border-app-tile-border bg-app-tile px-4 py-2"
+                  className="min-w-[320px] flex-1 rounded-full border border-app-tile-border bg-app-tile px-4 py-1"
                   onSubmit={handleSearchSubmit}
                 >
                   <label className="sr-only" htmlFor="browser-address">
@@ -421,14 +467,14 @@ function App() {
                       type="text"
                       value={inputValue}
                       onChange={(event) => setInputValue(event.target.value)}
-                      className="focus-ring w-full rounded-full bg-transparent px-3 py-2 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
+                      className="focus-ring w-full rounded-full bg-transparent px-3 py-1 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
                       placeholder="Wpisz adres strony lub wyszukaj"
                     />
 
                     <div className="relative flex shrink-0 items-center">
                       <button
                         aria-label="Kopiuj adres strony"
-                      className="focus-ring flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-app-text"
+                      className="focus-ring flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-app-text"
                         type="button"
                         onClick={copyCurrentUrl}
                       >
@@ -453,6 +499,11 @@ function App() {
                     </div>
                   </div>
                 </form>
+
+                <BrowserAccessIndicator
+                  hasMicrophoneAccess={hasMicrophoneAccess}
+                  hasCameraAccess={hasCameraAccess}
+                />
               </div>
             </div>
           </header>
