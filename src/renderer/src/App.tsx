@@ -1029,6 +1029,9 @@ function App() {
             onClick={closeDeleteModal}
           >
             <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="delete-user-title"
               className="w-full max-w-md rounded-[28px] border border-red-200 bg-white p-6 shadow-[0_28px_80px_rgba(15,23,42,0.24)]"
               onClick={(event) => {
                 event.stopPropagation()
@@ -1041,7 +1044,7 @@ function App() {
                   </div>
 
                   <div>
-                    <h2 className="text-xl font-bold text-app-text">
+                    <h2 id="delete-user-title" className="text-xl font-bold text-app-text">
                       Czy na pewno chcesz usunąć użytkownika?
                     </h2>
                     <p className="mt-2 text-sm leading-6 text-slate-500">
