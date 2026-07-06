@@ -11,6 +11,8 @@ type BrowserState = {
   error: string | null
   hasMicrophoneAccess: boolean
   hasCameraAccess: boolean
+  isFavorite: boolean
+  browserFaviconUrl: string | null
 }
 
 type UserProfile = {
@@ -21,9 +23,18 @@ type UserProfile = {
   createdAt: string
 }
 
+type FavoriteEntry = {
+  url: string
+  title: string
+  faviconUrl: string | null
+  createdAt: string
+  updatedAt: string
+}
+
 type UserState = {
   users: UserProfile[]
   activeUserId: string | null
+  favorites: FavoriteEntry[]
 }
 
 contextBridge.exposeInMainWorld('easybrowser', {
@@ -42,6 +53,9 @@ contextBridge.exposeInMainWorld('easybrowser', {
   goBack: () => ipcRenderer.invoke('browser:back'),
   goForward: () => ipcRenderer.invoke('browser:forward'),
   reload: () => ipcRenderer.invoke('browser:reload'),
+  toggleFavorite: () => ipcRenderer.invoke('browser:toggle-favorite') as Promise<boolean>,
+  removeFavorite: (url: string) =>
+    ipcRenderer.invoke('browser:remove-favorite', url) as Promise<UserState>,
   toggleMaximize: () => ipcRenderer.invoke('browser:toggle-maximize'),
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),

@@ -8,7 +8,7 @@ import {
   shell,
   WebContentsView
 } from 'electron'
-import { randomBytes } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -39,6 +39,14 @@ type UserStore = {
 type UserKeyStore = Record<string, string>
 type MediaAccessType = 'audio' | 'video'
 type UserMediaPermissionStore = Record<string, Record<string, MediaAccessType[]>>
+type FavoriteEntry = {
+  url: string
+  title: string
+  faviconUrl: string | null
+  createdAt: string
+  updatedAt: string
+}
+type UserFavoritesStore = Record<string, FavoriteEntry[]>
 
 let mainWindow: BrowserWindow | null = null
 let browserView: WebContentsView | null = null
@@ -47,10 +55,14 @@ let browserMode: BrowserMode = 'home'
 let lastError: string | null = null
 let browserChromeHeight = 122
 let browserCssKey: string | null = null
+let browserFaviconUrl: string | null = null
 let userStore: UserStore | null = null
 let userKeyStore: UserKeyStore | null = null
 let userMediaPermissionStore: UserMediaPermissionStore | null = null
+let userFavoritesStore: UserFavoritesStore | null = null
 const pendingMediaPermissionRequests = new Map<string, Promise<PermissionPromptAction>>()
+const faviconDataUrlCache = new Map<string, string | null>()
+const pageFaviconCache = new Map<string, string>()
 
 const DEFAULT_USERS: UserProfile[] = []
 const DEV_PLAIN_KEY_PREFIX = 'dev-plain:'
@@ -134,6 +146,14 @@ function getUserKeyStorePath(): string {
   return path.join(app.getPath('userData'), 'user-keys.json')
 }
 
+function getUserFavoritesDirectoryPath(): string {
+  return path.join(app.getPath('userData'), 'favorites')
+}
+
+function getUserFavoritesPath(userId: string): string {
+  return path.join(getUserFavoritesDirectoryPath(), `${userId}.json.enc`)
+}
+
 function getInitials(value: string): string {
   const parts = value
     .trim()
@@ -166,6 +186,205 @@ function loadUserMediaPermissionStore(): UserMediaPermissionStore {
 
   userMediaPermissionStore = {}
   return userMediaPermissionStore
+}
+
+function loadUserFavoritesStore(): UserFavoritesStore {
+  if (userFavoritesStore) {
+    return userFavoritesStore
+  }
+
+  userFavoritesStore = {}
+  return userFavoritesStore
+}
+
+function getUserDataKey(userId: string): Buffer {
+  const storedValue = loadUserKeyStore()[userId]
+
+  if (typeof storedValue !== 'string' || storedValue.length === 0) {
+    throw new Error('Nie znaleziono klucza danych użytkownika.')
+  }
+
+  if (storedValue.startsWith(DEV_PLAIN_KEY_PREFIX)) {
+    return Buffer.from(storedValue.slice(DEV_PLAIN_KEY_PREFIX.length), 'base64')
+  }
+
+  assertSecureUserKeyStorageAvailable()
+
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
+  }
+
+  const decryptedValue = safeStorage.decryptString(Buffer.from(storedValue, 'base64'))
+  return Buffer.from(decryptedValue, 'base64')
+}
+
+function encryptUserPayload(userId: string, payload: string): string {
+  const key = createHash('sha256').update(getUserDataKey(userId)).digest()
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  const encryptedValue = Buffer.concat([cipher.update(payload, 'utf8'), cipher.final()])
+  const authTag = cipher.getAuthTag()
+
+  return JSON.stringify({
+    iv: iv.toString('base64'),
+    tag: authTag.toString('base64'),
+    content: encryptedValue.toString('base64')
+  })
+}
+
+function decryptUserPayload(userId: string, payload: string): string {
+  const parsedPayload = JSON.parse(payload) as {
+    iv?: string
+    tag?: string
+    content?: string
+  }
+
+  if (!parsedPayload.iv || !parsedPayload.tag || !parsedPayload.content) {
+    throw new Error('Nieprawidłowy format zaszyfrowanych danych użytkownika.')
+  }
+
+  const key = createHash('sha256').update(getUserDataKey(userId)).digest()
+  const decipher = createDecipheriv(
+    'aes-256-gcm',
+    key,
+    Buffer.from(parsedPayload.iv, 'base64')
+  )
+  decipher.setAuthTag(Buffer.from(parsedPayload.tag, 'base64'))
+
+  return Buffer.concat([
+    decipher.update(Buffer.from(parsedPayload.content, 'base64')),
+    decipher.final()
+  ]).toString('utf8')
+}
+
+function normalizeFavoriteEntries(entries: FavoriteEntry[]): FavoriteEntry[] {
+  return entries
+    .filter((entry) => {
+      return (
+        entry &&
+        typeof entry.url === 'string' &&
+        entry.url.length > 0 &&
+        typeof entry.title === 'string' &&
+        (typeof entry.faviconUrl === 'string' || entry.faviconUrl === null || entry.faviconUrl === undefined) &&
+        typeof entry.createdAt === 'string' &&
+        typeof entry.updatedAt === 'string'
+      )
+    })
+    .map((entry) => ({
+      ...entry,
+      faviconUrl: typeof entry.faviconUrl === 'string' ? entry.faviconUrl : null
+    }))
+    .sort((left, right) => left.title.localeCompare(right.title, 'pl'))
+}
+
+function getUserFavorites(userId: string): FavoriteEntry[] {
+  const store = loadUserFavoritesStore()
+
+  if (store[userId]) {
+    return store[userId]
+  }
+
+  const filePath = getUserFavoritesPath(userId)
+
+  try {
+    if (fs.existsSync(filePath)) {
+      const encryptedPayload = fs.readFileSync(filePath, 'utf8')
+      const decryptedPayload = decryptUserPayload(userId, encryptedPayload)
+      const parsedFavorites = JSON.parse(decryptedPayload) as FavoriteEntry[]
+      const normalizedFavorites = Array.isArray(parsedFavorites)
+        ? normalizeFavoriteEntries(parsedFavorites)
+        : []
+      store[userId] = normalizedFavorites
+      return normalizedFavorites
+    }
+  } catch {
+    // Fall back to empty favorites when encrypted data cannot be read.
+  }
+
+  store[userId] = []
+  return store[userId]
+}
+
+function saveUserFavorites(userId: string, favorites: FavoriteEntry[]): void {
+  const normalizedFavorites = normalizeFavoriteEntries(favorites)
+  const store = loadUserFavoritesStore()
+  store[userId] = normalizedFavorites
+
+  const directoryPath = getUserFavoritesDirectoryPath()
+  fs.mkdirSync(directoryPath, { recursive: true })
+
+  const encryptedPayload = encryptUserPayload(userId, JSON.stringify(normalizedFavorites))
+  fs.writeFileSync(getUserFavoritesPath(userId), encryptedPayload, 'utf8')
+}
+
+function isFavoriteUrl(userId: string | null, rawUrl: string): boolean {
+  if (!userId || !isSafeBrowserUrl(rawUrl)) {
+    return false
+  }
+
+  return getUserFavorites(userId).some((favorite) => favorite.url === rawUrl)
+}
+
+function toggleFavoriteForCurrentPage(): boolean {
+  const userId = getActiveUserId()
+  const currentUrl = browserView?.webContents.getURL() ?? ''
+
+  if (!userId) {
+    throw new Error('Najpierw wybierz użytkownika.')
+  }
+
+  if (!isSafeBrowserUrl(currentUrl)) {
+    throw new Error('Nie można dodać tej strony do ulubionych.')
+  }
+
+  const favorites = getUserFavorites(userId)
+  const existingFavorite = favorites.find((favorite) => favorite.url === currentUrl)
+
+  if (existingFavorite) {
+    saveUserFavorites(
+      userId,
+      favorites.filter((favorite) => favorite.url !== currentUrl)
+    )
+    sendBrowserState()
+    return false
+  }
+
+  const timestamp = new Date().toISOString()
+  const pageTitle = browserView?.webContents.getTitle()?.trim() || currentUrl
+
+  saveUserFavorites(userId, [
+    ...favorites,
+    {
+      url: currentUrl,
+      title: pageTitle,
+      faviconUrl: browserFaviconUrl,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    }
+  ])
+  sendBrowserState()
+  return true
+}
+
+function removeFavoriteForActiveUser(rawUrl: string) {
+  const userId = getActiveUserId()
+
+  if (!userId) {
+    throw new Error('Najpierw wybierz użytkownika.')
+  }
+
+  if (!isSafeBrowserUrl(rawUrl)) {
+    throw new Error('Nie można usunąć tej strony z ulubionych.')
+  }
+
+  const favorites = getUserFavorites(userId)
+  saveUserFavorites(
+    userId,
+    favorites.filter((favorite) => favorite.url !== rawUrl)
+  )
+  sendBrowserState()
+
+  return getUserState()
 }
 
 function getGrantedMediaTypes(userId: string | null, origin: string): MediaAccessType[] {
@@ -247,6 +466,20 @@ function clearUserMediaPermissions(userId: string): void {
   delete store[userId]
 }
 
+function clearUserFavorites(userId: string): void {
+  const store = loadUserFavoritesStore()
+
+  if (userId in store) {
+    delete store[userId]
+  }
+
+  const filePath = getUserFavoritesPath(userId)
+
+  if (fs.existsSync(filePath)) {
+    fs.rmSync(filePath, { force: true })
+  }
+}
+
 function isAllowedPermissionOrigin(rawUrl: string): boolean {
   try {
     const parsedUrl = new URL(rawUrl)
@@ -276,6 +509,218 @@ function isSafeBrowserUrl(rawUrl: string): boolean {
     return ALLOWED_BROWSER_PROTOCOLS.has(parsedUrl.protocol)
   } catch {
     return false
+  }
+}
+
+function buildFallbackFaviconCandidates(rawUrl: string): string[] {
+  try {
+    const parsedUrl = new URL(rawUrl)
+
+    if (!ALLOWED_BROWSER_PROTOCOLS.has(parsedUrl.protocol)) {
+      return []
+    }
+
+    return [
+      `${parsedUrl.origin}/favicon.ico`,
+      `${parsedUrl.origin}/apple-touch-icon.png`
+    ]
+  } catch {
+    return []
+  }
+}
+
+function getFaviconCacheKey(rawUrl: string): string | null {
+  try {
+    const parsedUrl = new URL(rawUrl)
+
+    if (!ALLOWED_BROWSER_PROTOCOLS.has(parsedUrl.protocol)) {
+      return null
+    }
+
+    return parsedUrl.origin
+  } catch {
+    return null
+  }
+}
+
+function getCachedPageFavicon(rawUrl: string): string | null {
+  const cacheKey = getFaviconCacheKey(rawUrl)
+
+  if (!cacheKey) {
+    return null
+  }
+
+  return pageFaviconCache.get(cacheKey) ?? null
+}
+
+function rememberPageFavicon(rawUrl: string, dataUrl: string): void {
+  const cacheKey = getFaviconCacheKey(rawUrl)
+
+  if (!cacheKey) {
+    return
+  }
+
+  pageFaviconCache.set(cacheKey, dataUrl)
+}
+
+function updateFavoriteFavicon(userId: string | null, rawUrl: string, faviconUrl: string): void {
+  if (!userId || !isSafeBrowserUrl(rawUrl)) {
+    return
+  }
+
+  const favorites = getUserFavorites(userId)
+  const favoriteIndex = favorites.findIndex((favorite) => favorite.url === rawUrl)
+
+  if (favoriteIndex === -1 || favorites[favoriteIndex]?.faviconUrl === faviconUrl) {
+    return
+  }
+
+  const timestamp = new Date().toISOString()
+  const nextFavorites = favorites.map((favorite, index) => {
+    if (index !== favoriteIndex) {
+      return favorite
+    }
+
+    return {
+      ...favorite,
+      faviconUrl,
+      updatedAt: timestamp
+    }
+  })
+
+  saveUserFavorites(userId, nextFavorites)
+}
+
+function applyCachedPageFavicon(rawUrl: string, shouldClearMissing = false): void {
+  const cachedFavicon = getCachedPageFavicon(rawUrl)
+  browserFaviconUrl = cachedFavicon ?? (shouldClearMissing ? null : browserFaviconUrl)
+  sendBrowserState()
+}
+
+async function fetchFaviconAsDataUrl(
+  targetSession: Electron.Session,
+  faviconUrl: string
+): Promise<string | null> {
+  const cachedValue = faviconDataUrlCache.get(faviconUrl)
+
+  if (cachedValue !== undefined) {
+    return cachedValue
+  }
+
+  try {
+    const response = await targetSession.fetch(faviconUrl)
+
+    if (!response.ok) {
+      faviconDataUrlCache.set(faviconUrl, null)
+      return null
+    }
+
+    const contentType = response.headers.get('content-type') || 'image/png'
+
+    if (!contentType.startsWith('image/')) {
+      faviconDataUrlCache.set(faviconUrl, null)
+      return null
+    }
+
+    const arrayBuffer = await response.arrayBuffer()
+    const dataUrl = `data:${contentType};base64,${Buffer.from(arrayBuffer).toString('base64')}`
+    faviconDataUrlCache.set(faviconUrl, dataUrl)
+    return dataUrl
+  } catch {
+    faviconDataUrlCache.set(faviconUrl, null)
+    return null
+  }
+}
+
+async function extractPageIconCandidates(view: WebContentsView): Promise<string[]> {
+  try {
+    const rawValue = await view.webContents.executeJavaScript(`
+      (() => {
+        const nodes = Array.from(document.querySelectorAll('link[rel]'));
+        return nodes
+          .filter((node) => {
+            const rel = String(node.getAttribute('rel') || '').toLowerCase();
+            return rel.includes('icon');
+          })
+          .sort((left, right) => {
+            const leftSizes = String(left.getAttribute('sizes') || '');
+            const rightSizes = String(right.getAttribute('sizes') || '');
+            return rightSizes.length - leftSizes.length;
+          })
+          .map((node) => node.href)
+          .filter((value) => typeof value === 'string' && value.length > 0);
+      })()
+    `)
+
+    return Array.isArray(rawValue)
+      ? rawValue.filter((value): value is string => typeof value === 'string' && value.length > 0)
+      : []
+  } catch {
+    return []
+  }
+}
+
+async function updateBrowserFavicon(view: WebContentsView, candidateUrls: string[] = []): Promise<void> {
+  const currentPageUrl = view.webContents.getURL()
+  const activeUserId = getActiveUserId()
+  const cachedFavicon = getCachedPageFavicon(currentPageUrl)
+
+  if (cachedFavicon && !browserFaviconUrl) {
+    browserFaviconUrl = cachedFavicon
+    sendBrowserState()
+  }
+
+  const pageIconCandidates = await extractPageIconCandidates(view)
+
+  if (currentPageUrl !== view.webContents.getURL()) {
+    return
+  }
+
+  const combinedCandidates = [
+    ...candidateUrls,
+    ...pageIconCandidates,
+    ...buildFallbackFaviconCandidates(currentPageUrl)
+  ].filter((value, index, array) => {
+    return typeof value === 'string' && value.length > 0 && array.indexOf(value) === index
+  })
+
+  if (combinedCandidates.length === 0) {
+    if (!browserFaviconUrl) {
+      sendBrowserState()
+    }
+    return
+  }
+
+  for (const candidateUrl of combinedCandidates) {
+    if (candidateUrl.startsWith('data:image/')) {
+      rememberPageFavicon(currentPageUrl, candidateUrl)
+      updateFavoriteFavicon(activeUserId, currentPageUrl, candidateUrl)
+      browserFaviconUrl = candidateUrl
+      sendBrowserState()
+      return
+    }
+
+    if (!isSafeBrowserUrl(candidateUrl)) {
+      continue
+    }
+
+    const dataUrl = await fetchFaviconAsDataUrl(view.webContents.session, candidateUrl)
+
+    if (currentPageUrl !== view.webContents.getURL()) {
+      return
+    }
+
+    if (dataUrl) {
+      rememberPageFavicon(currentPageUrl, dataUrl)
+      updateFavoriteFavicon(activeUserId, currentPageUrl, dataUrl)
+      browserFaviconUrl = dataUrl
+      sendBrowserState()
+      return
+    }
+  }
+
+  if (!browserFaviconUrl) {
+    sendBrowserState()
   }
 }
 
@@ -853,10 +1298,12 @@ async function clearUserBrowsingData(userId: string): Promise<void> {
 
 function getUserState() {
   const store = loadUserStore()
+  const favorites = store.activeUserId ? getUserFavorites(store.activeUserId) : []
 
   return {
     users: store.users,
-    activeUserId: store.activeUserId
+    activeUserId: store.activeUserId,
+    favorites
   }
 }
 
@@ -913,19 +1360,24 @@ function sendBrowserState(): void {
     return
   }
 
-  const mediaAccessState = getGrantedMediaAccessState(getActiveUserId(), browserView?.webContents.getURL() ?? '')
+  const currentUrl = browserView?.webContents.getURL() ?? ''
+  const activeUserId = getActiveUserId()
+  const mediaAccessState = getGrantedMediaAccessState(activeUserId, currentUrl)
+  const effectiveBrowserFaviconUrl = browserFaviconUrl || getCachedPageFavicon(currentUrl)
 
   mainWindow.webContents.send('browser:state', {
     mode: browserMode,
-    url: browserView?.webContents.getURL() ?? '',
+    url: currentUrl,
     title: browserView?.webContents.getTitle() || 'Easybrowser',
     isLoading: browserView?.webContents.isLoading() ?? false,
-    canGoBack: browserView?.webContents.canGoBack() ?? false,
-    canGoForward: browserView?.webContents.canGoForward() ?? false,
+    canGoBack: browserView?.webContents.navigationHistory.canGoBack() ?? false,
+    canGoForward: browserView?.webContents.navigationHistory.canGoForward() ?? false,
     isMaximized: mainWindow.isMaximized(),
     error: lastError,
     hasMicrophoneAccess: mediaAccessState.hasMicrophoneAccess,
-    hasCameraAccess: mediaAccessState.hasCameraAccess
+    hasCameraAccess: mediaAccessState.hasCameraAccess,
+    isFavorite: isFavoriteUrl(activeUserId, currentUrl),
+    browserFaviconUrl: effectiveBrowserFaviconUrl
   })
 }
 
@@ -966,13 +1418,25 @@ function wireBrowserView(view: WebContentsView): void {
     }
   })
 
-  view.webContents.on('did-start-loading', syncBrowserState)
+  view.webContents.on('did-start-loading', () => {
+    syncBrowserState()
+  })
   view.webContents.on('did-stop-loading', syncBrowserState)
-  view.webContents.on('did-navigate', syncBrowserState)
-  view.webContents.on('did-navigate-in-page', syncBrowserState)
+  view.webContents.on('did-navigate', (_event, navigationUrl) => {
+    applyCachedPageFavicon(navigationUrl, true)
+    void updateBrowserFavicon(view)
+  })
+  view.webContents.on('did-navigate-in-page', (_event, navigationUrl) => {
+    applyCachedPageFavicon(navigationUrl)
+    void updateBrowserFavicon(view)
+  })
   view.webContents.on('page-title-updated', syncBrowserState)
+  view.webContents.on('page-favicon-updated', (_event, favicons) => {
+    void updateBrowserFavicon(view, favicons)
+  })
   view.webContents.on('dom-ready', () => {
     void injectBrowserCss()
+    void updateBrowserFavicon(view)
     syncBrowserState()
   })
   view.webContents.on(
@@ -1183,6 +1647,7 @@ ipcMain.handle('users:delete', async (_event, userId: string) => {
   await clearUserBrowsingData(userId)
   removeStoredUserDataKey(userId)
   clearUserMediaPermissions(userId)
+  clearUserFavorites(userId)
   saveUserStore(store)
   browserMode = 'home'
   lastError = null
@@ -1213,6 +1678,14 @@ ipcMain.handle('browser:forward', () => {
 
 ipcMain.handle('browser:reload', () => {
   browserView?.webContents.reload()
+})
+
+ipcMain.handle('browser:toggle-favorite', () => {
+  return toggleFavoriteForCurrentPage()
+})
+
+ipcMain.handle('browser:remove-favorite', (_event, url: string) => {
+  return removeFavoriteForActiveUser(url)
 })
 
 ipcMain.handle('browser:toggle-maximize', () => {

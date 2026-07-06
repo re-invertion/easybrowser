@@ -12,6 +12,8 @@ declare global {
     error: string | null
     hasMicrophoneAccess: boolean
     hasCameraAccess: boolean
+    isFavorite: boolean
+    browserFaviconUrl: string | null
   }
 
   type UserProfile = {
@@ -22,9 +24,18 @@ declare global {
     createdAt: string
   }
 
+  type FavoriteEntry = {
+    url: string
+    title: string
+    faviconUrl: string | null
+    createdAt: string
+    updatedAt: string
+  }
+
   type UserState = {
     users: UserProfile[]
     activeUserId: string | null
+    favorites: FavoriteEntry[]
   }
 
   interface Window {
@@ -40,6 +51,8 @@ declare global {
       goBack: () => Promise<void>
       goForward: () => Promise<void>
       reload: () => Promise<void>
+      toggleFavorite: () => Promise<boolean>
+      removeFavorite: (url: string) => Promise<UserState>
       toggleMaximize: () => Promise<void>
       minimizeWindow: () => Promise<void>
       closeWindow: () => Promise<void>

@@ -37,6 +37,8 @@ The goal is to create a simple and very secure browser for eldery and non techni
 - After choosing a profile, the user sees a simplified home screen with a large search field.
 - Entering a query or address opens the browsing mode.
 - Returning to the home screen clears the main search field so it never shows leftover URLs from the browser view.
+- The home screen also renders the active user's favorite pages as large tiles.
+- Favorite tiles can be clicked to open the saved page or removed directly from the home screen.
 
 ## Current Browser Architecture
 - Each user gets a separate persistent Chromium partition: `persist:easybrowser-user-{userId}`.
@@ -46,9 +48,15 @@ The goal is to create a simple and very secure browser for eldery and non techni
   - forward,
   - reload,
   - go home,
+  - add or remove the current page from favorites,
   - copy current URL,
   - custom window controls.
 - The browser chrome height is reported from the renderer to the main process so the `WebContentsView` can be resized correctly below the custom header.
+- The address field shows the current page favicon on the left and keeps user edits stable while the user is typing.
+- The address field never restores a browser URL into the home search field.
+- Favicons are resolved from Electron favicon events, page `<link rel="icon">` candidates, `/favicon.ico`, and `/apple-touch-icon.png`.
+- Successful favicon responses are cached per origin as data URLs so the icon does not flicker or disappear during later loading events.
+- The renderer has an additional visual fallback chain for favicon display.
 
 ## Current Security Model
 - `contextIsolation` is enabled.
@@ -87,6 +95,9 @@ The goal is to create a simple and very secure browser for eldery and non techni
   - stores the user list and current active user id.
 - `user-keys.json`
   - stores encrypted per-user data keys.
+- `favorites/{userId}.json.enc`
+  - stores the active user's favorite pages encrypted with the user's data key.
+  - each favorite contains the URL, title, optional favicon data, and timestamps.
 - Media permission grants are not persisted to disk.
 
 ## Current UI State
@@ -94,6 +105,11 @@ The goal is to create a simple and very secure browser for eldery and non techni
 - The interface uses `Atkinson Hyperlegible`.
 - The browser top bar has already been slightly compacted to reduce vertical space.
 - The browsing header now includes a right-side status badge for active microphone and camera access.
+- The browser address bar includes:
+  - a left-side favicon,
+  - a favorite star action,
+  - a copy URL action.
+- The user home screen includes favorite page tiles with favicon rendering and a delete action.
 
 ## Visual Design Rules
 - Background: `#F8FAFC`
