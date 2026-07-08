@@ -66,6 +66,11 @@ The goal is to create a simple and very secure browser for eldery and non techni
 - New windows are blocked and safe links are opened externally through the OS.
 - Browser sessions use explicit Electron permission handlers.
 - User data keys are stored with `safeStorage` when secure system storage is available.
+- The browser administrator PIN is not stored in plain text:
+  - the PIN itself is never persisted,
+  - only `pinSalt`, `pinHash`, `failedAttempts`, and `lockedUntil` are stored.
+- Global browser settings are stored in a single encrypted `browser-settings.json` payload.
+- User favorites are stored in per-user encrypted payload files.
 
 ## Current Permissions Model
 - Media permissions are handled with a custom in-app modal instead of the native Electron message box.
@@ -93,12 +98,30 @@ The goal is to create a simple and very secure browser for eldery and non techni
 ## Current Data Storage
 - `users.json`
   - stores the user list and current active user id.
+  - the whole file payload is encrypted directly with Electron `safeStorage`.
 - `user-keys.json`
-  - stores encrypted per-user data keys.
+  - stores per-user data keys.
+  - when secure system storage is available, each stored key is protected with Electron `safeStorage`.
+  - in local development fallback mode, keys may be stored as `dev-plain:*`.
 - `favorites/{userId}.json.enc`
   - stores the active user's favorite pages encrypted with the user's data key.
   - each favorite contains the URL, title, optional favicon data, and timestamps.
+  - payload encryption uses `AES-256-GCM`.
+  - the encryption key is derived from the per-user data key stored in `user-keys.json`.
+- `browser-settings.json`
+  - stores global browser settings such as:
+    - `accessibility.visibleFocus`
+    - administrator PIN metadata: `pinSalt`, `pinHash`, `failedAttempts`, `lockedUntil`
+  - the whole file payload is encrypted directly with Electron `safeStorage`.
+- Chromium session storage for each user partition
+  - each user gets a separate persistent partition: `persist:easybrowser-user-{userId}`.
+  - Chromium stores cookies, cache, local storage, and other browser session data there.
+  - this storage is isolated per user, but it is not additionally encrypted by Easybrowser itself.
 - Media permission grants are not persisted to disk.
+- The following state is intentionally memory-only:
+  - media permission grants,
+  - administrator unlocked session state,
+  - favicon cache.
 
 ## Current UI State
 - All user-facing strings remain in Polish.
@@ -110,6 +133,8 @@ The goal is to create a simple and very secure browser for eldery and non techni
   - a favorite star action,
   - a copy URL action.
 - The user home screen includes favorite page tiles with favicon rendering and a delete action.
+- The admin panel is protected by an administrator PIN gate before access is granted.
+- The admin panel includes an accessibility setting for toggling the visible yellow focus outline.
 
 ## Visual Design Rules
 - Background: `#F8FAFC`

@@ -10,6 +10,8 @@ import {
 } from 'react-icons/fi'
 
 type ViewMode = 'home' | 'browser'
+type AppMenuMode = 'closed' | 'main'
+type AdminGateMode = 'closed' | 'setup' | 'verify'
 
 type BrowserAccessIndicatorState = {
   hasMicrophoneAccess: boolean
@@ -17,6 +19,21 @@ type BrowserAccessIndicatorState = {
 }
 
 const GOOGLE_HOME_URL = 'https://www.google.pl/?hl=pl&gl=PL&pws=0'
+
+function getAdminLockMessage(lockedUntil: string | null): string | null {
+  if (!lockedUntil) {
+    return null
+  }
+
+  const remainingMs = Date.parse(lockedUntil) - Date.now()
+
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    return null
+  }
+
+  const remainingSeconds = Math.max(1, Math.ceil(remainingMs / 1000))
+  return `Panel administracyjny jest zablokowany jeszcze przez około ${remainingSeconds} s.`
+}
 
 function getFavoriteFaviconUrl(rawUrl: string): string | null {
   try {
@@ -272,6 +289,42 @@ function BrowserAddressFavicon({
   )
 }
 
+function AppBrandMenu({
+  isOpen,
+  onOpen,
+  onOpenAdminPanel
+}: {
+  isOpen: boolean
+  onOpen: () => void
+  onOpenAdminPanel: () => void
+}) {
+  return (
+    <div className="app-no-drag relative" data-app-menu-root="main">
+      <div
+        className="inline-flex items-center rounded-xl px-2 py-1 text-sm font-bold text-app-text"
+        onContextMenu={(event) => {
+          event.preventDefault()
+          onOpen()
+        }}
+      >
+        Przegladarka
+      </div>
+
+      {isOpen ? (
+        <div className="absolute top-[calc(100%+0.45rem)] left-0 z-30 min-w-[220px] rounded-2xl border border-app-tile-border bg-app-tile p-2 shadow-[0_18px_40px_rgba(148,163,184,0.18)]">
+          <button
+            type="button"
+            className="focus-ring flex w-full rounded-xl px-3 py-2.5 text-left text-sm font-medium text-app-text transition hover:bg-slate-100"
+            onClick={onOpenAdminPanel}
+          >
+            Panel administracyjny
+          </button>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function App() {
   const browserChromeRef = useRef<HTMLElement | null>(null)
   const isEditingAddressRef = useRef(false)
@@ -296,6 +349,17 @@ function App() {
   const [isAddingUser, setIsAddingUser] = useState(false)
   const [newUserName, setNewUserName] = useState('')
   const [openUserMenuId, setOpenUserMenuId] = useState<string | null>(null)
+  const [openAppMenu, setOpenAppMenu] = useState<AppMenuMode>('closed')
+  const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false)
+  const [adminPinStatus, setAdminPinStatus] = useState<AdminPinStatus | null>(null)
+  const [adminGateMode, setAdminGateMode] = useState<AdminGateMode>('closed')
+  const [adminPinValue, setAdminPinValue] = useState('')
+  const [adminPinConfirmValue, setAdminPinConfirmValue] = useState('')
+  const [adminPinErrorMessage, setAdminPinErrorMessage] = useState<string | null>(null)
+  const [isSubmittingAdminPin, setIsSubmittingAdminPin] = useState(false)
+  const [accessibilitySettings, setAccessibilitySettings] = useState<AccessibilitySettings>({
+    visibleFocus: true
+  })
   const [userPendingDeletion, setUserPendingDeletion] = useState<UserProfile | null>(null)
 
   const selectedUser = users.find((user) => user.id === selectedUserId) ?? null
@@ -303,10 +367,16 @@ function App() {
   useEffect(() => {
     const loadUsers = async () => {
       try {
-        const state = await window.easybrowser.getUserState()
+        const [state, nextAdminPinStatus, nextAccessibilitySettings] = await Promise.all([
+          window.easybrowser.getUserState(),
+          window.easybrowser.getAdminPinStatus(),
+          window.easybrowser.getAccessibilitySettings()
+        ])
         setUsers(state.users)
         setSelectedUserId(state.activeUserId)
         setFavorites(state.favorites)
+        setAdminPinStatus(nextAdminPinStatus)
+        setAccessibilitySettings(nextAccessibilitySettings)
       } catch (error) {
         setErrorMessage(
           error instanceof Error ? error.message : 'Nie udało się wczytać użytkowników.'
@@ -397,11 +467,55 @@ function App() {
     }
   }, [openUserMenuId])
 
+  useEffect(() => {
+    if (openAppMenu === 'closed') {
+      return
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target
+
+      if (!(target instanceof HTMLElement)) {
+        return
+      }
+
+      if (target.closest('[data-app-menu-root="main"]')) {
+        return
+      }
+
+      setOpenAppMenu('closed')
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown)
+
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown)
+    }
+  }, [openAppMenu])
+
+  useEffect(() => {
+    document.documentElement.dataset.visibleFocus = accessibilitySettings.visibleFocus
+      ? 'on'
+      : 'off'
+  }, [accessibilitySettings.visibleFocus])
+
   const applyUserState = (state: UserState) => {
     setUsers(state.users)
     setSelectedUserId(state.activeUserId)
     setFavorites(state.favorites)
     setErrorMessage(null)
+  }
+
+  const resetAdminPinForm = () => {
+    setAdminPinValue('')
+    setAdminPinConfirmValue('')
+    setAdminPinErrorMessage(null)
+  }
+
+  const refreshAdminPinStatus = async () => {
+    const nextStatus = await window.easybrowser.getAdminPinStatus()
+    setAdminPinStatus(nextStatus)
+    return nextStatus
   }
 
   const openInBrowser = async (rawValue: string) => {
@@ -435,8 +549,13 @@ function App() {
   const handleClearActiveUser = async () => {
     try {
       const state = await window.easybrowser.clearActiveUser()
+      const nextAdminPinStatus = await window.easybrowser.clearAdminSession()
       applyUserState(state)
+      setAdminPinStatus(nextAdminPinStatus)
       setIsAddingUser(false)
+      setIsAdminPanelOpen(false)
+      setAdminGateMode('closed')
+      setOpenAppMenu('closed')
       setNewUserName('')
       setInputValue('')
       setCurrentUrl(GOOGLE_HOME_URL)
@@ -478,6 +597,9 @@ function App() {
 
   const goHome = async () => {
     await window.easybrowser.goHome()
+    setIsAdminPanelOpen(false)
+    setAdminGateMode('closed')
+    setOpenAppMenu('closed')
     setInputValue('')
     setCurrentUrl(GOOGLE_HOME_URL)
     setPageTitle('Easybrowser')
@@ -547,6 +669,249 @@ function App() {
     setUserPendingDeletion(null)
   }
 
+  const finishOpeningAdminPanel = async () => {
+    resetAdminPinForm()
+    setAdminGateMode('closed')
+    setIsAdminPanelOpen(true)
+  }
+
+  const openAdminPanel = async () => {
+    setOpenAppMenu('closed')
+    resetAdminPinForm()
+
+    try {
+      if (mode === 'browser') {
+        await window.easybrowser.goHome()
+      }
+
+      const nextStatus = await refreshAdminPinStatus()
+
+      if (!nextStatus.isSet) {
+        setAdminGateMode('setup')
+        return
+      }
+
+      if (nextStatus.isSessionUnlocked) {
+        await finishOpeningAdminPanel()
+        return
+      }
+
+      setAdminGateMode('verify')
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się otworzyć panelu administracyjnego.'
+      )
+    }
+  }
+
+  const closeAdminPanel = async () => {
+    const nextStatus = await window.easybrowser.clearAdminSession()
+    setAdminPinStatus(nextStatus)
+    setIsAdminPanelOpen(false)
+    setOpenAppMenu('closed')
+    resetAdminPinForm()
+    setAdminGateMode('closed')
+  }
+
+  const closeAdminGate = () => {
+    resetAdminPinForm()
+    setOpenAppMenu('closed')
+    setAdminGateMode('closed')
+  }
+
+  const toggleVisibleFocus = async (visibleFocus: boolean) => {
+    try {
+      const nextSettings = await window.easybrowser.setVisibleFocus(visibleFocus)
+      setAccessibilitySettings(nextSettings)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zmienić ustawień dostępności.'
+      )
+    }
+  }
+
+  const handleAdminPinSetupSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    if (adminPinValue !== adminPinConfirmValue) {
+      setAdminPinErrorMessage('Oba pola PIN-u muszą być identyczne.')
+      return
+    }
+
+    setIsSubmittingAdminPin(true)
+    setAdminPinErrorMessage(null)
+
+    try {
+      const nextStatus = await window.easybrowser.setAdminPin(adminPinValue)
+      setAdminPinStatus(nextStatus)
+      await finishOpeningAdminPanel()
+    } catch (error) {
+      setAdminPinErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się ustawić PIN-u administratora.'
+      )
+      await refreshAdminPinStatus()
+    } finally {
+      setIsSubmittingAdminPin(false)
+    }
+  }
+
+  const handleAdminPinVerifySubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setIsSubmittingAdminPin(true)
+    setAdminPinErrorMessage(null)
+
+    try {
+      const nextStatus = await window.easybrowser.verifyAdminPin(adminPinValue)
+      setAdminPinStatus(nextStatus)
+      await finishOpeningAdminPanel()
+    } catch (error) {
+      setAdminPinErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zweryfikować PIN-u administratora.'
+      )
+      await refreshAdminPinStatus()
+    } finally {
+      setIsSubmittingAdminPin(false)
+    }
+  }
+
+  const adminGateModal = adminGateMode !== 'closed' ? (
+    <div
+      className="absolute inset-0 z-[220] flex items-center justify-center bg-slate-950/36 px-4 backdrop-blur-[3px]"
+      onClick={() => {
+        if (!isSubmittingAdminPin) {
+          closeAdminGate()
+        }
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="admin-pin-title"
+        className="w-full max-w-md rounded-[28px] border border-app-tile-border bg-white p-6 shadow-[0_28px_80px_rgba(15,23,42,0.24)]"
+        onClick={(event) => {
+          event.stopPropagation()
+        }}
+      >
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+              Administracja
+            </p>
+            <h2 id="admin-pin-title" className="mt-2 text-2xl font-bold text-app-text">
+              {adminGateMode === 'setup'
+                ? 'Ustaw PIN administratora'
+                : 'Wpisz PIN administratora'}
+            </h2>
+            <p className="mt-2 text-sm leading-6 text-slate-500">
+              {adminGateMode === 'setup'
+                ? 'Ten PIN będzie potrzebny przed każdym wejściem do panelu administracyjnego.'
+                : 'Aby otworzyć panel administracyjny, wpisz wcześniej ustawiony PIN.'}
+            </p>
+          </div>
+
+          <button
+            type="button"
+            aria-label="Zamknij okno PIN-u administratora"
+            className="focus-ring flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-app-text"
+            onClick={closeAdminGate}
+            disabled={isSubmittingAdminPin}
+          >
+            <FiX aria-hidden="true" className="h-5 w-5" />
+          </button>
+        </div>
+
+        <form
+          className="mt-6"
+          onSubmit={(event) => {
+            if (adminGateMode === 'setup') {
+              void handleAdminPinSetupSubmit(event)
+              return
+            }
+
+            void handleAdminPinVerifySubmit(event)
+          }}
+        >
+          <label className="mb-2 block text-sm font-bold text-app-text" htmlFor="admin-pin">
+            PIN
+          </label>
+          <input
+            id="admin-pin"
+            type="password"
+            inputMode="numeric"
+            autoComplete="off"
+            value={adminPinValue}
+            onChange={(event) => setAdminPinValue(event.target.value)}
+            placeholder="4 do 6 cyfr"
+            className="focus-ring w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base tracking-[0.22em] text-app-text placeholder:tracking-normal placeholder:text-slate-400 focus:outline-none"
+            autoFocus
+            disabled={isSubmittingAdminPin}
+          />
+
+          {adminGateMode === 'setup' ? (
+            <>
+              <label
+                className="mt-4 mb-2 block text-sm font-bold text-app-text"
+                htmlFor="admin-pin-confirm"
+              >
+                Powtórz PIN
+              </label>
+              <input
+                id="admin-pin-confirm"
+                type="password"
+                inputMode="numeric"
+                autoComplete="off"
+                value={adminPinConfirmValue}
+                onChange={(event) => setAdminPinConfirmValue(event.target.value)}
+                placeholder="Wpisz PIN ponownie"
+                className="focus-ring w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base tracking-[0.22em] text-app-text placeholder:tracking-normal placeholder:text-slate-400 focus:outline-none"
+                disabled={isSubmittingAdminPin}
+              />
+            </>
+          ) : null}
+
+          {adminGateMode === 'verify' && adminPinStatus ? (
+            <p className="mt-3 text-sm text-slate-500">
+              Pozostało prób: {adminPinStatus.remainingAttempts}
+            </p>
+          ) : null}
+
+          {getAdminLockMessage(adminPinStatus?.lockedUntil ?? null) ? (
+            <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              {getAdminLockMessage(adminPinStatus?.lockedUntil ?? null)}
+            </div>
+          ) : null}
+
+          {adminPinErrorMessage ? (
+            <div className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              {adminPinErrorMessage}
+            </div>
+          ) : null}
+
+          <div className="mt-6 flex flex-wrap justify-end gap-3">
+            <button
+              type="button"
+              className="focus-ring rounded-full border border-app-tile-border px-5 py-3 text-sm font-bold text-app-text"
+              onClick={closeAdminGate}
+              disabled={isSubmittingAdminPin}
+            >
+              Anuluj
+            </button>
+            <button
+              type="submit"
+              className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={
+                isSubmittingAdminPin ||
+                Boolean(getAdminLockMessage(adminPinStatus?.lockedUntil ?? null))
+              }
+            >
+              {adminGateMode === 'setup' ? 'Ustaw PIN i otwórz panel' : 'Otwórz panel'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  ) : null
+
   if (isLoadingUsers) {
     return (
       <main className="flex h-screen overflow-hidden bg-app text-app-text">
@@ -569,9 +934,15 @@ function App() {
           >
             <div className="flex h-12 items-center justify-between border-b border-app-tile-border px-4">
               <div className="app-drag-region min-w-0 flex flex-1 items-center gap-3 pr-4 select-none">
-                <p className="truncate text-sm font-bold text-app-text">
-                  Przegladarka
-                </p>
+                <AppBrandMenu
+                  isOpen={openAppMenu === 'main'}
+                  onOpen={() => {
+                    setOpenAppMenu('main')
+                  }}
+                  onOpenAdminPanel={() => {
+                    void openAdminPanel()
+                  }}
+                />
                 <div className="app-drag-surface flex h-8 flex-1 items-center justify-center rounded-full border border-dashed border-slate-200 bg-slate-50/70 px-3">
                   <span className="app-drag-label text-xs font-medium text-slate-400">
                     Przeciągnij okno
@@ -713,6 +1084,143 @@ function App() {
           </header>
 
           <section className="min-h-0 flex-1 overflow-hidden bg-white" />
+          {adminGateModal}
+        </div>
+      </main>
+    )
+  }
+
+  if (isAdminPanelOpen) {
+    return (
+      <main className="flex h-screen overflow-hidden bg-app text-app-text">
+        <div className="app-shell flex h-full w-full flex-col overflow-hidden border-0 shadow-none">
+          <header className="border-b border-app-tile-border bg-app-tile shadow-[0_10px_30px_rgba(148,163,184,0.12)]">
+            <div className="flex h-12 items-center justify-between px-4">
+              <div className="app-drag-region min-w-0 flex flex-1 items-center gap-3 pr-4 select-none">
+                <AppBrandMenu
+                  isOpen={openAppMenu === 'main'}
+                  onOpen={() => {
+                    setOpenAppMenu('main')
+                  }}
+                  onOpenAdminPanel={() => {
+                    void openAdminPanel()
+                  }}
+                />
+                <div className="app-drag-surface flex h-8 flex-1 items-center justify-center rounded-full border border-dashed border-slate-200 bg-slate-50/70 px-3">
+                  <span className="app-drag-label text-xs font-medium text-slate-400">
+                    Przeciągnij okno
+                  </span>
+                </div>
+              </div>
+
+              <WindowControls
+                isMaximized={isMaximized}
+                onMinimize={minimizeWindow}
+                onToggleMaximize={toggleMaximize}
+                onClose={closeWindow}
+              />
+            </div>
+          </header>
+
+          <section className="mx-auto flex min-h-0 flex-1 w-full max-w-6xl overflow-hidden px-4 py-6 sm:px-5 sm:py-8">
+            <div className="w-full">
+              <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
+                <div>
+                  <p className="text-sm font-bold tracking-[0.16em] text-slate-500 uppercase">
+                    Administracja
+                  </p>
+                  <h1 className="mt-2 text-3xl leading-tight font-bold md:text-5xl">
+                    Panel administracyjny
+                  </h1>
+                  <p className="mt-3 max-w-2xl text-base text-slate-500 md:text-lg">
+                    To miejsce na zarządzanie użytkownikami, ustawieniami i ochroną
+                    przeglądarki.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  className="focus-ring rounded-full border border-app-tile-border bg-app-tile px-5 py-3 text-sm font-bold text-app-text transition hover:bg-slate-50"
+                  onClick={() => {
+                    void closeAdminPanel()
+                  }}
+                >
+                  Wróć
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+                <div className="rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                  <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                    Użytkownicy
+                  </p>
+                  <p className="mt-4 text-4xl font-bold text-app-text">{users.length}</p>
+                  <p className="mt-2 text-sm text-slate-500">
+                    Łączna liczba profili dostępnych w aplikacji.
+                  </p>
+                </div>
+
+                <div className="rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                  <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                    Aktywny użytkownik
+                  </p>
+                  <p className="mt-4 text-2xl font-bold text-app-text">
+                    {selectedUser?.name ?? 'Brak'}
+                  </p>
+                  <p className="mt-2 text-sm text-slate-500">
+                    Ten profil jest aktualnie wybrany w przeglądarce.
+                  </p>
+                </div>
+
+                <div className="rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                  <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                    Ulubione
+                  </p>
+                  <p className="mt-4 text-4xl font-bold text-app-text">{favorites.length}</p>
+                  <p className="mt-2 text-sm text-slate-500">
+                    Zapisane strony aktywnego użytkownika.
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-6 rounded-[28px] border border-dashed border-app-tile-border bg-app-tile/70 p-6 shadow-[0_14px_34px_rgba(148,163,184,0.08)]">
+                <h2 className="text-xl font-bold text-app-text">Co dalej</h2>
+                <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-500">
+                  Panel jest już podłączony do nawigacji z nagłówka. W kolejnym kroku możemy
+                  dodać tutaj ochronę phishingową, zarządzanie zgodami, listę zaufanych stron
+                  albo ustawienia kont użytkowników.
+                </p>
+              </div>
+
+              <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div className="max-w-2xl">
+                    <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                      Dostępność
+                    </p>
+                    <h2 className="mt-2 text-xl font-bold text-app-text">Visible focus</h2>
+                    <p className="mt-3 text-sm leading-6 text-slate-500">
+                      Włącza albo wyłącza żółte obramowanie elementów, gdy są zaznaczone
+                      klawiaturą lub focusem.
+                    </p>
+                  </div>
+
+                  <label className="app-no-drag flex items-center gap-3 rounded-full border border-app-tile-border bg-slate-50 px-4 py-3 text-sm font-bold text-app-text">
+                    <input
+                      type="checkbox"
+                      className="focus-ring h-5 w-5 rounded border border-app-tile-border accent-[#1e3a8a]"
+                      checked={accessibilitySettings.visibleFocus}
+                      onChange={(event) => {
+                        void toggleVisibleFocus(event.target.checked)
+                      }}
+                    />
+                    <span>Włącz visible focus</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </section>
+          {adminGateModal}
         </div>
       </main>
     )
@@ -725,9 +1233,15 @@ function App() {
           <header className="border-b border-app-tile-border bg-app-tile shadow-[0_10px_30px_rgba(148,163,184,0.12)]">
             <div className="flex h-12 items-center justify-between px-4">
               <div className="app-drag-region min-w-0 flex flex-1 items-center gap-3 pr-4 select-none">
-                <p className="truncate text-sm font-bold text-app-text">
-                  Przegladarka
-                </p>
+                <AppBrandMenu
+                  isOpen={openAppMenu === 'main'}
+                  onOpen={() => {
+                    setOpenAppMenu('main')
+                  }}
+                  onOpenAdminPanel={() => {
+                    void openAdminPanel()
+                  }}
+                />
                 <div className="app-drag-surface flex h-8 flex-1 items-center justify-center rounded-full border border-dashed border-slate-200 bg-slate-50/70 px-3">
                   <span className="app-drag-label text-xs font-medium text-slate-400">
                     Przeciągnij okno
@@ -857,6 +1371,7 @@ function App() {
               </div>
             </div>
           </section>
+          {adminGateModal}
         </div>
       </main>
     )
@@ -868,9 +1383,15 @@ function App() {
         <header className="border-b border-app-tile-border bg-app-tile shadow-[0_10px_30px_rgba(148,163,184,0.12)]">
           <div className="flex h-12 items-center justify-between px-4">
             <div className="app-drag-region min-w-0 flex flex-1 items-center gap-3 pr-4 select-none">
-              <p className="truncate text-sm font-bold text-app-text">
-                Przegladarka
-              </p>
+              <AppBrandMenu
+                isOpen={openAppMenu === 'main'}
+                onOpen={() => {
+                  setOpenAppMenu('main')
+                }}
+                onOpenAdminPanel={() => {
+                  void openAdminPanel()
+                }}
+              />
               <div className="app-drag-surface flex h-8 flex-1 items-center justify-center rounded-full border border-dashed border-slate-200 bg-slate-50/70 px-3">
                 <span className="app-drag-label text-xs font-medium text-slate-400">
                   Przeciągnij okno
@@ -1085,6 +1606,8 @@ function App() {
             </div>
           </div>
         ) : null}
+
+        {adminGateModal}
       </div>
     </main>
   )

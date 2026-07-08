@@ -8,7 +8,14 @@ import {
   shell,
   WebContentsView
 } from 'electron'
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+  scryptSync,
+  timingSafeEqual
+} from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -47,6 +54,26 @@ type FavoriteEntry = {
   updatedAt: string
 }
 type UserFavoritesStore = Record<string, FavoriteEntry[]>
+type AdminSecurityStore = {
+  pinSalt: string | null
+  pinHash: string | null
+  failedAttempts: number
+  lockedUntil: string | null
+}
+type AdminPinStatus = {
+  isSet: boolean
+  isSessionUnlocked: boolean
+  failedAttempts: number
+  remainingAttempts: number
+  lockedUntil: string | null
+}
+type AccessibilitySettings = {
+  visibleFocus: boolean
+}
+type BrowserSettings = {
+  accessibility: AccessibilitySettings
+  adminSecurity: AdminSecurityStore
+}
 
 let mainWindow: BrowserWindow | null = null
 let browserView: WebContentsView | null = null
@@ -60,6 +87,8 @@ let userStore: UserStore | null = null
 let userKeyStore: UserKeyStore | null = null
 let userMediaPermissionStore: UserMediaPermissionStore | null = null
 let userFavoritesStore: UserFavoritesStore | null = null
+let browserSettingsStore: BrowserSettings | null = null
+let isAdminSessionUnlocked = false
 const pendingMediaPermissionRequests = new Map<string, Promise<PermissionPromptAction>>()
 const faviconDataUrlCache = new Map<string, string | null>()
 const pageFaviconCache = new Map<string, string>()
@@ -85,6 +114,8 @@ const BROWSER_INPUT_RING_CSS = `
 const GOOGLE_HOME_URL = 'https://www.google.pl/?hl=pl&gl=PL&pws=0'
 const ALLOWED_BROWSER_PERMISSION_ORIGINS = new Set<string>([])
 const ALLOWED_BROWSER_PROTOCOLS = new Set(['https:', 'http:'])
+const ADMIN_PIN_ATTEMPT_LIMIT = 5
+const ADMIN_PIN_LOCK_MS = 60_000
 
 type PermissionPromptAction = 'allow' | 'deny' | 'leave'
 
@@ -154,6 +185,10 @@ function getUserFavoritesPath(userId: string): string {
   return path.join(getUserFavoritesDirectoryPath(), `${userId}.json.enc`)
 }
 
+function getBrowserSettingsPath(): string {
+  return path.join(app.getPath('userData'), 'browser-settings.json')
+}
+
 function getInitials(value: string): string {
   const parts = value
     .trim()
@@ -195,6 +230,301 @@ function loadUserFavoritesStore(): UserFavoritesStore {
 
   userFavoritesStore = {}
   return userFavoritesStore
+}
+
+function normalizeAdminSecurityStore(value: unknown): AdminSecurityStore {
+  if (!value || typeof value !== 'object') {
+    return {
+      pinSalt: null,
+      pinHash: null,
+      failedAttempts: 0,
+      lockedUntil: null
+    }
+  }
+
+  const nextValue = value as Partial<AdminSecurityStore>
+
+  return {
+    pinSalt: typeof nextValue.pinSalt === 'string' && nextValue.pinSalt.length > 0 ? nextValue.pinSalt : null,
+    pinHash: typeof nextValue.pinHash === 'string' && nextValue.pinHash.length > 0 ? nextValue.pinHash : null,
+    failedAttempts:
+      typeof nextValue.failedAttempts === 'number' && Number.isFinite(nextValue.failedAttempts)
+        ? Math.max(0, Math.floor(nextValue.failedAttempts))
+        : 0,
+    lockedUntil: typeof nextValue.lockedUntil === 'string' && nextValue.lockedUntil.length > 0
+      ? nextValue.lockedUntil
+      : null
+  }
+}
+
+function loadAdminSecurityStore(): AdminSecurityStore {
+  return loadBrowserSettings().adminSecurity
+}
+
+function saveAdminSecurityStore(value: AdminSecurityStore): void {
+  saveBrowserSettings({
+    ...loadBrowserSettings(),
+    adminSecurity: normalizeAdminSecurityStore(value)
+  })
+}
+
+function isAdminPinSet(store: AdminSecurityStore = loadAdminSecurityStore()): boolean {
+  return typeof store.pinSalt === 'string' && typeof store.pinHash === 'string'
+}
+
+function getAdminPinLockTimestamp(store: AdminSecurityStore = loadAdminSecurityStore()): number | null {
+  if (!store.lockedUntil) {
+    return null
+  }
+
+  const lockTimestamp = Date.parse(store.lockedUntil)
+  return Number.isFinite(lockTimestamp) ? lockTimestamp : null
+}
+
+function clearExpiredAdminPinLock(): AdminSecurityStore {
+  const store = loadAdminSecurityStore()
+  const lockTimestamp = getAdminPinLockTimestamp(store)
+
+  if (!lockTimestamp || lockTimestamp > Date.now()) {
+    return store
+  }
+
+  const nextStore: AdminSecurityStore = {
+    ...store,
+    failedAttempts: 0,
+    lockedUntil: null
+  }
+  saveAdminSecurityStore(nextStore)
+  return nextStore
+}
+
+function getAdminPinStatus(): AdminPinStatus {
+  const store = clearExpiredAdminPinLock()
+  const remainingAttempts = isAdminPinSet(store)
+    ? Math.max(0, ADMIN_PIN_ATTEMPT_LIMIT - store.failedAttempts)
+    : ADMIN_PIN_ATTEMPT_LIMIT
+
+  return {
+    isSet: isAdminPinSet(store),
+    isSessionUnlocked: isAdminSessionUnlocked,
+    failedAttempts: store.failedAttempts,
+    remainingAttempts,
+    lockedUntil: store.lockedUntil
+  }
+}
+
+function validateAdminPin(pin: string): string {
+  const normalizedValue = pin.trim()
+
+  if (!/^\d{4,6}$/.test(normalizedValue)) {
+    throw new Error('PIN administratora musi mieć od 4 do 6 cyfr.')
+  }
+
+  return normalizedValue
+}
+
+function hashAdminPin(pin: string, salt: string): string {
+  return scryptSync(pin, salt, 64).toString('base64')
+}
+
+function setAdminPin(pin: string): AdminPinStatus {
+  const normalizedPin = validateAdminPin(pin)
+  const currentStore = loadAdminSecurityStore()
+
+  if (isAdminPinSet(currentStore)) {
+    throw new Error('PIN administratora jest już ustawiony.')
+  }
+
+  const nextStore: AdminSecurityStore = {
+    pinSalt: randomBytes(16).toString('base64'),
+    pinHash: null,
+    failedAttempts: 0,
+    lockedUntil: null
+  }
+  const nextSalt = nextStore.pinSalt
+  nextStore.pinHash = nextSalt ? hashAdminPin(normalizedPin, nextSalt) : null
+  saveAdminSecurityStore(nextStore)
+  isAdminSessionUnlocked = true
+
+  return getAdminPinStatus()
+}
+
+function verifyAdminPin(pin: string): AdminPinStatus {
+  const normalizedPin = validateAdminPin(pin)
+  const currentStore = clearExpiredAdminPinLock()
+
+  if (!isAdminPinSet(currentStore)) {
+    throw new Error('PIN administratora nie jest jeszcze ustawiony.')
+  }
+
+  const lockTimestamp = getAdminPinLockTimestamp(currentStore)
+
+  if (lockTimestamp && lockTimestamp > Date.now()) {
+    throw new Error('Panel administracyjny jest chwilowo zablokowany. Spróbuj ponownie za chwilę.')
+  }
+
+  const currentPinHash = currentStore.pinHash
+  const currentPinSalt = currentStore.pinSalt
+
+  if (!currentPinHash || !currentPinSalt) {
+    throw new Error('PIN administratora nie jest jeszcze ustawiony.')
+  }
+
+  const expectedHash = Buffer.from(currentPinHash, 'base64')
+  const candidateHash = Buffer.from(hashAdminPin(normalizedPin, currentPinSalt), 'base64')
+
+  if (expectedHash.length === candidateHash.length && timingSafeEqual(expectedHash, candidateHash)) {
+    saveAdminSecurityStore({
+      ...currentStore,
+      failedAttempts: 0,
+      lockedUntil: null
+    })
+    isAdminSessionUnlocked = true
+    return getAdminPinStatus()
+  }
+
+  const nextFailedAttempts = currentStore.failedAttempts + 1
+  const nextStore: AdminSecurityStore = {
+    ...currentStore,
+    failedAttempts: nextFailedAttempts,
+    lockedUntil:
+      nextFailedAttempts >= ADMIN_PIN_ATTEMPT_LIMIT
+        ? new Date(Date.now() + ADMIN_PIN_LOCK_MS).toISOString()
+        : null
+  }
+  saveAdminSecurityStore(nextStore)
+  isAdminSessionUnlocked = false
+
+  if (nextStore.lockedUntil) {
+    throw new Error('Zbyt wiele nieudanych prób. Panel administracyjny został chwilowo zablokowany.')
+  }
+
+  throw new Error('Nieprawidłowy PIN administratora.')
+}
+
+function clearAdminPinSession(): AdminPinStatus {
+  isAdminSessionUnlocked = false
+  return getAdminPinStatus()
+}
+
+function normalizeAccessibilitySettings(value: unknown): AccessibilitySettings {
+  if (!value || typeof value !== 'object') {
+    return {
+      visibleFocus: true
+    }
+  }
+
+  const nextValue = value as Partial<AccessibilitySettings>
+
+  return {
+    visibleFocus: typeof nextValue.visibleFocus === 'boolean' ? nextValue.visibleFocus : true
+  }
+}
+
+function normalizeBrowserSettings(value: unknown): BrowserSettings {
+  if (!value || typeof value !== 'object') {
+    return {
+      accessibility: normalizeAccessibilitySettings(null),
+      adminSecurity: normalizeAdminSecurityStore(null)
+    }
+  }
+
+  const nextValue = value as Partial<BrowserSettings> & {
+    accessibility?: unknown
+    adminSecurity?: unknown
+  }
+
+  return {
+    accessibility: normalizeAccessibilitySettings(nextValue.accessibility),
+    adminSecurity: normalizeAdminSecurityStore(nextValue.adminSecurity)
+  }
+}
+
+function encryptBrowserSettingsPayload(payload: string): string {
+  assertSecureUserKeyStorageAvailable()
+
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
+  }
+
+  return safeStorage.encryptString(payload).toString('base64')
+}
+
+function decryptBrowserSettingsPayload(payload: string): string {
+  assertSecureUserKeyStorageAvailable()
+
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
+  }
+
+  return safeStorage.decryptString(Buffer.from(payload, 'base64'))
+}
+
+function encryptUserStorePayload(payload: string): string {
+  assertSecureUserKeyStorageAvailable()
+
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
+  }
+
+  return safeStorage.encryptString(payload).toString('base64')
+}
+
+function decryptUserStorePayload(payload: string): string {
+  assertSecureUserKeyStorageAvailable()
+
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
+  }
+
+  return safeStorage.decryptString(Buffer.from(payload, 'base64'))
+}
+
+function loadBrowserSettings(): BrowserSettings {
+  if (browserSettingsStore) {
+    return browserSettingsStore
+  }
+
+  const filePath = getBrowserSettingsPath()
+
+  try {
+    if (fs.existsSync(filePath)) {
+      const encryptedPayload = fs.readFileSync(filePath, 'utf8')
+      const decryptedPayload = decryptBrowserSettingsPayload(encryptedPayload)
+      const rawValue = JSON.parse(decryptedPayload) as unknown
+      browserSettingsStore = normalizeBrowserSettings(rawValue)
+      return browserSettingsStore
+    }
+  } catch {
+    // Fall back to defaults when browser settings cannot be read.
+  }
+
+  browserSettingsStore = normalizeBrowserSettings(null)
+  return browserSettingsStore
+}
+
+function saveBrowserSettings(value: BrowserSettings): BrowserSettings {
+  browserSettingsStore = normalizeBrowserSettings(value)
+  const encryptedPayload = encryptBrowserSettingsPayload(
+    JSON.stringify(browserSettingsStore, null, 2)
+  )
+  fs.writeFileSync(getBrowserSettingsPath(), encryptedPayload, 'utf8')
+  return browserSettingsStore
+}
+
+function loadAccessibilitySettings(): AccessibilitySettings {
+  return loadBrowserSettings().accessibility
+}
+
+function setVisibleFocusSetting(visibleFocus: boolean): AccessibilitySettings {
+  const nextBrowserSettings = saveBrowserSettings({
+    ...loadBrowserSettings(),
+    accessibility: {
+      ...loadAccessibilitySettings(),
+      visibleFocus
+    }
+  })
+  return nextBrowserSettings.accessibility
 }
 
 function getUserDataKey(userId: string): Buffer {
@@ -1119,7 +1449,8 @@ function normalizeStore(store: UserStore): UserStore {
 }
 
 function saveUserStore(store: UserStore): void {
-  fs.writeFileSync(getUserStorePath(), JSON.stringify(store, null, 2), 'utf8')
+  const encryptedPayload = encryptUserStorePayload(JSON.stringify(store, null, 2))
+  fs.writeFileSync(getUserStorePath(), encryptedPayload, 'utf8')
 }
 
 function saveUserKeyStore(store: UserKeyStore): void {
@@ -1135,8 +1466,9 @@ function loadUserStore(): UserStore {
 
   try {
     if (fs.existsSync(filePath)) {
-      const rawValue = fs.readFileSync(filePath, 'utf8')
-      const parsedStore = JSON.parse(rawValue) as UserStore
+      const encryptedPayload = fs.readFileSync(filePath, 'utf8')
+      const decryptedPayload = decryptUserStorePayload(encryptedPayload)
+      const parsedStore = JSON.parse(decryptedPayload) as UserStore
       userStore = normalizeStore(parsedStore)
       return userStore
     }
@@ -1686,6 +2018,30 @@ ipcMain.handle('browser:toggle-favorite', () => {
 
 ipcMain.handle('browser:remove-favorite', (_event, url: string) => {
   return removeFavoriteForActiveUser(url)
+})
+
+ipcMain.handle('admin:get-pin-status', () => {
+  return getAdminPinStatus()
+})
+
+ipcMain.handle('admin:set-pin', (_event, pin: string) => {
+  return setAdminPin(pin)
+})
+
+ipcMain.handle('admin:verify-pin', (_event, pin: string) => {
+  return verifyAdminPin(pin)
+})
+
+ipcMain.handle('admin:clear-session', () => {
+  return clearAdminPinSession()
+})
+
+ipcMain.handle('accessibility:get-settings', () => {
+  return loadAccessibilitySettings()
+})
+
+ipcMain.handle('accessibility:set-visible-focus', (_event, visibleFocus: boolean) => {
+  return setVisibleFocusSetting(visibleFocus)
 })
 
 ipcMain.handle('browser:toggle-maximize', () => {
