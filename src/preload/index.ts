@@ -37,6 +37,18 @@ type UserState = {
   favorites: FavoriteEntry[]
 }
 
+type AdminPinStatus = {
+  isSet: boolean
+  isSessionUnlocked: boolean
+  failedAttempts: number
+  remainingAttempts: number
+  lockedUntil: string | null
+}
+
+type AccessibilitySettings = {
+  visibleFocus: boolean
+}
+
 contextBridge.exposeInMainWorld('easybrowser', {
   version: '1.0.0',
   getUserState: () => ipcRenderer.invoke('users:get-state') as Promise<UserState>,
@@ -56,6 +68,16 @@ contextBridge.exposeInMainWorld('easybrowser', {
   toggleFavorite: () => ipcRenderer.invoke('browser:toggle-favorite') as Promise<boolean>,
   removeFavorite: (url: string) =>
     ipcRenderer.invoke('browser:remove-favorite', url) as Promise<UserState>,
+  getAdminPinStatus: () => ipcRenderer.invoke('admin:get-pin-status') as Promise<AdminPinStatus>,
+  setAdminPin: (pin: string) => ipcRenderer.invoke('admin:set-pin', pin) as Promise<AdminPinStatus>,
+  verifyAdminPin: (pin: string) =>
+    ipcRenderer.invoke('admin:verify-pin', pin) as Promise<AdminPinStatus>,
+  clearAdminSession: () =>
+    ipcRenderer.invoke('admin:clear-session') as Promise<AdminPinStatus>,
+  getAccessibilitySettings: () =>
+    ipcRenderer.invoke('accessibility:get-settings') as Promise<AccessibilitySettings>,
+  setVisibleFocus: (visibleFocus: boolean) =>
+    ipcRenderer.invoke('accessibility:set-visible-focus', visibleFocus) as Promise<AccessibilitySettings>,
   toggleMaximize: () => ipcRenderer.invoke('browser:toggle-maximize'),
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),

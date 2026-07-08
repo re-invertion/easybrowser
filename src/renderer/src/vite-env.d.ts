@@ -38,6 +38,18 @@ declare global {
     favorites: FavoriteEntry[]
   }
 
+  type AdminPinStatus = {
+    isSet: boolean
+    isSessionUnlocked: boolean
+    failedAttempts: number
+    remainingAttempts: number
+    lockedUntil: string | null
+  }
+
+  type AccessibilitySettings = {
+    visibleFocus: boolean
+  }
+
   interface Window {
     easybrowser: {
       version: string
@@ -53,6 +65,12 @@ declare global {
       reload: () => Promise<void>
       toggleFavorite: () => Promise<boolean>
       removeFavorite: (url: string) => Promise<UserState>
+      getAdminPinStatus: () => Promise<AdminPinStatus>
+      setAdminPin: (pin: string) => Promise<AdminPinStatus>
+      verifyAdminPin: (pin: string) => Promise<AdminPinStatus>
+      clearAdminSession: () => Promise<AdminPinStatus>
+      getAccessibilitySettings: () => Promise<AccessibilitySettings>
+      setVisibleFocus: (visibleFocus: boolean) => Promise<AccessibilitySettings>
       toggleMaximize: () => Promise<void>
       minimizeWindow: () => Promise<void>
       closeWindow: () => Promise<void>

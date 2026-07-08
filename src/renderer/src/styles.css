@@ -47,6 +47,10 @@ body {
   outline-offset: 2px;
 }
 
+:root[data-visible-focus="off"] .focus-ring:focus-visible {
+  outline: none;
+}
+
 .app-drag-region {
   -webkit-app-region: drag;
   user-select: none;
@@ -90,6 +94,10 @@ body {
 .window-control-button:focus-visible {
   outline: 3px solid #fbbf24;
   outline-offset: 2px;
+}
+
+:root[data-visible-focus="off"] .window-control-button:focus-visible {
+  outline: none;
 }
 
 .window-control-button-close:hover {
