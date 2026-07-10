@@ -8,7 +8,6 @@
 ## Project goal
 The goal is to create a simple and very secure browser for eldery and non technical people.
 - Future plans:
-    - Add validation against malicious websites.
     - Add a simple password manager with multiple users.
     
 ## Technology:
@@ -57,6 +56,31 @@ The goal is to create a simple and very secure browser for eldery and non techni
 - Favicons are resolved from Electron favicon events, page `<link rel="icon">` candidates, `/favicon.ico`, and `/apple-touch-icon.png`.
 - Successful favicon responses are cached per origin as data URLs so the icon does not flicker or disappear during later loading events.
 - The renderer has an additional visual fallback chain for favicon display.
+- Every attempted navigation is checked live against the currently enabled phishing blocklists configured in the admin panel.
+- Every attempted navigation is also passed through a configurable reputation engine before the page is shown.
+- Domain blocklist sources are fetched on demand from their remote HTTPS endpoints at navigation time, with no offline mirror maintained by Easybrowser.
+- The default blocklist sources are:
+  - `https://hole.cert.pl/domains/v2/domains.txt`
+  - `https://urlhaus.abuse.ch/downloads/text_online/`
+- The admin panel can add additional blocklist source URLs, enable or disable each source, and remove non-default sources.
+- The current reputation engine can score the page using these filters:
+  - plain `http` navigation,
+  - non-Latin characters in the hostname,
+  - direct navigation to an IP address,
+  - Google Safe Browsing matches,
+  - very young domain age resolved through RDAP,
+  - remote phishing blocklist matches.
+- Each filter can be enabled or disabled independently from the admin panel, even while its section is collapsed.
+- Filter settings are edited as a draft in the renderer and are written only after the user clicks the shared `Zapisz` action in the admin panel.
+- Domain-age checks use RDAP over HTTPS with the IANA DNS bootstrap as the registry discovery source.
+- Google Safe Browsing checks are executed from the Electron main process only and never expose the API key to page content or normal renderer state.
+- If a hostname matches a listed domain, the `WebContentsView` is hidden and the renderer shows a full warning screen in its place.
+- If the reputation score reaches the warning threshold, the user sees an in-browser caution screen and can explicitly continue.
+- If the reputation score reaches the block threshold, the user sees an in-browser block screen and cannot continue.
+- The current warning screens are phrased for non-technical users and show only a generic event code:
+  - `filters-warning`
+  - `filters-block`
+- DNS resolution failures render a separate in-browser screen with the event code `no-dns-found`.
 
 ## Current Security Model
 - `contextIsolation` is enabled.
@@ -71,6 +95,19 @@ The goal is to create a simple and very secure browser for eldery and non techni
   - only `pinSalt`, `pinHash`, `failedAttempts`, and `lockedUntil` are stored.
 - Global browser settings are stored in a single encrypted `browser-settings.json` payload.
 - User favorites are stored in per-user encrypted payload files.
+- Remote phishing blocklists are accepted only from HTTPS source URLs.
+- Google Safe Browsing API checks are sent only from the main process.
+- Navigation is fail-closed for phishing checks:
+  - if a domain is found on an enabled list, the page is blocked,
+  - if an enabled list cannot be fetched successfully during validation, the navigation is also blocked.
+- Domain-age lookups use RDAP and fall back safely:
+  - if RDAP data is unavailable, the age filter simply does not add score,
+  - missing RDAP data alone does not block navigation.
+- Google Safe Browsing lookups also fail softly:
+  - if no API key is configured, the filter stays inactive,
+  - if the remote request fails, the filter does not add score by itself.
+- Only the configured blocklist source metadata is persisted locally.
+- The downloaded blocklist contents are not written to disk by Easybrowser.
 
 ## Current Permissions Model
 - Media permissions are handled with a custom in-app modal instead of the native Electron message box.
@@ -112,6 +149,22 @@ The goal is to create a simple and very secure browser for eldery and non techni
   - stores global browser settings such as:
     - `accessibility.visibleFocus`
     - administrator PIN metadata: `pinSalt`, `pinHash`, `failedAttempts`, `lockedUntil`
+    - Google Safe Browsing API key
+    - reputation engine settings:
+      - `enabled`
+      - `warningThreshold`
+      - `blockedThreshold`
+      - `disabledRuleIds`
+      - `ruleWeights`
+      - `youngDomainMaxAgeDays`
+    - phishing blocklist source definitions:
+      - `id`
+      - `url`
+      - `enabled`
+      - `scoreDelta`
+      - `isDefault`
+      - `createdAt`
+      - `updatedAt`
   - the whole file payload is encrypted directly with Electron `safeStorage`.
 - Chromium session storage for each user partition
   - each user gets a separate persistent partition: `persist:easybrowser-user-{userId}`.
@@ -121,7 +174,11 @@ The goal is to create a simple and very secure browser for eldery and non techni
 - The following state is intentionally memory-only:
   - media permission grants,
   - administrator unlocked session state,
-  - favicon cache.
+  - favicon cache,
+  - RDAP bootstrap cache,
+  - domain-age result cache,
+  - Google Safe Browsing response cache,
+  - filter draft state in the admin panel.
 
 ## Current UI State
 - All user-facing strings remain in Polish.
@@ -135,6 +192,11 @@ The goal is to create a simple and very secure browser for eldery and non techni
 - The user home screen includes favorite page tiles with favicon rendering and a delete action.
 - The admin panel is protected by an administrator PIN gate before access is granted.
 - The admin panel includes an accessibility setting for toggling the visible yellow focus outline.
+- The admin panel includes phishing protection settings for managing remote domain blocklist sources.
+- The admin panel includes a broader security section for reputation scoring, per-filter enable/disable toggles, filter weights, RDAP-based young-domain settings, Google Safe Browsing configuration, and remote domain blocklist management.
+- The Google Safe Browsing section exposes only whether the API key is configured plus actions to set or remove it; the stored key is not shown back to the user.
+- The browser warning state is rendered as a dedicated in-browser safety screen instead of showing the dangerous page directly.
+- Both the warning and block screens now use non-technical Polish copy intended for elderly or non-technical users.
 
 ## Visual Design Rules
 - Background: `#F8FAFC`

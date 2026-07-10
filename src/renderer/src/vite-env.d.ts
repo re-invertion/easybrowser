@@ -14,6 +14,32 @@ declare global {
     hasCameraAccess: boolean
     isFavorite: boolean
     browserFaviconUrl: string | null
+    reputationIntervention: {
+      url: string
+      decision: 'warning' | 'blocked'
+      eventCode: string
+      title: string
+      message: string
+      canContinue: boolean
+      matchedRules: Array<{
+        ruleId:
+          | 'insecure-http'
+          | 'domain-blocklist'
+          | 'non-latin-script'
+          | 'is-ip'
+          | 'google-safe-browsing'
+          | 'young-domain-age'
+        matched: boolean
+        scoreDelta: number
+        severity: 'warning' | 'blocking'
+        code: string
+        message: string
+      }>
+    } | null
+    dnsFailure: {
+      url: string
+      eventCode: 'no-dns-found'
+    } | null
   }
 
   type UserProfile = {
@@ -50,6 +76,63 @@ declare global {
     visibleFocus: boolean
   }
 
+  type ReputationSettings = {
+    enabled: boolean
+    warningThreshold: number
+    blockedThreshold: number
+    disabledRuleIds: Array<
+      | 'insecure-http'
+      | 'domain-blocklist'
+      | 'non-latin-script'
+      | 'is-ip'
+      | 'google-safe-browsing'
+      | 'young-domain-age'
+    >
+    ruleWeights: Partial<
+      Record<
+        | 'insecure-http'
+        | 'domain-blocklist'
+        | 'non-latin-script'
+        | 'is-ip'
+        | 'google-safe-browsing'
+        | 'young-domain-age',
+        number
+      >
+    >
+    youngDomainMaxAgeDays: number
+    googleSafeBrowsingApiKeyConfigured: boolean
+  }
+
+  type ReputationAssessmentPreview = {
+    normalizedUrl: string
+    score: number
+    decision: 'allow' | 'warning' | 'blocked'
+    matchedRules: Array<{
+      ruleId:
+        | 'insecure-http'
+        | 'domain-blocklist'
+        | 'non-latin-script'
+        | 'is-ip'
+        | 'google-safe-browsing'
+        | 'young-domain-age'
+      matched: boolean
+      scoreDelta: number
+      severity: 'warning' | 'blocking'
+      code: string
+      message: string
+    }>
+  }
+
+  type DomainBlocklistSource = {
+    id: string
+    url: string
+    enabled: boolean
+    scoreDelta: number
+    isDefault: boolean
+    createdAt: string
+    updatedAt: string
+  }
+
   interface Window {
     easybrowser: {
       version: string
@@ -60,6 +143,7 @@ declare global {
       deleteUser: (userId: string) => Promise<UserState>
       navigate: (value: string) => Promise<void>
       goHome: () => Promise<void>
+      continueReputationWarning: () => Promise<void>
       goBack: () => Promise<void>
       goForward: () => Promise<void>
       reload: () => Promise<void>
@@ -71,6 +155,33 @@ declare global {
       clearAdminSession: () => Promise<AdminPinStatus>
       getAccessibilitySettings: () => Promise<AccessibilitySettings>
       setVisibleFocus: (visibleFocus: boolean) => Promise<AccessibilitySettings>
+      getReputationSettings: () => Promise<ReputationSettings>
+      updateReputationSettings: (
+        value: Partial<
+          Pick<
+            ReputationSettings,
+            | 'enabled'
+            | 'warningThreshold'
+            | 'blockedThreshold'
+            | 'ruleWeights'
+            | 'youngDomainMaxAgeDays'
+            | 'disabledRuleIds'
+          >
+        >
+      ) => Promise<ReputationSettings>
+      setGoogleSafeBrowsingApiKey: (value: string | null) => Promise<ReputationSettings>
+      assessReputationUrl: (rawUrl: string) => Promise<ReputationAssessmentPreview>
+      getDomainBlocklistSources: () => Promise<DomainBlocklistSource[]>
+      addDomainBlocklistSource: (url: string) => Promise<DomainBlocklistSource[]>
+      setDomainBlocklistSourceEnabled: (
+        id: string,
+        enabled: boolean
+      ) => Promise<DomainBlocklistSource[]>
+      setDomainBlocklistSourceScoreDelta: (
+        id: string,
+        scoreDelta: number
+      ) => Promise<DomainBlocklistSource[]>
+      removeDomainBlocklistSource: (id: string) => Promise<DomainBlocklistSource[]>
       toggleMaximize: () => Promise<void>
       minimizeWindow: () => Promise<void>
       closeWindow: () => Promise<void>

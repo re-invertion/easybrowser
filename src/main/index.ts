@@ -13,11 +13,15 @@ import {
   createDecipheriv,
   createHash,
   randomBytes,
+  randomUUID,
   scryptSync,
   timingSafeEqual
 } from 'node:crypto'
 import fs from 'node:fs'
+import { isIP } from 'node:net'
 import path from 'node:path'
+import { domainToUnicode } from 'node:url'
+import { getDomain, getPublicSuffix, getSubdomain } from 'tldts'
 
 if (process.platform === 'linux') {
   app.commandLine.appendSwitch('enable-features', 'UseOzonePlatform')
@@ -70,9 +74,102 @@ type AdminPinStatus = {
 type AccessibilitySettings = {
   visibleFocus: boolean
 }
+type ReputationRuleSeverity = 'warning' | 'blocking'
+type ReputationDecision = 'allow' | 'warning' | 'blocked'
+type ReputationRuleId =
+  | 'insecure-http'
+  | 'domain-blocklist'
+  | 'non-latin-script'
+  | 'is-ip'
+  | 'google-safe-browsing'
+  | 'young-domain-age'
+type NormalizedSiteCandidate = {
+  rawUrl: string
+  normalizedUrl: string
+  protocol: 'http:' | 'https:'
+  hostname: string
+  asciiHostname: string
+  unicodeHostname: string
+  registrableDomain: string | null
+  publicSuffix: string | null
+  subdomain: string | null
+  isIp: boolean
+  port: string | null
+  path: string
+  query: string
+}
+type ReputationRuleResult = {
+  ruleId: ReputationRuleId
+  matched: boolean
+  scoreDelta: number
+  severity: ReputationRuleSeverity
+  code: string
+  message: string
+}
+type ReputationAssessment = {
+  candidate: NormalizedSiteCandidate
+  score: number
+  decision: ReputationDecision
+  matchedRules: ReputationRuleResult[]
+}
+type ReputationAssessmentPreview = {
+  normalizedUrl: string
+  score: number
+  decision: ReputationDecision
+  matchedRules: ReputationRuleResult[]
+}
+type ReputationInterventionState = {
+  url: string
+  decision: Exclude<ReputationDecision, 'allow'>
+  eventCode: string
+  title: string
+  message: string
+  canContinue: boolean
+  matchedRules: ReputationRuleResult[]
+}
+type ReputationSettings = {
+  enabled: boolean
+  warningThreshold: number
+  blockedThreshold: number
+  disabledRuleIds: ReputationRuleId[]
+  ruleWeights: Partial<Record<ReputationRuleId, number>>
+  youngDomainMaxAgeDays: number
+  googleSafeBrowsingApiKeyConfigured: boolean
+}
+type RdapBootstrap = {
+  services: Array<[string[], string[]]>
+}
+type CachedDomainAgeEntry = {
+  cachedAt: number
+  ageDays: number | null
+}
+type CachedSafeBrowsingEntry = {
+  expiresAt: number
+  match: {
+    threatType: string
+    platformType: string
+    cacheDurationMs: number
+  } | null
+}
+type DnsFailureState = {
+  url: string
+  eventCode: 'no-dns-found'
+}
+type DomainBlocklistSource = {
+  id: string
+  url: string
+  enabled: boolean
+  scoreDelta: number
+  isDefault: boolean
+  createdAt: string
+  updatedAt: string
+}
 type BrowserSettings = {
   accessibility: AccessibilitySettings
   adminSecurity: AdminSecurityStore
+  domainBlocklistSources: DomainBlocklistSource[]
+  googleSafeBrowsingApiKey: string | null
+  reputation: ReputationSettings
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -83,6 +180,10 @@ let lastError: string | null = null
 let browserChromeHeight = 122
 let browserCssKey: string | null = null
 let browserFaviconUrl: string | null = null
+let allowedBrowserNavigationUrl: string | null = null
+let reputationInterventionState: ReputationInterventionState | null = null
+let dnsFailureState: DnsFailureState | null = null
+let continuedWarningNavigationUrl: string | null = null
 let userStore: UserStore | null = null
 let userKeyStore: UserKeyStore | null = null
 let userMediaPermissionStore: UserMediaPermissionStore | null = null
@@ -92,6 +193,9 @@ let isAdminSessionUnlocked = false
 const pendingMediaPermissionRequests = new Map<string, Promise<PermissionPromptAction>>()
 const faviconDataUrlCache = new Map<string, string | null>()
 const pageFaviconCache = new Map<string, string>()
+const domainAgeCache = new Map<string, CachedDomainAgeEntry>()
+const googleSafeBrowsingCache = new Map<string, CachedSafeBrowsingEntry>()
+let rdapBootstrapCache: RdapBootstrap | null = null
 
 const DEFAULT_USERS: UserProfile[] = []
 const DEV_PLAIN_KEY_PREFIX = 'dev-plain:'
@@ -116,6 +220,43 @@ const ALLOWED_BROWSER_PERMISSION_ORIGINS = new Set<string>([])
 const ALLOWED_BROWSER_PROTOCOLS = new Set(['https:', 'http:'])
 const ADMIN_PIN_ATTEMPT_LIMIT = 5
 const ADMIN_PIN_LOCK_MS = 60_000
+const DOMAIN_BLOCKLIST_FETCH_TIMEOUT_MS = 8_000
+const DEFAULT_DOMAIN_BLOCKLIST_SCORE_DELTA = 100
+const DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA = 25
+const DEFAULT_IP_ADDRESS_SCORE_DELTA = 40
+const DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA = 100
+const DEFAULT_YOUNG_DOMAIN_SCORE_DELTA = 35
+const DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS = 30
+const DEFAULT_REPUTATION_WARNING_THRESHOLD = 50
+const DEFAULT_REPUTATION_BLOCKED_THRESHOLD = 70
+const RDAP_BOOTSTRAP_URL = 'https://data.iana.org/rdap/dns.json'
+const RDAP_FETCH_TIMEOUT_MS = 5_000
+const RDAP_DOMAIN_AGE_CACHE_TTL_MS = 1000 * 60 * 60 * 12
+const GOOGLE_SAFE_BROWSING_ENDPOINT =
+  'https://safebrowsing.googleapis.com/v4/threatMatches:find'
+const GOOGLE_SAFE_BROWSING_FETCH_TIMEOUT_MS = 5_000
+const GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS = 1000 * 60 * 5
+const DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT = '2026-07-08T00:00:00.000Z'
+const DEFAULT_DOMAIN_BLOCKLIST_SOURCES: DomainBlocklistSource[] = [
+  {
+    id: 'default-cert-hole',
+    url: 'https://hole.cert.pl/domains/v2/domains.txt',
+    enabled: true,
+    scoreDelta: DEFAULT_DOMAIN_BLOCKLIST_SCORE_DELTA,
+    isDefault: true,
+    createdAt: DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT,
+    updatedAt: DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT
+  },
+  {
+    id: 'default-urlhaus-online',
+    url: 'https://urlhaus.abuse.ch/downloads/text_online/',
+    enabled: true,
+    scoreDelta: DEFAULT_DOMAIN_BLOCKLIST_SCORE_DELTA,
+    isDefault: true,
+    createdAt: DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT,
+    updatedAt: DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT
+  }
+]
 
 type PermissionPromptAction = 'allow' | 'deny' | 'leave'
 
@@ -421,22 +562,230 @@ function normalizeAccessibilitySettings(value: unknown): AccessibilitySettings {
   }
 }
 
+function normalizeReputationSettings(value: unknown): ReputationSettings {
+  if (!value || typeof value !== 'object') {
+    return {
+      enabled: true,
+      warningThreshold: DEFAULT_REPUTATION_WARNING_THRESHOLD,
+      blockedThreshold: DEFAULT_REPUTATION_BLOCKED_THRESHOLD,
+      disabledRuleIds: [],
+      ruleWeights: {
+        'non-latin-script': DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA,
+        'is-ip': DEFAULT_IP_ADDRESS_SCORE_DELTA,
+        'google-safe-browsing': DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA
+      },
+      youngDomainMaxAgeDays: DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS,
+      googleSafeBrowsingApiKeyConfigured: false
+    }
+  }
+
+  const nextValue = value as Partial<ReputationSettings>
+  const disabledRuleIds = Array.isArray(nextValue.disabledRuleIds)
+    ? nextValue.disabledRuleIds.filter((value): value is ReputationRuleId => {
+        return (
+          value === 'insecure-http' ||
+          value === 'domain-blocklist' ||
+          value === 'non-latin-script' ||
+          value === 'is-ip' ||
+          value === 'google-safe-browsing' ||
+          value === 'young-domain-age'
+        )
+      })
+    : []
+  const nextRuleWeights = nextValue.ruleWeights && typeof nextValue.ruleWeights === 'object'
+    ? nextValue.ruleWeights
+    : {}
+
+  return {
+    enabled: typeof nextValue.enabled === 'boolean' ? nextValue.enabled : true,
+    warningThreshold:
+      typeof nextValue.warningThreshold === 'number' && Number.isFinite(nextValue.warningThreshold)
+        ? Math.max(0, Math.floor(nextValue.warningThreshold))
+        : DEFAULT_REPUTATION_WARNING_THRESHOLD,
+    blockedThreshold:
+      typeof nextValue.blockedThreshold === 'number' && Number.isFinite(nextValue.blockedThreshold)
+        ? Math.max(0, Math.floor(nextValue.blockedThreshold))
+        : DEFAULT_REPUTATION_BLOCKED_THRESHOLD,
+    disabledRuleIds,
+    ruleWeights: {
+      'insecure-http':
+        typeof nextRuleWeights['insecure-http'] === 'number' &&
+        Number.isFinite(nextRuleWeights['insecure-http'])
+          ? Math.max(0, Math.floor(nextRuleWeights['insecure-http']))
+          : undefined,
+      'domain-blocklist':
+        typeof nextRuleWeights['domain-blocklist'] === 'number' &&
+        Number.isFinite(nextRuleWeights['domain-blocklist'])
+          ? Math.max(0, Math.floor(nextRuleWeights['domain-blocklist']))
+          : undefined,
+      'non-latin-script':
+        typeof nextRuleWeights['non-latin-script'] === 'number' &&
+        Number.isFinite(nextRuleWeights['non-latin-script'])
+          ? Math.max(0, Math.floor(nextRuleWeights['non-latin-script']))
+          : DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA,
+      'is-ip':
+        typeof nextRuleWeights['is-ip'] === 'number' &&
+        Number.isFinite(nextRuleWeights['is-ip'])
+          ? Math.max(0, Math.floor(nextRuleWeights['is-ip']))
+          : DEFAULT_IP_ADDRESS_SCORE_DELTA,
+      'google-safe-browsing':
+        typeof nextRuleWeights['google-safe-browsing'] === 'number' &&
+        Number.isFinite(nextRuleWeights['google-safe-browsing'])
+          ? Math.max(0, Math.floor(nextRuleWeights['google-safe-browsing']))
+          : DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA,
+      'young-domain-age':
+        typeof nextRuleWeights['young-domain-age'] === 'number' &&
+        Number.isFinite(nextRuleWeights['young-domain-age'])
+          ? Math.max(0, Math.floor(nextRuleWeights['young-domain-age']))
+          : DEFAULT_YOUNG_DOMAIN_SCORE_DELTA
+    },
+    youngDomainMaxAgeDays:
+      typeof nextValue.youngDomainMaxAgeDays === 'number' &&
+      Number.isFinite(nextValue.youngDomainMaxAgeDays)
+        ? Math.max(1, Math.floor(nextValue.youngDomainMaxAgeDays))
+        : DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS,
+    googleSafeBrowsingApiKeyConfigured: false
+  }
+}
+
+function normalizeDomainBlocklistSourceUrl(value: string): string | null {
+  const trimmed = value.trim()
+
+  if (trimmed.length === 0) {
+    return null
+  }
+
+  try {
+    const parsedUrl = new URL(trimmed)
+
+    if (parsedUrl.protocol !== 'https:') {
+      return null
+    }
+
+    parsedUrl.hash = ''
+    return parsedUrl.toString()
+  } catch {
+    return null
+  }
+}
+
+function normalizeDomainBlocklistSource(
+  value: unknown,
+  fallback: DomainBlocklistSource
+): DomainBlocklistSource {
+  if (!value || typeof value !== 'object') {
+    return fallback
+  }
+
+  const nextValue = value as Partial<DomainBlocklistSource>
+  const normalizedUrl =
+    typeof nextValue.url === 'string'
+      ? normalizeDomainBlocklistSourceUrl(nextValue.url)
+      : normalizeDomainBlocklistSourceUrl(fallback.url)
+
+  return {
+    id:
+      typeof nextValue.id === 'string' && nextValue.id.trim().length > 0
+        ? nextValue.id.trim()
+        : fallback.id,
+    url: normalizedUrl ?? fallback.url,
+    enabled: typeof nextValue.enabled === 'boolean' ? nextValue.enabled : fallback.enabled,
+    scoreDelta:
+      typeof nextValue.scoreDelta === 'number' && Number.isFinite(nextValue.scoreDelta)
+        ? Math.max(0, Math.floor(nextValue.scoreDelta))
+        : fallback.scoreDelta,
+    isDefault: typeof nextValue.isDefault === 'boolean' ? nextValue.isDefault : fallback.isDefault,
+    createdAt:
+      typeof nextValue.createdAt === 'string' && nextValue.createdAt.length > 0
+        ? nextValue.createdAt
+        : fallback.createdAt,
+    updatedAt:
+      typeof nextValue.updatedAt === 'string' && nextValue.updatedAt.length > 0
+        ? nextValue.updatedAt
+        : fallback.updatedAt
+  }
+}
+
+function normalizeDomainBlocklistSources(value: unknown): DomainBlocklistSource[] {
+  const normalizedEntries: DomainBlocklistSource[] = []
+  const urlToIndex = new Map<string, number>()
+
+  for (const defaultSource of DEFAULT_DOMAIN_BLOCKLIST_SOURCES) {
+    urlToIndex.set(defaultSource.url, normalizedEntries.length)
+    normalizedEntries.push({ ...defaultSource })
+  }
+
+  if (Array.isArray(value)) {
+    for (const rawEntry of value) {
+      const fallbackSource: DomainBlocklistSource = {
+        id: `domain-blocklist-${randomUUID()}`,
+        url: DEFAULT_DOMAIN_BLOCKLIST_SOURCES[0]?.url ?? 'https://example.com',
+        enabled: true,
+        scoreDelta: DEFAULT_DOMAIN_BLOCKLIST_SCORE_DELTA,
+        isDefault: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+      const nextEntry = normalizeDomainBlocklistSource(rawEntry, fallbackSource)
+      const normalizedUrl = normalizeDomainBlocklistSourceUrl(nextEntry.url)
+
+      if (!normalizedUrl) {
+        continue
+      }
+
+      const existingIndex = urlToIndex.get(normalizedUrl)
+
+      if (typeof existingIndex === 'number') {
+        const existingEntry = normalizedEntries[existingIndex]
+        normalizedEntries[existingIndex] = {
+          ...existingEntry,
+          enabled: nextEntry.enabled,
+          scoreDelta: nextEntry.scoreDelta,
+          updatedAt: nextEntry.updatedAt
+        }
+        continue
+      }
+
+      urlToIndex.set(normalizedUrl, normalizedEntries.length)
+      normalizedEntries.push({
+        ...nextEntry,
+        url: normalizedUrl
+      })
+    }
+  }
+
+  return normalizedEntries
+}
+
 function normalizeBrowserSettings(value: unknown): BrowserSettings {
   if (!value || typeof value !== 'object') {
     return {
       accessibility: normalizeAccessibilitySettings(null),
-      adminSecurity: normalizeAdminSecurityStore(null)
+      adminSecurity: normalizeAdminSecurityStore(null),
+      domainBlocklistSources: normalizeDomainBlocklistSources(null),
+      googleSafeBrowsingApiKey: null,
+      reputation: normalizeReputationSettings(null)
     }
   }
 
   const nextValue = value as Partial<BrowserSettings> & {
     accessibility?: unknown
     adminSecurity?: unknown
+    domainBlocklistSources?: unknown
+    googleSafeBrowsingApiKey?: unknown
+    reputation?: unknown
   }
 
   return {
     accessibility: normalizeAccessibilitySettings(nextValue.accessibility),
-    adminSecurity: normalizeAdminSecurityStore(nextValue.adminSecurity)
+    adminSecurity: normalizeAdminSecurityStore(nextValue.adminSecurity),
+    domainBlocklistSources: normalizeDomainBlocklistSources(nextValue.domainBlocklistSources),
+    googleSafeBrowsingApiKey:
+      typeof nextValue.googleSafeBrowsingApiKey === 'string' &&
+      nextValue.googleSafeBrowsingApiKey.trim().length > 0
+        ? nextValue.googleSafeBrowsingApiKey.trim()
+        : null,
+    reputation: normalizeReputationSettings(nextValue.reputation)
   }
 }
 
@@ -525,6 +874,122 @@ function setVisibleFocusSetting(visibleFocus: boolean): AccessibilitySettings {
     }
   })
   return nextBrowserSettings.accessibility
+}
+
+function loadDomainBlocklistSources(): DomainBlocklistSource[] {
+  return loadBrowserSettings().domainBlocklistSources
+}
+
+function saveDomainBlocklistSources(value: DomainBlocklistSource[]): DomainBlocklistSource[] {
+  const nextBrowserSettings = saveBrowserSettings({
+    ...loadBrowserSettings(),
+    domainBlocklistSources: normalizeDomainBlocklistSources(value)
+  })
+
+  return nextBrowserSettings.domainBlocklistSources
+}
+
+function validateDomainBlocklistSourceUrl(value: string): string {
+  const normalizedUrl = normalizeDomainBlocklistSourceUrl(value)
+
+  if (!normalizedUrl) {
+    throw new Error('Adres listy musi być poprawnym adresem HTTPS.')
+  }
+
+  return normalizedUrl
+}
+
+function addDomainBlocklistSource(value: string): DomainBlocklistSource[] {
+  const normalizedUrl = validateDomainBlocklistSourceUrl(value)
+  const currentSources = loadDomainBlocklistSources()
+  const existingEntry = currentSources.find((entry) => entry.url === normalizedUrl)
+
+  if (existingEntry) {
+    return saveDomainBlocklistSources(
+      currentSources.map((entry) =>
+        entry.url === normalizedUrl
+          ? {
+              ...entry,
+              enabled: true,
+              updatedAt: new Date().toISOString()
+            }
+          : entry
+      )
+    )
+  }
+
+  const now = new Date().toISOString()
+  return saveDomainBlocklistSources([
+    ...currentSources,
+    {
+      id: `domain-blocklist-${randomUUID()}`,
+      url: normalizedUrl,
+      enabled: true,
+      scoreDelta: DEFAULT_DOMAIN_BLOCKLIST_SCORE_DELTA,
+      isDefault: false,
+      createdAt: now,
+      updatedAt: now
+    }
+  ])
+}
+
+function setDomainBlocklistSourceEnabled(id: string, enabled: boolean): DomainBlocklistSource[] {
+  const currentSources = loadDomainBlocklistSources()
+  const sourceExists = currentSources.some((entry) => entry.id === id)
+
+  if (!sourceExists) {
+    throw new Error('Nie znaleziono wskazanej listy ostrzeżeń.')
+  }
+
+  return saveDomainBlocklistSources(
+    currentSources.map((entry) =>
+      entry.id === id
+        ? {
+            ...entry,
+            enabled,
+            updatedAt: new Date().toISOString()
+          }
+        : entry
+    )
+  )
+}
+
+function setDomainBlocklistSourceScoreDelta(id: string, scoreDelta: number): DomainBlocklistSource[] {
+  const currentSources = loadDomainBlocklistSources()
+  const sourceExists = currentSources.some((entry) => entry.id === id)
+
+  if (!sourceExists) {
+    throw new Error('Nie znaleziono wskazanej listy ostrzeżeń.')
+  }
+
+  const normalizedScoreDelta = Math.max(0, Math.floor(scoreDelta))
+
+  return saveDomainBlocklistSources(
+    currentSources.map((entry) =>
+      entry.id === id
+        ? {
+            ...entry,
+            scoreDelta: normalizedScoreDelta,
+            updatedAt: new Date().toISOString()
+          }
+        : entry
+    )
+  )
+}
+
+function removeDomainBlocklistSource(id: string): DomainBlocklistSource[] {
+  const currentSources = loadDomainBlocklistSources()
+  const sourceToRemove = currentSources.find((entry) => entry.id === id)
+
+  if (!sourceToRemove) {
+    throw new Error('Nie znaleziono wskazanej listy ostrzeżeń.')
+  }
+
+  if (sourceToRemove.isDefault) {
+    throw new Error('Domyślnej listy ostrzeżeń nie można usunąć.')
+  }
+
+  return saveDomainBlocklistSources(currentSources.filter((entry) => entry.id !== id))
 }
 
 function getUserDataKey(userId: string): Buffer {
@@ -839,6 +1304,759 @@ function isSafeBrowserUrl(rawUrl: string): boolean {
     return ALLOWED_BROWSER_PROTOCOLS.has(parsedUrl.protocol)
   } catch {
     return false
+  }
+}
+
+function normalizeHostname(value: string): string | null {
+  const trimmed = value.trim().toLowerCase().replace(/\.+$/g, '').replace(/^\*\./, '').replace(/^\./, '')
+
+  if (trimmed.length === 0) {
+    return null
+  }
+
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(trimmed)) {
+    return trimmed
+  }
+
+  if (!/^[a-z0-9.-]+$/i.test(trimmed)) {
+    return null
+  }
+
+  return trimmed
+}
+
+function getHostnameFromUrl(rawUrl: string): string | null {
+  try {
+    const parsedUrl = new URL(rawUrl)
+    return normalizeHostname(parsedUrl.hostname)
+  } catch {
+    return null
+  }
+}
+
+function loadReputationSettings(): ReputationSettings {
+  return {
+    ...loadBrowserSettings().reputation,
+    googleSafeBrowsingApiKeyConfigured: hasGoogleSafeBrowsingApiKey()
+  }
+}
+
+function saveReputationSettings(value: ReputationSettings): ReputationSettings {
+  const nextBrowserSettings = saveBrowserSettings({
+    ...loadBrowserSettings(),
+    reputation: normalizeReputationSettings(value)
+  })
+
+  return {
+    ...nextBrowserSettings.reputation,
+    googleSafeBrowsingApiKeyConfigured: hasGoogleSafeBrowsingApiKey(nextBrowserSettings)
+  }
+}
+
+function updateReputationSettings(
+  value: Partial<
+    Pick<
+      ReputationSettings,
+      | 'enabled'
+      | 'warningThreshold'
+      | 'blockedThreshold'
+      | 'ruleWeights'
+      | 'youngDomainMaxAgeDays'
+      | 'disabledRuleIds'
+    >
+  >
+): ReputationSettings {
+  const currentSettings = loadReputationSettings()
+  return saveReputationSettings({
+    ...currentSettings,
+    ...value,
+    ruleWeights: {
+      ...currentSettings.ruleWeights,
+      ...(value.ruleWeights ?? {})
+    }
+  })
+}
+
+function hasGoogleSafeBrowsingApiKey(
+  settings: BrowserSettings = loadBrowserSettings()
+): boolean {
+  return typeof settings.googleSafeBrowsingApiKey === 'string' && settings.googleSafeBrowsingApiKey.length > 0
+}
+
+function getGoogleSafeBrowsingApiKey(): string | null {
+  return loadBrowserSettings().googleSafeBrowsingApiKey
+}
+
+function setGoogleSafeBrowsingApiKey(value: string | null): ReputationSettings {
+  const normalizedValue =
+    typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+
+  const nextBrowserSettings = saveBrowserSettings({
+    ...loadBrowserSettings(),
+    googleSafeBrowsingApiKey: normalizedValue
+  })
+
+  googleSafeBrowsingCache.clear()
+
+  return {
+    ...nextBrowserSettings.reputation,
+    googleSafeBrowsingApiKeyConfigured: Boolean(normalizedValue)
+  }
+}
+
+function getDomainBlocklistEventCode(sourceUrl: string): string {
+  const sourceHostname = getHostnameFromUrl(sourceUrl) ?? 'unknown-source'
+  return `phising-detected-list-filter:${sourceHostname}`
+}
+
+function extractDomainBlocklistHostnames(payload: string): Set<string> {
+  const hostnames = new Set<string>()
+
+  for (const rawLine of payload.split(/\r?\n/)) {
+    const commentIndex = rawLine.indexOf('#')
+    const line = (commentIndex >= 0 ? rawLine.slice(0, commentIndex) : rawLine).trim()
+
+    if (line.length === 0) {
+      continue
+    }
+
+    const tokens = line.split(/\s+/).filter(Boolean)
+
+    for (const token of tokens) {
+      let nextHostname: string | null = null
+
+      if (/^https?:\/\//i.test(token)) {
+        nextHostname = getHostnameFromUrl(token)
+      } else {
+        nextHostname = normalizeHostname(token)
+      }
+
+      if (nextHostname) {
+        hostnames.add(nextHostname)
+      }
+    }
+  }
+
+  return hostnames
+}
+
+function isHostnameBlocked(hostname: string, blockedEntries: Set<string>): string | null {
+  for (const blockedEntry of blockedEntries) {
+    if (hostname === blockedEntry || hostname.endsWith(`.${blockedEntry}`)) {
+      return blockedEntry
+    }
+  }
+
+  return null
+}
+
+function setReputationIntervention(value: ReputationInterventionState | null): void {
+  reputationInterventionState = value
+  updateBrowserBounds()
+}
+
+function setDnsFailure(value: DnsFailureState | null): void {
+  dnsFailureState = value
+  updateBrowserBounds()
+}
+
+function isDnsResolutionFailure(errorCode: number, errorDescription: string): boolean {
+  return (
+    errorCode === -105 ||
+    errorCode === -137 ||
+    errorDescription.includes('ERR_NAME_NOT_RESOLVED')
+  )
+}
+
+function isDnsResolutionError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false
+  }
+
+  return (
+    error.message.includes('ERR_NAME_NOT_RESOLVED') ||
+    error.message.includes('net_error -105') ||
+    error.message.includes('net_error -100')
+  )
+}
+
+async function fetchDomainBlocklistSourceEntries(source: DomainBlocklistSource): Promise<Set<string>> {
+  const response = await fetch(source.url, {
+    cache: 'no-store',
+    signal: AbortSignal.timeout(DOMAIN_BLOCKLIST_FETCH_TIMEOUT_MS)
+  })
+
+  if (!response.ok) {
+    throw new Error(`Nie udało się pobrać listy ostrzeżeń: ${source.url}`)
+  }
+
+  const payload = await response.text()
+  return extractDomainBlocklistHostnames(payload)
+}
+
+function normalizeSiteCandidate(rawUrl: string): NormalizedSiteCandidate {
+  const parsedUrl = new URL(rawUrl)
+  const asciiHostname = normalizeHostname(parsedUrl.hostname)
+
+  if (!asciiHostname) {
+    throw new Error(`Nie udało się znormalizować hosta dla adresu: ${rawUrl}`)
+  }
+
+  const unicodeHostname = domainToUnicode(asciiHostname).toLowerCase() || asciiHostname
+
+  return {
+    rawUrl,
+    normalizedUrl: parsedUrl.toString(),
+    protocol: parsedUrl.protocol as 'http:' | 'https:',
+    hostname: asciiHostname,
+    asciiHostname,
+    unicodeHostname,
+    registrableDomain: getDomain(asciiHostname) ?? null,
+    publicSuffix: getPublicSuffix(asciiHostname) ?? null,
+    subdomain: getSubdomain(asciiHostname) || null,
+    isIp: isIP(asciiHostname) !== 0,
+    port: parsedUrl.port || null,
+    path: parsedUrl.pathname,
+    query: parsedUrl.search
+  }
+}
+
+function getRuleScoreDelta(
+  ruleId: ReputationRuleId,
+  fallbackScoreDelta: number,
+  settings: ReputationSettings
+): number {
+  return settings.ruleWeights[ruleId] ?? fallbackScoreDelta
+}
+
+function hasNonLatinLetters(value: string): boolean {
+  for (const char of value) {
+    if (!/\p{Letter}/u.test(char)) {
+      continue
+    }
+
+    if (!/\p{Script=Latin}/u.test(char)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+async function loadRdapBootstrap(): Promise<RdapBootstrap> {
+  if (rdapBootstrapCache) {
+    return rdapBootstrapCache
+  }
+
+  const response = await fetch(RDAP_BOOTSTRAP_URL, {
+    cache: 'force-cache',
+    signal: AbortSignal.timeout(RDAP_FETCH_TIMEOUT_MS)
+  })
+
+  if (!response.ok) {
+    throw new Error('Nie udało się pobrać konfiguracji RDAP.')
+  }
+
+  const payload = (await response.json()) as Partial<RdapBootstrap>
+  rdapBootstrapCache = {
+    services: Array.isArray(payload.services) ? payload.services : []
+  }
+  return rdapBootstrapCache
+}
+
+function getRdapBaseUrlForDomain(domain: string, bootstrap: RdapBootstrap): string | null {
+  const labels = domain.toLowerCase().split('.').filter(Boolean)
+
+  for (let index = 0; index < labels.length; index += 1) {
+    const suffix = labels.slice(index).join('.')
+
+    for (const service of bootstrap.services) {
+      const [tlds, baseUrls] = service
+
+      if (!Array.isArray(tlds) || !Array.isArray(baseUrls) || baseUrls.length === 0) {
+        continue
+      }
+
+      if (tlds.some((tld) => typeof tld === 'string' && tld.toLowerCase() === suffix)) {
+        return baseUrls[0] ?? null
+      }
+    }
+  }
+
+  return null
+}
+
+function parseRdapEventDate(payload: unknown): Date | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const events = (payload as { events?: unknown }).events
+
+  if (!Array.isArray(events)) {
+    return null
+  }
+
+  const matchingEvent = events.find((event) => {
+    if (!event || typeof event !== 'object') {
+      return false
+    }
+
+    const eventAction = (event as { eventAction?: unknown }).eventAction
+    return eventAction === 'registration' || eventAction === 'registered'
+  }) as { eventDate?: unknown } | undefined
+
+  if (!matchingEvent || typeof matchingEvent.eventDate !== 'string') {
+    return null
+  }
+
+  const timestamp = Date.parse(matchingEvent.eventDate)
+  return Number.isFinite(timestamp) ? new Date(timestamp) : null
+}
+
+async function getDomainAgeInDays(domain: string): Promise<number | null> {
+  const cachedEntry = domainAgeCache.get(domain)
+
+  if (cachedEntry && Date.now() - cachedEntry.cachedAt < RDAP_DOMAIN_AGE_CACHE_TTL_MS) {
+    return cachedEntry.ageDays
+  }
+
+  try {
+    const bootstrap = await loadRdapBootstrap()
+    const baseUrl = getRdapBaseUrlForDomain(domain, bootstrap)
+
+    if (!baseUrl) {
+      domainAgeCache.set(domain, { cachedAt: Date.now(), ageDays: null })
+      return null
+    }
+
+    const rdapUrl = new URL(`domain/${domain}`, baseUrl).toString()
+    const response = await fetch(rdapUrl, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(RDAP_FETCH_TIMEOUT_MS),
+      headers: {
+        accept: 'application/rdap+json, application/json'
+      }
+    })
+
+    if (!response.ok) {
+      domainAgeCache.set(domain, { cachedAt: Date.now(), ageDays: null })
+      return null
+    }
+
+    const payload = await response.json()
+    const createdAt = parseRdapEventDate(payload)
+
+    if (!createdAt) {
+      domainAgeCache.set(domain, { cachedAt: Date.now(), ageDays: null })
+      return null
+    }
+
+    const ageDays = Math.max(0, Math.floor((Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24)))
+    domainAgeCache.set(domain, { cachedAt: Date.now(), ageDays })
+    return ageDays
+  } catch {
+    domainAgeCache.set(domain, { cachedAt: Date.now(), ageDays: null })
+    return null
+  }
+}
+
+function parseGoogleSafeBrowsingCacheDurationMs(value: unknown): number {
+  if (typeof value !== 'string') {
+    return GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS
+  }
+
+  const match = /^([0-9]+(?:\.[0-9]+)?)s$/.exec(value)
+
+  if (!match) {
+    return GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS
+  }
+
+  return Math.max(1000, Math.floor(Number(match[1]) * 1000))
+}
+
+async function lookupGoogleSafeBrowsingMatch(
+  normalizedUrl: string
+): Promise<CachedSafeBrowsingEntry['match']> {
+  const apiKey = getGoogleSafeBrowsingApiKey()
+
+  if (!apiKey) {
+    return null
+  }
+
+  const cachedEntry = googleSafeBrowsingCache.get(normalizedUrl)
+
+  if (cachedEntry && cachedEntry.expiresAt > Date.now()) {
+    return cachedEntry.match
+  }
+
+  try {
+    const requestUrl = `${GOOGLE_SAFE_BROWSING_ENDPOINT}?key=${encodeURIComponent(apiKey)}`
+    const response = await fetch(requestUrl, {
+      method: 'POST',
+      signal: AbortSignal.timeout(GOOGLE_SAFE_BROWSING_FETCH_TIMEOUT_MS),
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        client: {
+          clientId: 'easybrowser',
+          clientVersion: app.getVersion()
+        },
+        threatInfo: {
+          threatTypes: ['MALWARE', 'SOCIAL_ENGINEERING', 'UNWANTED_SOFTWARE'],
+          platformTypes: ['ANY_PLATFORM'],
+          threatEntryTypes: ['URL'],
+          threatEntries: [{ url: normalizedUrl }]
+        }
+      })
+    })
+
+    if (!response.ok) {
+      return null
+    }
+
+    const payload = (await response.json()) as {
+      matches?: Array<{
+        threatType?: unknown
+        platformType?: unknown
+        cacheDuration?: unknown
+      }>
+    }
+
+    const firstMatch = Array.isArray(payload.matches) ? payload.matches[0] : undefined
+
+    if (!firstMatch) {
+      googleSafeBrowsingCache.set(normalizedUrl, {
+        expiresAt: Date.now() + GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS,
+        match: null
+      })
+      return null
+    }
+
+    const match = {
+      threatType:
+        typeof firstMatch.threatType === 'string' ? firstMatch.threatType : 'UNKNOWN_THREAT',
+      platformType:
+        typeof firstMatch.platformType === 'string'
+          ? firstMatch.platformType
+          : 'UNKNOWN_PLATFORM',
+      cacheDurationMs: parseGoogleSafeBrowsingCacheDurationMs(firstMatch.cacheDuration)
+    }
+
+    googleSafeBrowsingCache.set(normalizedUrl, {
+      expiresAt: Date.now() + match.cacheDurationMs,
+      match
+    })
+    return match
+  } catch {
+    return null
+  }
+}
+
+async function evaluateInsecureHttpRule(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult | null> {
+  if (candidate.protocol !== 'http:') {
+    return null
+  }
+
+  return {
+    ruleId: 'insecure-http',
+    matched: true,
+    scoreDelta: getRuleScoreDelta('insecure-http', 50, settings),
+    severity: 'warning',
+    code: 'http-not-encrypted',
+    message:
+      'Strona używa połączenia HTTP, więc przesyłane dane nie są chronione tak jak przy HTTPS.'
+  }
+}
+
+async function evaluateDomainBlocklistRule(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult | null> {
+  const enabledSources = loadDomainBlocklistSources().filter((source) => source.enabled)
+
+  if (enabledSources.length === 0) {
+    return null
+  }
+
+  const sourceResults = await Promise.all(
+    enabledSources.map(async (source) => {
+      const blockedEntries = await fetchDomainBlocklistSourceEntries(source)
+      return {
+        source,
+        matchedEntry: isHostnameBlocked(candidate.asciiHostname, blockedEntries)
+      }
+    })
+  )
+
+  const blockedResult = sourceResults.find((result) => typeof result.matchedEntry === 'string')
+
+  if (!blockedResult?.matchedEntry) {
+    return null
+  }
+
+  return {
+    ruleId: 'domain-blocklist',
+    matched: true,
+    scoreDelta: blockedResult.source.scoreDelta,
+    severity: 'blocking',
+    code: getDomainBlocklistEventCode(blockedResult.source.url),
+    message: `Domena znajduje się na liście ostrzeżeń: ${blockedResult.source.url}`
+  }
+}
+
+async function evaluateNonLatinScriptRule(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult | null> {
+  if (!hasNonLatinLetters(candidate.unicodeHostname)) {
+    return null
+  }
+
+  return {
+    ruleId: 'non-latin-script',
+    matched: true,
+    scoreDelta: getRuleScoreDelta(
+      'non-latin-script',
+      DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA,
+      settings
+    ),
+    severity: 'warning',
+    code: 'non-latin-script-domain',
+    message:
+      'Domena zawiera litery spoza alfabetu łacińskiego, co może utrudniać rozpoznanie prawdziwego adresu.'
+  }
+}
+
+async function evaluateIpAddressRule(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult | null> {
+  if (!candidate.isIp) {
+    return null
+  }
+
+  return {
+    ruleId: 'is-ip',
+    matched: true,
+    scoreDelta: getRuleScoreDelta('is-ip', DEFAULT_IP_ADDRESS_SCORE_DELTA, settings),
+    severity: 'warning',
+    code: 'ip-address-navigation',
+    message:
+      'Adres prowadzi bezpośrednio na numer IP zamiast na zwykłą domenę, co bywa częste przy podejrzanych linkach.'
+  }
+}
+
+async function evaluateGoogleSafeBrowsingRule(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult | null> {
+  const match = await lookupGoogleSafeBrowsingMatch(candidate.normalizedUrl)
+
+  if (!match) {
+    return null
+  }
+
+  return {
+    ruleId: 'google-safe-browsing',
+    matched: true,
+    scoreDelta: getRuleScoreDelta(
+      'google-safe-browsing',
+      DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA,
+      settings
+    ),
+    severity: 'blocking',
+    code: `google-safe-browsing:${match.threatType.toLowerCase()}`,
+    message: `Google Safe Browsing oznaczył ten adres jako ${match.threatType} dla ${match.platformType}.`
+  }
+}
+
+async function evaluateYoungDomainAgeRule(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult | null> {
+  if (!candidate.registrableDomain || candidate.isIp) {
+    return null
+  }
+
+  const ageDays = await getDomainAgeInDays(candidate.registrableDomain)
+
+  if (ageDays === null || ageDays > settings.youngDomainMaxAgeDays) {
+    return null
+  }
+
+  return {
+    ruleId: 'young-domain-age',
+    matched: true,
+    scoreDelta: getRuleScoreDelta(
+      'young-domain-age',
+      DEFAULT_YOUNG_DOMAIN_SCORE_DELTA,
+      settings
+    ),
+    severity: 'warning',
+    code: 'young-domain-rdap',
+    message: `Domena ma około ${ageDays} dni i mieści się w progu ${settings.youngDomainMaxAgeDays} dni.`
+  }
+}
+
+async function assessNavigationReputation(rawUrl: string): Promise<ReputationAssessment> {
+  if (!isSafeBrowserUrl(rawUrl)) {
+    throw new Error(`Zablokowano niebezpieczny adres: ${rawUrl}`)
+  }
+
+  const candidate = normalizeSiteCandidate(rawUrl)
+  const settings = loadReputationSettings()
+
+  if (!settings.enabled) {
+    return {
+      candidate,
+      score: 0,
+      decision: 'allow',
+      matchedRules: []
+    }
+  }
+
+  const rules = [
+    {
+      id: 'insecure-http' as const,
+      evaluate: evaluateInsecureHttpRule
+    },
+    {
+      id: 'domain-blocklist' as const,
+      evaluate: evaluateDomainBlocklistRule
+    },
+    {
+      id: 'non-latin-script' as const,
+      evaluate: evaluateNonLatinScriptRule
+    },
+    {
+      id: 'is-ip' as const,
+      evaluate: evaluateIpAddressRule
+    },
+    {
+      id: 'google-safe-browsing' as const,
+      evaluate: evaluateGoogleSafeBrowsingRule
+    },
+    {
+      id: 'young-domain-age' as const,
+      evaluate: evaluateYoungDomainAgeRule
+    }
+  ]
+  const matchedRules: ReputationRuleResult[] = []
+
+  for (const rule of rules) {
+    if (settings.disabledRuleIds.includes(rule.id)) {
+      continue
+    }
+
+    const result = await rule.evaluate(candidate, settings)
+
+    if (result?.matched) {
+      matchedRules.push(result)
+    }
+  }
+
+  const score = matchedRules.reduce((sum, result) => sum + result.scoreDelta, 0)
+  const decision: ReputationDecision =
+    score >= settings.blockedThreshold
+      ? 'blocked'
+      : score >= settings.warningThreshold
+        ? 'warning'
+        : 'allow'
+
+  return {
+    candidate,
+    score,
+    decision,
+    matchedRules
+  }
+}
+
+async function assessReputationPreview(rawUrl: string): Promise<ReputationAssessmentPreview> {
+  const assessment = await assessNavigationReputation(rawUrl)
+
+  return {
+    normalizedUrl: assessment.candidate.normalizedUrl,
+    score: assessment.score,
+    decision: assessment.decision,
+    matchedRules: assessment.matchedRules
+  }
+}
+
+function createReputationInterventionState(
+  assessment: ReputationAssessment
+): ReputationInterventionState | null {
+  if (assessment.decision === 'allow' || assessment.matchedRules.length === 0) {
+    return null
+  }
+
+  const primaryRule = assessment.matchedRules[0]
+
+  if (assessment.decision === 'warning') {
+    return {
+      url: assessment.candidate.normalizedUrl,
+      decision: 'warning',
+      eventCode: 'filters-warning',
+      title: 'Filtry bezpieczeństwa oznaczyły tę stronę jako potencjalnie niebezpieczną',
+      message:
+        'Ta strona wygląda podejrzanie według naszych zabezpieczeń. Jeśli jej nie rozpoznajesz albo nie masz do niej pełnego zaufania, lepiej nie kontynuować.',
+      canContinue: true,
+      matchedRules: assessment.matchedRules
+    }
+  }
+
+  return {
+    url: assessment.candidate.normalizedUrl,
+    decision: 'blocked',
+    eventCode: 'filters-block',
+    title: 'Filtry bezpieczeństwa oznaczyły tę stronę jako niebezpieczną',
+    message:
+      'Zablokowaliśmy tę stronę, ponieważ nasze zabezpieczenia wykryły wysokie ryzyko. Dzięki temu możesz bezpiecznie wrócić i nie przechodzić dalej.',
+    canContinue: false,
+    matchedRules: assessment.matchedRules
+  }
+}
+
+async function shouldAllowNavigation(rawUrl: string): Promise<boolean> {
+  const assessment = await assessNavigationReputation(rawUrl)
+
+  if (continuedWarningNavigationUrl === assessment.candidate.normalizedUrl) {
+    continuedWarningNavigationUrl = null
+    setReputationIntervention(null)
+    return true
+  }
+
+  const interventionState = createReputationInterventionState(assessment)
+
+  if (!interventionState) {
+    setReputationIntervention(null)
+    return true
+  }
+
+  setReputationIntervention(interventionState)
+  lastError = interventionState.message
+  sendBrowserState()
+  return false
+}
+
+async function openExternalUrlIfAllowed(rawUrl: string): Promise<void> {
+  try {
+    if (!(await shouldAllowNavigation(rawUrl))) {
+      return
+    }
+    setReputationIntervention(null)
+    setDnsFailure(null)
+    lastError = null
+    await shell.openExternal(rawUrl)
+  } catch (error) {
+    setReputationIntervention(null)
+    lastError =
+      error instanceof Error ? error.message : 'Nie udało się sprawdzić bezpieczeństwa adresu.'
+    sendBrowserState()
   }
 }
 
@@ -1246,6 +2464,9 @@ function leaveCurrentPage(): void {
   }
 
   browserMode = 'home'
+  setReputationIntervention(null)
+  setDnsFailure(null)
+  continuedWarningNavigationUrl = null
   lastError = null
   updateBrowserBounds()
   sendBrowserState()
@@ -1674,7 +2895,7 @@ function updateBrowserBounds(): void {
 
   const [width, height] = mainWindow.getContentSize()
 
-  if (browserMode !== 'browser') {
+  if (browserMode !== 'browser' || reputationInterventionState || dnsFailureState) {
     browserView.setBounds({ x: 0, y: 0, width: 0, height: 0 })
     return
   }
@@ -1699,7 +2920,7 @@ function sendBrowserState(): void {
 
   mainWindow.webContents.send('browser:state', {
     mode: browserMode,
-    url: currentUrl,
+    url: reputationInterventionState?.url ?? dnsFailureState?.url ?? currentUrl,
     title: browserView?.webContents.getTitle() || 'Easybrowser',
     isLoading: browserView?.webContents.isLoading() ?? false,
     canGoBack: browserView?.webContents.navigationHistory.canGoBack() ?? false,
@@ -1709,7 +2930,9 @@ function sendBrowserState(): void {
     hasMicrophoneAccess: mediaAccessState.hasMicrophoneAccess,
     hasCameraAccess: mediaAccessState.hasCameraAccess,
     isFavorite: isFavoriteUrl(activeUserId, currentUrl),
-    browserFaviconUrl: effectiveBrowserFaviconUrl
+    browserFaviconUrl: reputationInterventionState || dnsFailureState ? null : effectiveBrowserFaviconUrl,
+    reputationIntervention: reputationInterventionState,
+    dnsFailure: dnsFailureState,
   })
 }
 
@@ -1736,18 +2959,42 @@ function wireBrowserView(view: WebContentsView): void {
 
   view.webContents.setWindowOpenHandler(({ url }: { url: string }) => {
     if (isSafeBrowserUrl(url)) {
-      shell.openExternal(url)
+      void openExternalUrlIfAllowed(url)
     }
 
     return { action: 'deny' }
   })
 
   view.webContents.on('will-navigate', (event, navigationUrl) => {
-    if (!isSafeBrowserUrl(navigationUrl)) {
-      event.preventDefault()
-      lastError = `Zablokowano niebezpieczny adres: ${navigationUrl}`
-      sendBrowserState()
+    if (allowedBrowserNavigationUrl === navigationUrl) {
+      allowedBrowserNavigationUrl = null
+      return
     }
+
+    event.preventDefault()
+
+    void (async () => {
+      try {
+        if (!(await shouldAllowNavigation(navigationUrl))) {
+          return
+        }
+        setReputationIntervention(null)
+        setDnsFailure(null)
+        lastError = null
+        allowedBrowserNavigationUrl = navigationUrl
+        await view.webContents.loadURL(navigationUrl)
+        if (allowedBrowserNavigationUrl === navigationUrl) {
+          allowedBrowserNavigationUrl = null
+        }
+      } catch (error) {
+        allowedBrowserNavigationUrl = null
+        setReputationIntervention(null)
+        setDnsFailure(null)
+        lastError =
+          error instanceof Error ? error.message : 'Nie udało się otworzyć strony.'
+        sendBrowserState()
+      }
+    })()
   })
 
   view.webContents.on('did-start-loading', () => {
@@ -1755,10 +3002,14 @@ function wireBrowserView(view: WebContentsView): void {
   })
   view.webContents.on('did-stop-loading', syncBrowserState)
   view.webContents.on('did-navigate', (_event, navigationUrl) => {
+    setDnsFailure(null)
+    setReputationIntervention(null)
     applyCachedPageFavicon(navigationUrl, true)
     void updateBrowserFavicon(view)
   })
   view.webContents.on('did-navigate-in-page', (_event, navigationUrl) => {
+    setDnsFailure(null)
+    setReputationIntervention(null)
     applyCachedPageFavicon(navigationUrl)
     void updateBrowserFavicon(view)
   })
@@ -1775,6 +3026,17 @@ function wireBrowserView(view: WebContentsView): void {
     'did-fail-load',
     (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
       if (!isMainFrame || errorCode === -3) {
+        return
+      }
+
+      if (isDnsResolutionFailure(errorCode, errorDescription)) {
+        setReputationIntervention(null)
+        setDnsFailure({
+          url: validatedURL && validatedURL.length > 0 ? validatedURL : view.webContents.getURL(),
+          eventCode: 'no-dns-found'
+        })
+        lastError = 'Nie udało się znaleźć tej strony w DNS.'
+        sendBrowserState()
         return
       }
 
@@ -1831,13 +3093,38 @@ async function navigateBrowser(rawValue: string): Promise<void> {
   const view = ensureBrowserView()
   const destination = normalizeAddress(rawValue)
   browserMode = 'browser'
+  setReputationIntervention(null)
+  setDnsFailure(null)
   lastError = null
   updateBrowserBounds()
   sendBrowserState()
 
   try {
+    if (!(await shouldAllowNavigation(destination))) {
+      return
+    }
+    setReputationIntervention(null)
+    setDnsFailure(null)
+    allowedBrowserNavigationUrl = destination
     await view.webContents.loadURL(destination)
+    if (allowedBrowserNavigationUrl === destination) {
+      allowedBrowserNavigationUrl = null
+    }
   } catch (error) {
+    allowedBrowserNavigationUrl = null
+    if (isDnsResolutionError(error)) {
+      setReputationIntervention(null)
+      setDnsFailure({
+        url: destination,
+        eventCode: 'no-dns-found'
+      })
+      lastError = 'Nie udało się znaleźć tej strony w DNS.'
+      sendBrowserState()
+      return
+    } else {
+      setReputationIntervention(null)
+      setDnsFailure(null)
+    }
     lastError = error instanceof Error ? error.message : 'Nie udało się otworzyć strony.'
     sendBrowserState()
   }
@@ -1865,7 +3152,7 @@ function createMainWindow(): void {
 
   mainWindow.webContents.setWindowOpenHandler(({ url }: { url: string }) => {
     if (isSafeBrowserUrl(url)) {
-      shell.openExternal(url)
+      void openExternalUrlIfAllowed(url)
     }
 
     return { action: 'deny' }
@@ -1907,6 +3194,9 @@ ipcMain.handle('users:select', (_event, userId: string) => {
   store.activeUserId = userId
   saveUserStore(store)
   browserMode = 'home'
+  setReputationIntervention(null)
+  setDnsFailure(null)
+  continuedWarningNavigationUrl = null
   lastError = null
 
   if (mainWindow) {
@@ -1923,6 +3213,9 @@ ipcMain.handle('users:clear-active', () => {
   store.activeUserId = null
   saveUserStore(store)
   browserMode = 'home'
+  setReputationIntervention(null)
+  setDnsFailure(null)
+  continuedWarningNavigationUrl = null
   lastError = null
   updateBrowserBounds()
   sendBrowserState()
@@ -1952,6 +3245,9 @@ ipcMain.handle('users:create', (_event, name: string) => {
   store.activeUserId = nextUser.id
   saveUserStore(store)
   browserMode = 'home'
+  setReputationIntervention(null)
+  setDnsFailure(null)
+  continuedWarningNavigationUrl = null
   lastError = null
 
   if (mainWindow) {
@@ -1982,6 +3278,9 @@ ipcMain.handle('users:delete', async (_event, userId: string) => {
   clearUserFavorites(userId)
   saveUserStore(store)
   browserMode = 'home'
+  setReputationIntervention(null)
+  setDnsFailure(null)
+  continuedWarningNavigationUrl = null
   lastError = null
   updateBrowserBounds()
   sendBrowserState()
@@ -1995,9 +3294,23 @@ ipcMain.handle('browser:navigate', async (_event, value: string) => {
 
 ipcMain.handle('browser:home', () => {
   browserMode = 'home'
+  setReputationIntervention(null)
+  setDnsFailure(null)
+  continuedWarningNavigationUrl = null
   lastError = null
   updateBrowserBounds()
   sendBrowserState()
+})
+
+ipcMain.handle('browser:continue-reputation-warning', async () => {
+  const pendingUrl = reputationInterventionState?.canContinue ? reputationInterventionState.url : null
+
+  if (!pendingUrl) {
+    return
+  }
+
+  continuedWarningNavigationUrl = pendingUrl
+  await navigateBrowser(pendingUrl)
 })
 
 ipcMain.handle('browser:back', () => {
@@ -2042,6 +3355,58 @@ ipcMain.handle('accessibility:get-settings', () => {
 
 ipcMain.handle('accessibility:set-visible-focus', (_event, visibleFocus: boolean) => {
   return setVisibleFocusSetting(visibleFocus)
+})
+
+ipcMain.handle('reputation:get-settings', () => {
+  return loadReputationSettings()
+})
+
+ipcMain.handle(
+  'reputation:update-settings',
+  (
+    _event,
+    value: Partial<
+      Pick<
+        ReputationSettings,
+        | 'enabled'
+        | 'warningThreshold'
+        | 'blockedThreshold'
+        | 'ruleWeights'
+        | 'youngDomainMaxAgeDays'
+        | 'disabledRuleIds'
+      >
+    >
+  ) => {
+    return updateReputationSettings(value)
+  }
+)
+
+ipcMain.handle('reputation:set-google-safe-browsing-api-key', (_event, value: string | null) => {
+  return setGoogleSafeBrowsingApiKey(value)
+})
+
+ipcMain.handle('reputation:assess-url', (_event, rawUrl: string) => {
+  return assessReputationPreview(rawUrl)
+})
+
+ipcMain.handle('domain-blocklists:get-sources', () => {
+  return loadDomainBlocklistSources()
+})
+
+ipcMain.handle('domain-blocklists:add-source', (_event, url: string) => {
+  return addDomainBlocklistSource(url)
+})
+
+ipcMain.handle('domain-blocklists:set-enabled', (_event, id: string, enabled: boolean) => {
+  return setDomainBlocklistSourceEnabled(id, enabled)
+})
+
+ipcMain.handle('domain-blocklists:set-score-delta', (_event, id: string, scoreDelta: number) => {
+  return setDomainBlocklistSourceScoreDelta(id, scoreDelta)
+})
+
+ipcMain.handle('domain-blocklists:remove-source', (_event, id: string) => {
+  return removeDomainBlocklistSource(id)
 })
 
 ipcMain.handle('browser:toggle-maximize', () => {
