@@ -133,6 +133,21 @@ declare global {
     updatedAt: string
   }
 
+  type TrustedDomainSource = {
+    id: string
+    name: string
+    kind: 'tranco'
+    url: string
+    enabled: boolean
+    isDefault: boolean
+    maxDomains: number
+    lastSyncedAt: string | null
+    lastDomainCount: number
+    lastSyncError: string | null
+    createdAt: string
+    updatedAt: string
+  }
+
   interface Window {
     easybrowser: {
       version: string
@@ -182,6 +197,12 @@ declare global {
         scoreDelta: number
       ) => Promise<DomainBlocklistSource[]>
       removeDomainBlocklistSource: (id: string) => Promise<DomainBlocklistSource[]>
+      getTrustedDomainSources: () => Promise<TrustedDomainSource[]>
+      setTrustedDomainSourceEnabled: (
+        id: string,
+        enabled: boolean
+      ) => Promise<TrustedDomainSource[]>
+      syncTrustedDomainSource: (id: string) => Promise<TrustedDomainSource[]>
       toggleMaximize: () => Promise<void>
       minimizeWindow: () => Promise<void>
       closeWindow: () => Promise<void>

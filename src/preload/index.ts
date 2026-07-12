@@ -128,6 +128,20 @@ type DomainBlocklistSource = {
   createdAt: string
   updatedAt: string
 }
+type TrustedDomainSource = {
+  id: string
+  name: string
+  kind: 'tranco'
+  url: string
+  enabled: boolean
+  isDefault: boolean
+  maxDomains: number
+  lastSyncedAt: string | null
+  lastDomainCount: number
+  lastSyncError: string | null
+  createdAt: string
+  updatedAt: string
+}
 
 contextBridge.exposeInMainWorld('easybrowser', {
   version: '1.0.0',
@@ -188,6 +202,12 @@ contextBridge.exposeInMainWorld('easybrowser', {
     ipcRenderer.invoke('domain-blocklists:set-score-delta', id, scoreDelta) as Promise<DomainBlocklistSource[]>,
   removeDomainBlocklistSource: (id: string) =>
     ipcRenderer.invoke('domain-blocklists:remove-source', id) as Promise<DomainBlocklistSource[]>,
+  getTrustedDomainSources: () =>
+    ipcRenderer.invoke('trusted-domains:get-sources') as Promise<TrustedDomainSource[]>,
+  setTrustedDomainSourceEnabled: (id: string, enabled: boolean) =>
+    ipcRenderer.invoke('trusted-domains:set-enabled', id, enabled) as Promise<TrustedDomainSource[]>,
+  syncTrustedDomainSource: (id: string) =>
+    ipcRenderer.invoke('trusted-domains:sync-source', id) as Promise<TrustedDomainSource[]>,
   toggleMaximize: () => ipcRenderer.invoke('browser:toggle-maximize'),
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),

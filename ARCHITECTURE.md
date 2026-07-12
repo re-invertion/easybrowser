@@ -1,202 +1,358 @@
-# Easybrowser is a very simple web browser based on Electron.
-## Non negotiable principles:
+# Easybrowser
+
+Easybrowser is a very simple and security-focused browser based on Electron.
+
+## Non Negotiable Principles
 - No ads, no tracking, no telemetry.
-- No unnecessary features, no bloat.
-- Every string is in Polish!
-- Always use the `Atkinson Hyperlegible` font across the whole interface.
+- No unnecessary features and no bloat.
+- Every user-facing string must be in Polish.
+- The UI must use `Atkinson Hyperlegible` consistently.
+- The product is designed for elderly and non-technical people, so security messages must be calm, clear, and non-technical.
 
-## Project goal
-The goal is to create a simple and very secure browser for eldery and non technical people.
-- Future plans:
-    - Add a simple password manager with multiple users.
-    
-## Technology:
-- Electron
-- React TS
-- Tailwind CSS
-- Vite
+## Technology
+- Electron for the desktop shell, privileged main process, Chromium sessions, and `WebContentsView`.
+- React and TypeScript for the renderer UI.
+- Tailwind CSS for styling.
+- Vite and Electron Vite for bundling.
+- `sql.js` for the application-managed SQLite database.
+- Electron `safeStorage` for encrypting the SQLite payload before it is written to disk.
+- `tldts` for URL, hostname, public suffix, and registrable-domain normalization.
 
-## Current Implementation Status
-- The app is already split into the standard Electron layers:
-  - `src/main/index.ts` for window management, browser session security, user data, and permission handling.
-  - `src/preload/index.ts` for the safe bridge exposed to the renderer.
-  - `src/renderer/src/App.tsx` for the full user interface.
-- The main browser surface is rendered through `WebContentsView`, not inside the React DOM.
-- The renderer currently works as a single main React screen with distinct states for:
+## Process And Layer Split
+- `src/main/index.ts` owns privileged browser behavior:
+  - main window and `WebContentsView` lifecycle,
+  - navigation validation,
+  - Chromium session configuration,
+  - permission handling,
+  - encrypted SQLite storage,
+  - phishing and reputation checks,
+  - trusted-domain synchronization,
+  - admin PIN verification.
+- `src/preload/index.ts` exposes a narrow, typed bridge from the renderer to the main process.
+- `src/renderer/src/App.tsx` owns the visible UI:
   - user selection,
-  - user home screen,
-  - active browser mode.
+  - home screen,
+  - browser chrome,
+  - admin panel,
+  - warning and error screens.
+- Browsed web pages are not rendered inside the React DOM. They are rendered through Electron `WebContentsView` below the custom browser chrome.
 
-## Current User Flow
-- On launch, the app always starts with no active user selected.
-- The user can:
-  - choose an existing profile,
-  - create a new profile,
-  - remove a profile.
-- After choosing a profile, the user sees a simplified home screen with a large search field.
-- Entering a query or address opens the browsing mode.
-- Returning to the home screen clears the main search field so it never shows leftover URLs from the browser view.
-- The home screen also renders the active user's favorite pages as large tiles.
-- Favorite tiles can be clicked to open the saved page or removed directly from the home screen.
+## Application Startup
+- On app startup, the encrypted SQLite database is initialized before the main window is created.
+- The app always starts with no active user selected.
+- Existing users remain stored in the database, but `activeUserId` is cleared on launch.
+- Trusted-domain sources are checked in the background after startup.
+- If the default trusted-domain source has no local entries yet, the app attempts an initial synchronization.
+- The app remains usable if the trusted-domain synchronization fails.
 
-## Current Browser Architecture
-- Each user gets a separate persistent Chromium partition: `persist:easybrowser-user-{userId}`.
-- This means browsing storage is isolated per user profile.
-- The browser mode includes:
+## User Profiles
+- Users are stored in the shared application database in the `users` table.
+- Each user has:
+  - `id`,
+  - `name`,
+  - `initials`,
+  - `description`,
+  - `created_at`,
+  - `is_active`.
+- The app supports:
+  - creating a user,
+  - selecting a user,
+  - removing a user,
+  - clearing the active user when returning to the selection flow.
+- User removal also clears Easybrowser-managed user favorites and in-memory media grants for that user.
+- Chromium browsing data is isolated separately per user through persistent Chromium partitions.
+
+## Chromium Session Isolation
+- Each user gets a Chromium partition named `persist:easybrowser-user-{userId}`.
+- Chromium stores cookies, cache, local storage, IndexedDB, and other page-controlled browser data inside that partition.
+- This Chromium-managed partition storage is isolated per user.
+- Easybrowser does not additionally encrypt Chromium's own session storage.
+- Application-managed profile data is separate from Chromium session storage and is stored in `browser-data.sqlite.enc`.
+
+## Home Screen And Favorites
+- After selecting a user, the user sees a simplified home screen with a large search field.
+- The home search field is always clean when returning from browsing mode.
+- Browser URLs are not written back into the home search field.
+- Favorites are stored per user in the `favorites` table.
+- Each favorite contains:
+  - `url`,
+  - `title`,
+  - optional `favicon_url`,
+  - `created_at`,
+  - `updated_at`.
+- The home screen renders favorites as large tiles.
+- Favorite tiles can be opened directly from the home screen.
+- Favorite tiles can be removed directly from the home screen.
+
+## Browser Chrome
+- The browser chrome is rendered in React above the `WebContentsView`.
+- The renderer reports the browser chrome height to the main process.
+- The main process resizes the `WebContentsView` so web content starts below the custom browser chrome.
+- The browser chrome includes:
   - back,
   - forward,
   - reload,
-  - go home,
-  - add or remove the current page from favorites,
-  - copy current URL,
+  - home,
+  - favorite star,
+  - current-page favicon,
+  - URL input,
+  - copy URL,
+  - microphone/camera usage indicator,
   - custom window controls.
-- The browser chrome height is reported from the renderer to the main process so the `WebContentsView` can be resized correctly below the custom header.
-- The address field shows the current page favicon on the left and keeps user edits stable while the user is typing.
-- The address field never restores a browser URL into the home search field.
-- Favicons are resolved from Electron favicon events, page `<link rel="icon">` candidates, `/favicon.ico`, and `/apple-touch-icon.png`.
-- Successful favicon responses are cached per origin as data URLs so the icon does not flicker or disappear during later loading events.
-- The renderer has an additional visual fallback chain for favicon display.
-- Every attempted navigation is checked live against the currently enabled phishing blocklists configured in the admin panel.
-- Every attempted navigation is also passed through a configurable reputation engine before the page is shown.
-- Domain blocklist sources are fetched on demand from their remote HTTPS endpoints at navigation time, with no offline mirror maintained by Easybrowser.
-- The default blocklist sources are:
-  - `https://hole.cert.pl/domains/v2/domains.txt`
-  - `https://urlhaus.abuse.ch/downloads/text_online/`
-- The admin panel can add additional blocklist source URLs, enable or disable each source, and remove non-default sources.
-- The current reputation engine can score the page using these filters:
-  - plain `http` navigation,
-  - non-Latin characters in the hostname,
-  - direct navigation to an IP address,
-  - Google Safe Browsing matches,
-  - very young domain age resolved through RDAP,
-  - remote phishing blocklist matches.
-- Each filter can be enabled or disabled independently from the admin panel, even while its section is collapsed.
-- Filter settings are edited as a draft in the renderer and are written only after the user clicks the shared `Zapisz` action in the admin panel.
-- Domain-age checks use RDAP over HTTPS with the IANA DNS bootstrap as the registry discovery source.
-- Google Safe Browsing checks are executed from the Electron main process only and never expose the API key to page content or normal renderer state.
-- If a hostname matches a listed domain, the `WebContentsView` is hidden and the renderer shows a full warning screen in its place.
-- If the reputation score reaches the warning threshold, the user sees an in-browser caution screen and can explicitly continue.
-- If the reputation score reaches the block threshold, the user sees an in-browser block screen and cannot continue.
-- The current warning screens are phrased for non-technical users and show only a generic event code:
-  - `filters-warning`
-  - `filters-block`
-- DNS resolution failures render a separate in-browser screen with the event code `no-dns-found`.
+- The URL input preserves user edits while the user is typing.
+- Deleting the URL does not cause the old loaded URL to be reinserted into the field.
 
-## Current Security Model
-- `contextIsolation` is enabled.
-- `nodeIntegration` is disabled.
-- `sandbox` is enabled both for the main renderer window and the browser view.
-- Only `http:` and `https:` navigation are allowed for opened pages.
-- New windows are blocked and safe links are opened externally through the OS.
-- Browser sessions use explicit Electron permission handlers.
-- User data keys are stored with `safeStorage` when secure system storage is available.
-- The browser administrator PIN is not stored in plain text:
-  - the PIN itself is never persisted,
-  - only `pinSalt`, `pinHash`, `failedAttempts`, and `lockedUntil` are stored.
-- Global browser settings are stored in a single encrypted `browser-settings.json` payload.
-- User favorites are stored in per-user encrypted payload files.
-- Remote phishing blocklists are accepted only from HTTPS source URLs.
-- Google Safe Browsing API checks are sent only from the main process.
-- Navigation is fail-closed for phishing checks:
-  - if a domain is found on an enabled list, the page is blocked,
-  - if an enabled list cannot be fetched successfully during validation, the navigation is also blocked.
-- Domain-age lookups use RDAP and fall back safely:
-  - if RDAP data is unavailable, the age filter simply does not add score,
-  - missing RDAP data alone does not block navigation.
-- Google Safe Browsing lookups also fail softly:
-  - if no API key is configured, the filter stays inactive,
-  - if the remote request fails, the filter does not add score by itself.
-- Only the configured blocklist source metadata is persisted locally.
-- The downloaded blocklist contents are not written to disk by Easybrowser.
+## Favicons
+- Favicons are resolved from several sources:
+  - Electron page favicon events,
+  - page `<link rel="icon">` candidates,
+  - `/favicon.ico`,
+  - `/apple-touch-icon.png`.
+- Successful favicon responses are cached per origin as data URLs.
+- The cache prevents favicons from disappearing during later navigation/loading events.
+- The renderer has a fallback display path when no favicon is available.
+- The favicon is shown both:
+  - in the browser address bar,
+  - on favorite tiles.
 
-## Current Permissions Model
-- Media permissions are handled with a custom in-app modal instead of the native Electron message box.
-- The modal is shown above the browser as a separate lightweight overlay window controlled by the main process.
+## Navigation Pipeline
+- Navigation is allowed only for `http:` and `https:` URLs.
+- New windows are blocked by default.
+- Safe external links are opened externally through the OS when appropriate.
+- Every attempted navigation goes through normalization and validation before the page is shown.
+- The navigation pipeline checks:
+  - protocol,
+  - normalized hostname,
+  - trusted-domain bypass,
+  - reputation filters,
+  - warning/block thresholds,
+  - DNS and Chromium navigation failures.
+- When navigation is blocked or paused by a warning, the `WebContentsView` is hidden and the renderer shows a dedicated safety screen.
+
+## URL Normalization
+- URLs are parsed through the platform URL parser.
+- Hostnames are normalized before security checks.
+- Domain data is resolved with `tldts`.
+- The normalized candidate includes:
+  - original URL,
+  - normalized URL,
+  - protocol,
+  - hostname,
+  - ASCII hostname,
+  - Unicode hostname,
+  - registrable domain,
+  - public suffix,
+  - subdomain,
+  - IP-address marker,
+  - port,
+  - path,
+  - query.
+- This normalized candidate is the shared input for reputation rules.
+
+## Reputation Engine
+- The reputation engine scores each navigation attempt.
+- The engine can be enabled or disabled from the admin panel.
+- Each rule can be enabled or disabled independently.
+- Each rule has a configurable score value.
+- The warning threshold and block threshold are configurable.
+- Current default behavior:
+  - score `50+` shows a warning screen,
+  - score `70+` blocks the page.
+- Blocking rules can force a high score by adding enough points to cross the block threshold.
+- Filter settings are edited as draft state in the renderer.
+- Filter settings are persisted only after the admin clicks `Zapisz`.
+
+## Reputation Rules
+- `insecure-http`
+  - Detects navigation to plain `http:`.
+  - This is configured under warning filters.
+  - The user can choose whether to continue from the warning screen.
+- `domain-blocklist`
+  - Checks the hostname against remote phishing/blocklist sources.
+  - Enabled lists are fetched live during navigation.
+  - If a source cannot be fetched during validation, navigation fails closed for that list path.
+- `non-latin-script`
+  - Detects hostnames containing letters outside the Latin alphabet.
+  - This helps catch lookalike domains using mixed scripts.
+- `is-ip`
+  - Detects direct navigation to an IP address instead of a named domain.
+- `google-safe-browsing`
+  - Checks the URL with Google Safe Browsing when an API key is configured.
+  - The API key is never exposed to page content or normal renderer state.
+  - If no API key is configured, the rule is inactive.
+  - If the remote request fails, this rule fails softly and does not add score by itself.
+- `young-domain-age`
+  - Checks domain age through RDAP.
+  - Very young domains can add warning score.
+  - Missing RDAP data does not block navigation by itself.
+
+## Remote Blocklists
+- The default remote blocklist sources are:
+  - `https://hole.cert.pl/domains/v2/domains.txt`,
+  - `https://urlhaus.abuse.ch/downloads/text_online/`.
+- Admins can add more HTTPS blocklist sources.
+- Admins can enable or disable each source.
+- Admins can remove non-default sources.
+- Source metadata is stored in `domain_blocklist_sources`.
+- Downloaded blocklist contents are not stored as an offline Easybrowser mirror.
+- Blocklist validation is performed live against currently enabled source URLs.
+
+## Trusted Domains
+- Trusted domains are intended as a whitelist-style bypass for reputation filters.
+- The current trusted source is Tranco.
+- Trusted source metadata is stored in `trusted_sources`.
+- Trusted domain entries are stored in `trusted_domains`.
+- The default Tranco source is:
+  - `https://tranco-list.eu/top-1m.csv.zip`.
+- The default local limit is `50_000` domains.
+- Tranco data is downloaded as a ZIP archive and parsed locally.
+- If a domain is trusted, reputation rules are bypassed and the navigation assessment is allowed.
+- Trusted source synchronization errors are stored on the source row and do not prevent the app from starting.
+
+## Warning And Error Screens
+- Warning and block screens are rendered by the renderer in the browser content area.
+- The dangerous page is not shown behind the warning screen.
+- Warning copy is written for non-technical users.
+- Rule IDs are not shown to the user.
+- The user-facing event codes are:
+  - `filters-warning`,
+  - `filters-block`,
+  - `no-dns-found`.
+- `filters-warning` allows the user to continue explicitly.
+- `filters-block` does not allow continuing to the page.
+- `no-dns-found` is shown when Chromium reports that the domain cannot be resolved.
+- The DNS failure screen includes a return action to the home screen.
+
+## Security Events
+- Security events are stored in the `security_events` table.
+- A security event is currently written when reputation filters produce a warning or block intervention.
+- Each stored event contains:
+  - generated event id,
+  - current user id when available,
+  - normalized URL,
+  - hostname,
+  - decision,
+  - event code,
+  - JSON details with score and matched rule metadata,
+  - creation timestamp.
+- These events are local application state and are encrypted as part of the shared SQLite payload.
+
+## Permissions
+- Media permissions use a custom in-app modal instead of Electron's native dialog.
+- The modal is displayed above the browser as a separate lightweight overlay window controlled by the main process.
 - The modal distinguishes between:
   - microphone access,
   - camera access,
   - microphone and camera access together.
-- The modal currently offers three actions:
-  - `Zezwalaj`
-  - `Nie zezwalaj`
-  - `Opuść stronę`
-- Choosing `Opuść stronę` exits the current page and returns the user to the app home screen.
-- Media permissions are currently:
+- The modal offers:
+  - `Zezwalaj`,
+  - `Nie zezwalaj`,
+  - `Opuść stronę`.
+- Choosing `Opuść stronę` exits the current page and returns the user to the home screen.
+- Media permissions are:
   - per user,
   - per origin,
-  - per app session only.
-- Permissions are intentionally kept only in memory, so they are cleared after the app is restarted.
-- The browser UI shows a visible indicator when the current page has access to:
-  - the microphone,
-  - the camera,
-  - both microphone and camera.
-- All other browser permissions are effectively denied unless explicitly added to the allowlist in code.
+  - per app session.
+- Media permission grants are intentionally memory-only and are cleared after app restart.
+- The browser chrome shows a visible indicator when the current page has access to:
+  - microphone,
+  - camera,
+  - microphone and camera.
+- Other browser permissions are denied unless explicitly allowed in code.
 
-## Current Data Storage
-- `users.json`
-  - stores the user list and current active user id.
-  - the whole file payload is encrypted directly with Electron `safeStorage`.
-- `user-keys.json`
-  - stores per-user data keys.
-  - when secure system storage is available, each stored key is protected with Electron `safeStorage`.
-  - in local development fallback mode, keys may be stored as `dev-plain:*`.
-- `favorites/{userId}.json.enc`
-  - stores the active user's favorite pages encrypted with the user's data key.
-  - each favorite contains the URL, title, optional favicon data, and timestamps.
-  - payload encryption uses `AES-256-GCM`.
-  - the encryption key is derived from the per-user data key stored in `user-keys.json`.
-- `browser-settings.json`
-  - stores global browser settings such as:
-    - `accessibility.visibleFocus`
-    - administrator PIN metadata: `pinSalt`, `pinHash`, `failedAttempts`, `lockedUntil`
-    - Google Safe Browsing API key
-    - reputation engine settings:
-      - `enabled`
-      - `warningThreshold`
-      - `blockedThreshold`
-      - `disabledRuleIds`
-      - `ruleWeights`
-      - `youngDomainMaxAgeDays`
-    - phishing blocklist source definitions:
-      - `id`
-      - `url`
-      - `enabled`
-      - `scoreDelta`
-      - `isDefault`
-      - `createdAt`
-      - `updatedAt`
-  - the whole file payload is encrypted directly with Electron `safeStorage`.
-- Chromium session storage for each user partition
-  - each user gets a separate persistent partition: `persist:easybrowser-user-{userId}`.
-  - Chromium stores cookies, cache, local storage, and other browser session data there.
-  - this storage is isolated per user, but it is not additionally encrypted by Easybrowser itself.
-- Media permission grants are not persisted to disk.
-- The following state is intentionally memory-only:
+## Admin Panel
+- The admin panel is opened from the browser label context menu.
+- The panel is protected by an administrator PIN.
+- If the PIN is unset, the admin must set it before entering the panel.
+- After the PIN is set, entering the panel requires verification.
+- The PIN itself is never stored.
+- Stored PIN metadata includes:
+  - salt,
+  - hash,
+  - failed attempt count,
+  - lock timestamp.
+- The admin unlocked state is session-only and memory-only.
+- The admin panel includes:
+  - accessibility settings,
+  - reputation scoring settings,
+  - per-rule enable/disable toggles,
+  - per-rule score values,
+  - warning and block thresholds,
+  - remote blocklist source management,
+  - trusted-domain source management,
+  - Google Safe Browsing API key management.
+- The panel content scrolls inside the panel area and does not scroll the custom window chrome.
+
+## Accessibility
+- The current accessibility setting is `visibleFocus`.
+- `visibleFocus` controls the yellow focus outline.
+- The setting is stored in `app_settings`.
+- The UI is designed around high contrast, large controls, simple layouts, and readable typography.
+
+## Shared SQLite Database
+- Easybrowser uses one application-managed database file:
+  - `browser-data.sqlite.enc`.
+- The file lives in Electron's `app.getPath('userData')` directory.
+- The app does not currently migrate data from older JSON-based storage files.
+- Losing old local state is accepted at this stage.
+- The database is loaded on startup, decrypted in memory, and saved back as an encrypted payload.
+- If the encrypted database cannot be read, the app creates a fresh database.
+
+## Database Tables
+- `app_settings`
+  - key-value JSON settings such as accessibility options.
+- `users`
+  - Easybrowser user profiles and active-user marker.
+- `favorites`
+  - user favorite pages keyed by `user_id`.
+- `admin_security`
+  - admin PIN salt/hash metadata, failed attempts, and lock state.
+- `reputation_settings`
+  - global reputation engine state, thresholds, young-domain configuration, and Google Safe Browsing API key.
+- `reputation_rule_settings`
+  - per-rule enable state, score delta, and severity.
+- `domain_blocklist_sources`
+  - configured remote phishing/blocklist source URLs and score values.
+- `trusted_sources`
+  - configured trusted-domain source metadata and synchronization status.
+- `trusted_domains`
+  - trusted domain rows imported from enabled trusted sources.
+- `security_events`
+  - local records of warning/block security decisions.
+
+## Encryption Model
+- The SQLite database bytes are exported from `sql.js`.
+- The exported SQLite bytes are base64-encoded.
+- The base64 payload is encrypted with Electron `safeStorage.encryptString`.
+- The encrypted output is saved as base64 text in `browser-data.sqlite.enc`.
+- On load, the file is decoded, decrypted with `safeStorage.decryptString`, and reconstructed as a `sql.js` database.
+- There are no per-user Easybrowser data keys.
+- User-specific application rows are separated by `user_id`, not by separate encrypted files.
+- This protects Easybrowser-managed application data at rest through the OS-backed storage mechanism used by Electron `safeStorage`.
+- Chromium profile data remains managed by Chromium and is not additionally encrypted by Easybrowser.
+
+## Memory-Only State
+- The following state is intentionally not persisted:
   - media permission grants,
-  - administrator unlocked session state,
+  - pending media permission requests,
+  - administrator unlocked session,
   - favicon cache,
   - RDAP bootstrap cache,
   - domain-age result cache,
   - Google Safe Browsing response cache,
-  - filter draft state in the admin panel.
+  - renderer draft state for unsaved admin settings.
 
 ## Current UI State
-- All user-facing strings remain in Polish.
 - The interface uses `Atkinson Hyperlegible`.
-- The browser top bar has already been slightly compacted to reduce vertical space.
-- The browsing header now includes a right-side status badge for active microphone and camera access.
+- The browser top bar is compact to preserve vertical space.
+- The browsing header includes a right-side status badge for active microphone and camera access.
 - The browser address bar includes:
-  - a left-side favicon,
-  - a favorite star action,
-  - a copy URL action.
-- The user home screen includes favorite page tiles with favicon rendering and a delete action.
-- The admin panel is protected by an administrator PIN gate before access is granted.
-- The admin panel includes an accessibility setting for toggling the visible yellow focus outline.
-- The admin panel includes phishing protection settings for managing remote domain blocklist sources.
-- The admin panel includes a broader security section for reputation scoring, per-filter enable/disable toggles, filter weights, RDAP-based young-domain settings, Google Safe Browsing configuration, and remote domain blocklist management.
-- The Google Safe Browsing section exposes only whether the API key is configured plus actions to set or remove it; the stored key is not shown back to the user.
-- The browser warning state is rendered as a dedicated in-browser safety screen instead of showing the dangerous page directly.
-- Both the warning and block screens now use non-technical Polish copy intended for elderly or non-technical users.
+  - left-side favicon,
+  - favorite star action,
+  - copy URL action.
+- The user home screen includes favorite page tiles with favicon rendering and delete actions.
+- The browser warning state is rendered as a dedicated in-browser safety screen.
+- Warning and block screens use non-technical Polish copy intended for elderly or non-technical users.
 
 ## Visual Design Rules
 - Background: `#F8FAFC`
@@ -211,6 +367,7 @@ The goal is to create a simple and very secure browser for eldery and non techni
 - Keep the interface calm, high-contrast, and easy to scan.
 - Use white tiles on the light background for key actions and grouped content.
 - Reserve the primary blue for the main action on each screen.
-- Ensure keyboard focus is always visible with the amber focus ring.
-- Do not introduce alternate decorative UI fonts. Use `Atkinson Hyperlegible` consistently for headings, labels, inputs, and buttons.
-- Avoid any unnecessary texts or labels. Use clear and concise language. 
+- Ensure keyboard focus can be visible with the amber focus ring.
+- Do not introduce alternate decorative UI fonts.
+- Avoid unnecessary text and labels.
+- Prefer clear, concise Polish wording over technical details.

@@ -14,9 +14,11 @@
     "preview": "sh -c 'unset ELECTRON_RUN_AS_NODE DISPLAY; export XDG_SESSION_TYPE=wayland ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_LOGGING=1; if [ -d /mnt/wslg/runtime-dir ]; then export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir; export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}; fi; exec electron-vite preview -- --enable-features=UseOzonePlatform --ozone-platform=wayland'"
   },
   "dependencies": {
+    "adm-zip": "^0.6.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-icons": "^5.7.0",
+    "sql.js": "^1.14.1",
     "tldts": "^7.4.7"
   },
   "devDependencies": {
@@ -24,6 +26,7 @@
     "@types/node": "^24.0.10",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
+    "@types/sql.js": "^1.4.11",
     "@vitejs/plugin-react": "^4.4.1",
     "autoprefixer": "^10.4.21",
     "electron": "^37.2.0",

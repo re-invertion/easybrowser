@@ -8,9 +8,8 @@ import {
   shell,
   WebContentsView
 } from 'electron'
+import AdmZip from 'adm-zip'
 import {
-  createCipheriv,
-  createDecipheriv,
   createHash,
   randomBytes,
   randomUUID,
@@ -21,7 +20,11 @@ import fs from 'node:fs'
 import { isIP } from 'node:net'
 import path from 'node:path'
 import { domainToUnicode } from 'node:url'
+import initSqlJs from 'sql.js'
 import { getDomain, getPublicSuffix, getSubdomain } from 'tldts'
+
+type SqlJsModule = Awaited<ReturnType<typeof initSqlJs>>
+type SqlJsDatabase = InstanceType<SqlJsModule['Database']>
 
 if (process.platform === 'linux') {
   app.commandLine.appendSwitch('enable-features', 'UseOzonePlatform')
@@ -47,7 +50,6 @@ type UserStore = {
   activeUserId: string | null
 }
 
-type UserKeyStore = Record<string, string>
 type MediaAccessType = 'audio' | 'video'
 type UserMediaPermissionStore = Record<string, Record<string, MediaAccessType[]>>
 type FavoriteEntry = {
@@ -57,7 +59,6 @@ type FavoriteEntry = {
   createdAt: string
   updatedAt: string
 }
-type UserFavoritesStore = Record<string, FavoriteEntry[]>
 type AdminSecurityStore = {
   pinSalt: string | null
   pinHash: string | null
@@ -164,6 +165,21 @@ type DomainBlocklistSource = {
   createdAt: string
   updatedAt: string
 }
+type TrustedDomainSourceKind = 'tranco'
+type TrustedDomainSource = {
+  id: string
+  name: string
+  kind: TrustedDomainSourceKind
+  url: string
+  enabled: boolean
+  isDefault: boolean
+  maxDomains: number
+  lastSyncedAt: string | null
+  lastDomainCount: number
+  lastSyncError: string | null
+  createdAt: string
+  updatedAt: string
+}
 type BrowserSettings = {
   accessibility: AccessibilitySettings
   adminSecurity: AdminSecurityStore
@@ -185,10 +201,7 @@ let reputationInterventionState: ReputationInterventionState | null = null
 let dnsFailureState: DnsFailureState | null = null
 let continuedWarningNavigationUrl: string | null = null
 let userStore: UserStore | null = null
-let userKeyStore: UserKeyStore | null = null
 let userMediaPermissionStore: UserMediaPermissionStore | null = null
-let userFavoritesStore: UserFavoritesStore | null = null
-let browserSettingsStore: BrowserSettings | null = null
 let isAdminSessionUnlocked = false
 const pendingMediaPermissionRequests = new Map<string, Promise<PermissionPromptAction>>()
 const faviconDataUrlCache = new Map<string, string | null>()
@@ -196,9 +209,10 @@ const pageFaviconCache = new Map<string, string>()
 const domainAgeCache = new Map<string, CachedDomainAgeEntry>()
 const googleSafeBrowsingCache = new Map<string, CachedSafeBrowsingEntry>()
 let rdapBootstrapCache: RdapBootstrap | null = null
+let sqlJsModulePromise: Promise<SqlJsModule> | null = null
+let appDatabase: SqlJsDatabase | null = null
 
 const DEFAULT_USERS: UserProfile[] = []
-const DEV_PLAIN_KEY_PREFIX = 'dev-plain:'
 
 const BROWSER_INPUT_RING_CSS = `
   input:focus,
@@ -229,6 +243,8 @@ const DEFAULT_YOUNG_DOMAIN_SCORE_DELTA = 35
 const DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS = 30
 const DEFAULT_REPUTATION_WARNING_THRESHOLD = 50
 const DEFAULT_REPUTATION_BLOCKED_THRESHOLD = 70
+const DEFAULT_TRANCO_TRUSTED_DOMAINS_URL = 'https://tranco-list.eu/top-1m.csv.zip'
+const DEFAULT_TRANCO_TRUSTED_DOMAINS_LIMIT = 50_000
 const RDAP_BOOTSTRAP_URL = 'https://data.iana.org/rdap/dns.json'
 const RDAP_FETCH_TIMEOUT_MS = 5_000
 const RDAP_DOMAIN_AGE_CACHE_TTL_MS = 1000 * 60 * 60 * 12
@@ -236,7 +252,24 @@ const GOOGLE_SAFE_BROWSING_ENDPOINT =
   'https://safebrowsing.googleapis.com/v4/threatMatches:find'
 const GOOGLE_SAFE_BROWSING_FETCH_TIMEOUT_MS = 5_000
 const GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS = 1000 * 60 * 5
+const TRUSTED_DOMAINS_FETCH_TIMEOUT_MS = 15_000
 const DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT = '2026-07-08T00:00:00.000Z'
+const DEFAULT_TRUSTED_DOMAIN_SOURCES: TrustedDomainSource[] = [
+  {
+    id: 'trusted-source-tranco-default',
+    name: 'Tranco top domains',
+    kind: 'tranco',
+    url: DEFAULT_TRANCO_TRUSTED_DOMAINS_URL,
+    enabled: true,
+    isDefault: true,
+    maxDomains: DEFAULT_TRANCO_TRUSTED_DOMAINS_LIMIT,
+    lastSyncedAt: null,
+    lastDomainCount: 0,
+    lastSyncError: null,
+    createdAt: '2026-07-12T00:00:00.000Z',
+    updatedAt: '2026-07-12T00:00:00.000Z'
+  }
+]
 const DEFAULT_DOMAIN_BLOCKLIST_SOURCES: DomainBlocklistSource[] = [
   {
     id: 'default-cert-hole',
@@ -310,24 +343,12 @@ function buildMediaPermissionRequestKey(
   return `${origin}|${mediaTypes.join(',')}`
 }
 
-function getUserStorePath(): string {
-  return path.join(app.getPath('userData'), 'users.json')
+function getAppDatabasePath(): string {
+  return path.join(app.getPath('userData'), 'browser-data.sqlite.enc')
 }
 
-function getUserKeyStorePath(): string {
-  return path.join(app.getPath('userData'), 'user-keys.json')
-}
-
-function getUserFavoritesDirectoryPath(): string {
-  return path.join(app.getPath('userData'), 'favorites')
-}
-
-function getUserFavoritesPath(userId: string): string {
-  return path.join(getUserFavoritesDirectoryPath(), `${userId}.json.enc`)
-}
-
-function getBrowserSettingsPath(): string {
-  return path.join(app.getPath('userData'), 'browser-settings.json')
+function getTrustedDomainsDatabasePath(): string {
+  return getAppDatabasePath()
 }
 
 function getInitials(value: string): string {
@@ -362,15 +383,6 @@ function loadUserMediaPermissionStore(): UserMediaPermissionStore {
 
   userMediaPermissionStore = {}
   return userMediaPermissionStore
-}
-
-function loadUserFavoritesStore(): UserFavoritesStore {
-  if (userFavoritesStore) {
-    return userFavoritesStore
-  }
-
-  userFavoritesStore = {}
-  return userFavoritesStore
 }
 
 function normalizeAdminSecurityStore(value: unknown): AdminSecurityStore {
@@ -789,76 +801,156 @@ function normalizeBrowserSettings(value: unknown): BrowserSettings {
   }
 }
 
-function encryptBrowserSettingsPayload(payload: string): string {
+function encryptTrustedDomainsDatabasePayload(payload: Uint8Array): string {
   assertSecureUserKeyStorageAvailable()
 
   if (!safeStorage.isEncryptionAvailable()) {
     throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
   }
 
-  return safeStorage.encryptString(payload).toString('base64')
+  return safeStorage.encryptString(Buffer.from(payload).toString('base64')).toString('base64')
 }
 
-function decryptBrowserSettingsPayload(payload: string): string {
+function decryptTrustedDomainsDatabasePayload(payload: string): Uint8Array {
   assertSecureUserKeyStorageAvailable()
 
   if (!safeStorage.isEncryptionAvailable()) {
     throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
   }
 
-  return safeStorage.decryptString(Buffer.from(payload, 'base64'))
-}
-
-function encryptUserStorePayload(payload: string): string {
-  assertSecureUserKeyStorageAvailable()
-
-  if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
-  }
-
-  return safeStorage.encryptString(payload).toString('base64')
-}
-
-function decryptUserStorePayload(payload: string): string {
-  assertSecureUserKeyStorageAvailable()
-
-  if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
-  }
-
-  return safeStorage.decryptString(Buffer.from(payload, 'base64'))
+  const base64Payload = safeStorage.decryptString(Buffer.from(payload, 'base64'))
+  return Uint8Array.from(Buffer.from(base64Payload, 'base64'))
 }
 
 function loadBrowserSettings(): BrowserSettings {
-  if (browserSettingsStore) {
-    return browserSettingsStore
-  }
+  const database = getAppDatabase()
+  const adminResult = database.exec(`
+    SELECT pin_salt, pin_hash, failed_attempts, locked_until
+    FROM admin_security
+    WHERE id = 1
+  `)
+  const adminRow = adminResult[0]?.values[0] ?? []
+  const reputationResult = database.exec(`
+    SELECT enabled, warning_threshold, blocked_threshold, young_domain_max_age_days,
+           google_safe_browsing_api_key
+    FROM reputation_settings
+    WHERE id = 1
+  `)
+  const reputationRow = reputationResult[0]?.values[0] ?? []
+  const ruleResult = database.exec(`
+    SELECT rule_id, enabled, score_delta
+    FROM reputation_rule_settings
+  `)
+  const disabledRuleIds: ReputationRuleId[] = []
+  const ruleWeights: Partial<Record<ReputationRuleId, number>> = {}
 
-  const filePath = getBrowserSettingsPath()
+  for (const row of ruleResult[0]?.values ?? []) {
+    const ruleId = row[0] as ReputationRuleId
+    const enabled = Number(row[1]) === 1
+    const scoreDelta = Number(row[2])
 
-  try {
-    if (fs.existsSync(filePath)) {
-      const encryptedPayload = fs.readFileSync(filePath, 'utf8')
-      const decryptedPayload = decryptBrowserSettingsPayload(encryptedPayload)
-      const rawValue = JSON.parse(decryptedPayload) as unknown
-      browserSettingsStore = normalizeBrowserSettings(rawValue)
-      return browserSettingsStore
+    if (!enabled) {
+      disabledRuleIds.push(ruleId)
     }
-  } catch {
-    // Fall back to defaults when browser settings cannot be read.
+
+    if (Number.isFinite(scoreDelta)) {
+      ruleWeights[ruleId] = scoreDelta
+    }
   }
 
-  browserSettingsStore = normalizeBrowserSettings(null)
-  return browserSettingsStore
+  const blocklistSources = getDomainBlocklistSourceRows(database)
+
+  return normalizeBrowserSettings({
+    accessibility: getAppSetting(database, 'accessibility', normalizeAccessibilitySettings(null)),
+    adminSecurity: {
+      pinSalt: typeof adminRow[0] === 'string' ? adminRow[0] : null,
+      pinHash: typeof adminRow[1] === 'string' ? adminRow[1] : null,
+      failedAttempts: Number(adminRow[2]) || 0,
+      lockedUntil: typeof adminRow[3] === 'string' ? adminRow[3] : null
+    },
+    domainBlocklistSources: blocklistSources,
+    googleSafeBrowsingApiKey: typeof reputationRow[4] === 'string' ? reputationRow[4] : null,
+    reputation: {
+      enabled: Number(reputationRow[0]) === 1,
+      warningThreshold: Number(reputationRow[1]) || DEFAULT_REPUTATION_WARNING_THRESHOLD,
+      blockedThreshold: Number(reputationRow[2]) || DEFAULT_REPUTATION_BLOCKED_THRESHOLD,
+      disabledRuleIds,
+      ruleWeights,
+      youngDomainMaxAgeDays:
+        Number(reputationRow[3]) || DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS,
+      googleSafeBrowsingApiKeyConfigured: typeof reputationRow[4] === 'string'
+    }
+  })
 }
 
 function saveBrowserSettings(value: BrowserSettings): BrowserSettings {
-  browserSettingsStore = normalizeBrowserSettings(value)
-  const encryptedPayload = encryptBrowserSettingsPayload(
-    JSON.stringify(browserSettingsStore, null, 2)
+  const database = getAppDatabase()
+  const normalizedValue = normalizeBrowserSettings(value)
+  const now = new Date().toISOString()
+
+  setAppSetting(database, 'accessibility', normalizedValue.accessibility)
+  database.run(
+    `
+      UPDATE admin_security
+      SET pin_salt = $pinSalt,
+          pin_hash = $pinHash,
+          failed_attempts = $failedAttempts,
+          locked_until = $lockedUntil,
+          updated_at = $updatedAt
+      WHERE id = 1
+    `,
+    {
+      $pinSalt: normalizedValue.adminSecurity.pinSalt,
+      $pinHash: normalizedValue.adminSecurity.pinHash,
+      $failedAttempts: normalizedValue.adminSecurity.failedAttempts,
+      $lockedUntil: normalizedValue.adminSecurity.lockedUntil,
+      $updatedAt: now
+    }
   )
-  fs.writeFileSync(getBrowserSettingsPath(), encryptedPayload, 'utf8')
-  return browserSettingsStore
+  database.run(
+    `
+      UPDATE reputation_settings
+      SET enabled = $enabled,
+          warning_threshold = $warningThreshold,
+          blocked_threshold = $blockedThreshold,
+          young_domain_max_age_days = $youngDomainMaxAgeDays,
+          google_safe_browsing_api_key = $googleSafeBrowsingApiKey,
+          updated_at = $updatedAt
+      WHERE id = 1
+    `,
+    {
+      $enabled: normalizedValue.reputation.enabled ? 1 : 0,
+      $warningThreshold: normalizedValue.reputation.warningThreshold,
+      $blockedThreshold: normalizedValue.reputation.blockedThreshold,
+      $youngDomainMaxAgeDays: normalizedValue.reputation.youngDomainMaxAgeDays,
+      $googleSafeBrowsingApiKey: normalizedValue.googleSafeBrowsingApiKey,
+      $updatedAt: now
+    }
+  )
+
+  for (const [ruleId, scoreDelta] of Object.entries(normalizedValue.reputation.ruleWeights)) {
+    database.run(
+      `
+        UPDATE reputation_rule_settings
+        SET enabled = $enabled,
+            score_delta = $scoreDelta,
+            updated_at = $updatedAt
+        WHERE rule_id = $ruleId
+      `,
+      {
+        $enabled: normalizedValue.reputation.disabledRuleIds.includes(ruleId as ReputationRuleId)
+          ? 0
+          : 1,
+        $scoreDelta: scoreDelta ?? 0,
+        $updatedAt: now,
+        $ruleId: ruleId
+      }
+    )
+  }
+
+  saveDomainBlocklistSourcesToDatabase(database, normalizedValue.domainBlocklistSources)
+  saveTrustedDomainsDatabase(database)
+  return loadBrowserSettings()
 }
 
 function loadAccessibilitySettings(): AccessibilitySettings {
@@ -881,12 +973,712 @@ function loadDomainBlocklistSources(): DomainBlocklistSource[] {
 }
 
 function saveDomainBlocklistSources(value: DomainBlocklistSource[]): DomainBlocklistSource[] {
-  const nextBrowserSettings = saveBrowserSettings({
-    ...loadBrowserSettings(),
-    domainBlocklistSources: normalizeDomainBlocklistSources(value)
-  })
+  const database = getAppDatabase()
+  const normalizedSources = normalizeDomainBlocklistSources(value)
+  saveDomainBlocklistSourcesToDatabase(database, normalizedSources)
+  saveTrustedDomainsDatabase(database)
+  return getDomainBlocklistSourceRows(database)
+}
 
-  return nextBrowserSettings.domainBlocklistSources
+function getDomainBlocklistSourceRows(database: SqlJsDatabase): DomainBlocklistSource[] {
+  const statement = database.prepare(`
+    SELECT id, url, enabled, score_delta, is_default, created_at, updated_at
+    FROM domain_blocklist_sources
+    ORDER BY is_default DESC, url COLLATE NOCASE ASC
+  `)
+  const rows: DomainBlocklistSource[] = []
+
+  while (statement.step()) {
+    const row = statement.getAsObject() as Record<string, unknown>
+    rows.push({
+      id: String(row.id),
+      url: String(row.url),
+      enabled: Number(row.enabled) === 1,
+      scoreDelta: Number(row.score_delta) || DEFAULT_DOMAIN_BLOCKLIST_SCORE_DELTA,
+      isDefault: Number(row.is_default) === 1,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    })
+  }
+
+  statement.free()
+  return rows
+}
+
+function saveDomainBlocklistSourcesToDatabase(
+  database: SqlJsDatabase,
+  sources: DomainBlocklistSource[]
+): void {
+  database.run('DELETE FROM domain_blocklist_sources')
+
+  const statement = database.prepare(`
+    INSERT INTO domain_blocklist_sources (
+      id, url, enabled, score_delta, is_default, created_at, updated_at
+    )
+    VALUES ($id, $url, $enabled, $scoreDelta, $isDefault, $createdAt, $updatedAt)
+  `)
+
+  for (const source of sources) {
+    statement.run({
+      $id: source.id,
+      $url: source.url,
+      $enabled: source.enabled ? 1 : 0,
+      $scoreDelta: source.scoreDelta,
+      $isDefault: source.isDefault ? 1 : 0,
+      $createdAt: source.createdAt,
+      $updatedAt: source.updatedAt
+    })
+  }
+
+  statement.free()
+}
+
+async function getSqlJsModule(): Promise<SqlJsModule> {
+  if (!sqlJsModulePromise) {
+    sqlJsModulePromise = initSqlJs({
+      locateFile: (file) => path.join(process.cwd(), 'node_modules/sql.js/dist', file)
+    })
+  }
+
+  return sqlJsModulePromise
+}
+
+function applyTrustedDomainsDatabaseSchema(database: SqlJsDatabase): void {
+  database.run(`
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      initials TEXT NOT NULL,
+      description TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS favorites (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      url TEXT NOT NULL,
+      title TEXT NOT NULL,
+      favicon_url TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(user_id, url),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_favorites_user_id
+      ON favorites(user_id);
+
+    CREATE TABLE IF NOT EXISTS admin_security (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      pin_salt TEXT,
+      pin_hash TEXT,
+      failed_attempts INTEGER NOT NULL DEFAULT 0,
+      locked_until TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reputation_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      enabled INTEGER NOT NULL,
+      warning_threshold INTEGER NOT NULL,
+      blocked_threshold INTEGER NOT NULL,
+      young_domain_max_age_days INTEGER NOT NULL,
+      google_safe_browsing_api_key TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reputation_rule_settings (
+      rule_id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL,
+      score_delta INTEGER NOT NULL,
+      severity TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS domain_blocklist_sources (
+      id TEXT PRIMARY KEY,
+      url TEXT NOT NULL UNIQUE,
+      enabled INTEGER NOT NULL,
+      score_delta INTEGER NOT NULL,
+      is_default INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS trusted_sources (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      url TEXT NOT NULL,
+      enabled INTEGER NOT NULL,
+      is_default INTEGER NOT NULL,
+      max_domains INTEGER NOT NULL,
+      last_synced_at TEXT,
+      last_domain_count INTEGER NOT NULL DEFAULT 0,
+      last_sync_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS trusted_domains (
+      source_id TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      rank INTEGER,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (source_id, domain),
+      FOREIGN KEY (source_id) REFERENCES trusted_sources(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_trusted_domains_domain
+      ON trusted_domains(domain);
+
+    CREATE INDEX IF NOT EXISTS idx_trusted_domains_source_rank
+      ON trusted_domains(source_id, rank);
+
+    CREATE TABLE IF NOT EXISTS security_events (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      url TEXT NOT NULL,
+      hostname TEXT,
+      decision TEXT NOT NULL,
+      event_code TEXT NOT NULL,
+      details_json TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_security_events_created_at
+      ON security_events(created_at);
+  `)
+}
+
+function saveTrustedDomainsDatabase(database: SqlJsDatabase): void {
+  const encryptedPayload = encryptTrustedDomainsDatabasePayload(database.export())
+  fs.writeFileSync(getTrustedDomainsDatabasePath(), encryptedPayload, 'utf8')
+}
+
+function setAppSetting(database: SqlJsDatabase, key: string, value: unknown): void {
+  database.run(
+    `
+      INSERT INTO app_settings (key, value_json, updated_at)
+      VALUES ($key, $valueJson, $updatedAt)
+      ON CONFLICT(key) DO UPDATE SET
+        value_json = excluded.value_json,
+        updated_at = excluded.updated_at
+    `,
+    {
+      $key: key,
+      $valueJson: JSON.stringify(value),
+      $updatedAt: new Date().toISOString()
+    }
+  )
+}
+
+function getAppSetting<T>(database: SqlJsDatabase, key: string, fallback: T): T {
+  const result = database.exec('SELECT value_json FROM app_settings WHERE key = $key LIMIT 1', {
+    $key: key
+  })
+  const value = result[0]?.values[0]?.[0]
+
+  if (typeof value !== 'string') {
+    return fallback
+  }
+
+  try {
+    return JSON.parse(value) as T
+  } catch {
+    return fallback
+  }
+}
+
+function upsertDefaultDomainBlocklistSource(
+  database: SqlJsDatabase,
+  source: DomainBlocklistSource
+): void {
+  database.run(
+    `
+      INSERT INTO domain_blocklist_sources (
+        id, url, enabled, score_delta, is_default, created_at, updated_at
+      )
+      VALUES ($id, $url, $enabled, $scoreDelta, $isDefault, $createdAt, $updatedAt)
+      ON CONFLICT(id) DO UPDATE SET
+        url = excluded.url,
+        is_default = excluded.is_default,
+        updated_at = excluded.updated_at
+    `,
+    {
+      $id: source.id,
+      $url: source.url,
+      $enabled: source.enabled ? 1 : 0,
+      $scoreDelta: source.scoreDelta,
+      $isDefault: source.isDefault ? 1 : 0,
+      $createdAt: source.createdAt,
+      $updatedAt: source.updatedAt
+    }
+  )
+}
+
+function ensureAppDatabaseDefaults(database: SqlJsDatabase): void {
+  const now = new Date().toISOString()
+  database.run(
+    `
+      INSERT OR IGNORE INTO admin_security (
+        id, pin_salt, pin_hash, failed_attempts, locked_until, updated_at
+      )
+      VALUES (1, NULL, NULL, 0, NULL, $updatedAt)
+    `,
+    { $updatedAt: now }
+  )
+  database.run(
+    `
+      INSERT OR IGNORE INTO reputation_settings (
+        id, enabled, warning_threshold, blocked_threshold,
+        young_domain_max_age_days, google_safe_browsing_api_key, updated_at
+      )
+      VALUES (1, 1, $warningThreshold, $blockedThreshold, $youngDomainMaxAgeDays, NULL, $updatedAt)
+    `,
+    {
+      $warningThreshold: DEFAULT_REPUTATION_WARNING_THRESHOLD,
+      $blockedThreshold: DEFAULT_REPUTATION_BLOCKED_THRESHOLD,
+      $youngDomainMaxAgeDays: DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS,
+      $updatedAt: now
+    }
+  )
+
+  const defaultRules: Array<{
+    ruleId: ReputationRuleId
+    enabled: boolean
+    scoreDelta: number
+    severity: ReputationRuleSeverity
+  }> = [
+    { ruleId: 'insecure-http', enabled: true, scoreDelta: 50, severity: 'warning' },
+    {
+      ruleId: 'domain-blocklist',
+      enabled: true,
+      scoreDelta: DEFAULT_DOMAIN_BLOCKLIST_SCORE_DELTA,
+      severity: 'blocking'
+    },
+    {
+      ruleId: 'non-latin-script',
+      enabled: true,
+      scoreDelta: DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
+      ruleId: 'is-ip',
+      enabled: true,
+      scoreDelta: DEFAULT_IP_ADDRESS_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
+      ruleId: 'google-safe-browsing',
+      enabled: true,
+      scoreDelta: DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA,
+      severity: 'blocking'
+    },
+    {
+      ruleId: 'young-domain-age',
+      enabled: true,
+      scoreDelta: DEFAULT_YOUNG_DOMAIN_SCORE_DELTA,
+      severity: 'warning'
+    }
+  ]
+
+  for (const rule of defaultRules) {
+    database.run(
+      `
+        INSERT OR IGNORE INTO reputation_rule_settings (
+          rule_id, enabled, score_delta, severity, updated_at
+        )
+        VALUES ($ruleId, $enabled, $scoreDelta, $severity, $updatedAt)
+      `,
+      {
+        $ruleId: rule.ruleId,
+        $enabled: rule.enabled ? 1 : 0,
+        $scoreDelta: rule.scoreDelta,
+        $severity: rule.severity,
+        $updatedAt: now
+      }
+    )
+  }
+
+  for (const source of DEFAULT_DOMAIN_BLOCKLIST_SOURCES) {
+    upsertDefaultDomainBlocklistSource(database, source)
+  }
+
+  for (const source of DEFAULT_TRUSTED_DOMAIN_SOURCES) {
+    upsertTrustedDomainSource(database, source)
+  }
+}
+
+function normalizeTrustedDomain(value: string): string | null {
+  const normalizedHostname = normalizeHostname(value)
+
+  if (!normalizedHostname || isIP(normalizedHostname) !== 0) {
+    return null
+  }
+
+  return getDomain(normalizedHostname) ?? normalizedHostname
+}
+
+function upsertTrustedDomainSource(database: SqlJsDatabase, source: TrustedDomainSource): void {
+  database.run(
+    `
+      INSERT INTO trusted_sources (
+        id, name, kind, url, enabled, is_default, max_domains,
+        last_synced_at, last_domain_count, last_sync_error, created_at, updated_at
+      )
+      VALUES (
+        $id, $name, $kind, $url, $enabled, $isDefault, $maxDomains,
+        $lastSyncedAt, $lastDomainCount, $lastSyncError, $createdAt, $updatedAt
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        kind = excluded.kind,
+        url = excluded.url,
+        is_default = excluded.is_default,
+        max_domains = excluded.max_domains,
+        updated_at = excluded.updated_at
+    `,
+    {
+      $id: source.id,
+      $name: source.name,
+      $kind: source.kind,
+      $url: source.url,
+      $enabled: source.enabled ? 1 : 0,
+      $isDefault: source.isDefault ? 1 : 0,
+      $maxDomains: source.maxDomains,
+      $lastSyncedAt: source.lastSyncedAt,
+      $lastDomainCount: source.lastDomainCount,
+      $lastSyncError: source.lastSyncError,
+      $createdAt: source.createdAt,
+      $updatedAt: source.updatedAt
+    }
+  )
+}
+
+function getTrustedDomainSourceRows(database: SqlJsDatabase): TrustedDomainSource[] {
+  const statement = database.prepare(`
+    SELECT
+      id, name, kind, url, enabled, is_default, max_domains,
+      last_synced_at, last_domain_count, last_sync_error, created_at, updated_at
+    FROM trusted_sources
+    ORDER BY is_default DESC, name COLLATE NOCASE ASC
+  `)
+  const rows: TrustedDomainSource[] = []
+
+  while (statement.step()) {
+    const row = statement.getAsObject() as Record<string, unknown>
+    rows.push({
+      id: String(row.id),
+      name: String(row.name),
+      kind: 'tranco',
+      url: String(row.url),
+      enabled: Number(row.enabled) === 1,
+      isDefault: Number(row.is_default) === 1,
+      maxDomains: Number(row.max_domains),
+      lastSyncedAt: typeof row.last_synced_at === 'string' ? row.last_synced_at : null,
+      lastDomainCount: Number(row.last_domain_count) || 0,
+      lastSyncError: typeof row.last_sync_error === 'string' ? row.last_sync_error : null,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    })
+  }
+
+  statement.free()
+  return rows
+}
+
+async function initializeAppDatabase(): Promise<void> {
+  if (appDatabase) {
+    return
+  }
+
+  const SQL = await getSqlJsModule()
+  const filePath = getAppDatabasePath()
+
+  if (fs.existsSync(filePath)) {
+    try {
+      const encryptedPayload = fs.readFileSync(filePath, 'utf8')
+      const decryptedPayload = decryptTrustedDomainsDatabasePayload(encryptedPayload)
+      appDatabase = new SQL.Database(decryptedPayload)
+    } catch {
+      appDatabase = new SQL.Database()
+    }
+  } else {
+    appDatabase = new SQL.Database()
+  }
+
+  applyTrustedDomainsDatabaseSchema(appDatabase)
+  ensureAppDatabaseDefaults(appDatabase)
+  saveTrustedDomainsDatabase(appDatabase)
+}
+
+function getAppDatabase(): SqlJsDatabase {
+  if (!appDatabase) {
+    throw new Error('Baza danych aplikacji nie została jeszcze zainicjalizowana.')
+  }
+
+  return appDatabase
+}
+
+function recordSecurityEvent(
+  assessment: ReputationAssessment,
+  interventionState: ReputationInterventionState
+): void {
+  try {
+    const database = getAppDatabase()
+    database.run(
+      `
+        INSERT INTO security_events (
+          id, user_id, url, hostname, decision, event_code, details_json, created_at
+        )
+        VALUES (
+          $id, $userId, $url, $hostname, $decision, $eventCode, $detailsJson, $createdAt
+        )
+      `,
+      {
+        $id: `security-event-${randomUUID()}`,
+        $userId: getActiveUserId(),
+        $url: assessment.candidate.normalizedUrl,
+        $hostname: assessment.candidate.hostname,
+        $decision: assessment.decision,
+        $eventCode: interventionState.eventCode,
+        $detailsJson: JSON.stringify({
+          score: assessment.score,
+          matchedRules: assessment.matchedRules.map((rule) => ({
+            ruleId: rule.ruleId,
+            scoreDelta: rule.scoreDelta,
+            severity: rule.severity,
+            code: rule.code
+          }))
+        }),
+        $createdAt: new Date().toISOString()
+      }
+    )
+    saveTrustedDomainsDatabase(database)
+  } catch (error) {
+    console.warn('[security-event] failed to persist event', error)
+  }
+}
+
+async function getTrustedDomainsDatabase(): Promise<SqlJsDatabase> {
+  await initializeAppDatabase()
+  return getAppDatabase()
+}
+
+async function loadTrustedDomainSources(): Promise<TrustedDomainSource[]> {
+  const database = await getTrustedDomainsDatabase()
+  return getTrustedDomainSourceRows(database)
+}
+
+async function setTrustedDomainSourceEnabled(
+  sourceId: string,
+  enabled: boolean
+): Promise<TrustedDomainSource[]> {
+  const database = await getTrustedDomainsDatabase()
+  database.run(
+    `
+      UPDATE trusted_sources
+      SET enabled = $enabled, updated_at = $updatedAt
+      WHERE id = $id
+    `,
+    {
+      $enabled: enabled ? 1 : 0,
+      $updatedAt: new Date().toISOString(),
+      $id: sourceId
+    }
+  )
+  saveTrustedDomainsDatabase(database)
+  return getTrustedDomainSourceRows(database)
+}
+
+function extractTrancoDomainsFromZipPayload(
+  payload: Buffer,
+  maxDomains: number
+): Array<{ domain: string; rank: number }> {
+  const zipArchive = new AdmZip(payload)
+  const csvEntry =
+    zipArchive.getEntry('top-1m.csv') ??
+    zipArchive
+      .getEntries()
+      .find((entry) => entry.entryName.toLowerCase().endsWith('.csv'))
+
+  if (!csvEntry) {
+    throw new Error('Nie udało się odczytać pliku CSV z archiwum Tranco.')
+  }
+
+  const csvPayload = zipArchive.readAsText(csvEntry)
+  const domains: Array<{ domain: string; rank: number }> = []
+
+  for (const rawLine of csvPayload.split(/\r?\n/)) {
+    const line = rawLine.trim()
+
+    if (!line) {
+      continue
+    }
+
+    const [rankToken, domainToken] = line.split(',', 2)
+    const rank = Number(rankToken)
+    const domain = normalizeTrustedDomain(domainToken ?? '')
+
+    if (!Number.isFinite(rank) || !domain) {
+      continue
+    }
+
+    domains.push({ domain, rank })
+
+    if (domains.length >= maxDomains) {
+      break
+    }
+  }
+
+  return domains
+}
+
+async function syncTrustedDomainSource(sourceId: string): Promise<TrustedDomainSource[]> {
+  const database = await getTrustedDomainsDatabase()
+  const source = getTrustedDomainSourceRows(database).find((entry) => entry.id === sourceId)
+
+  if (!source) {
+    throw new Error('Nie znaleziono źródła zaufanych domen.')
+  }
+
+  try {
+    if (source.kind !== 'tranco') {
+      throw new Error('Ten typ źródła nie jest jeszcze obsługiwany.')
+    }
+
+    const response = await fetch(source.url, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(TRUSTED_DOMAINS_FETCH_TIMEOUT_MS)
+    })
+
+    if (!response.ok) {
+      throw new Error('Nie udało się pobrać listy zaufanych domen.')
+    }
+
+    const domains = extractTrancoDomainsFromZipPayload(
+      Buffer.from(await response.arrayBuffer()),
+      source.maxDomains
+    )
+    const now = new Date().toISOString()
+
+    database.run('BEGIN')
+
+    try {
+      database.run('DELETE FROM trusted_domains WHERE source_id = $sourceId', {
+        $sourceId: source.id
+      })
+
+      const insertStatement = database.prepare(`
+        INSERT INTO trusted_domains (source_id, domain, rank, created_at)
+        VALUES ($sourceId, $domain, $rank, $createdAt)
+      `)
+
+      for (const domain of domains) {
+        insertStatement.run({
+          $sourceId: source.id,
+          $domain: domain.domain,
+          $rank: domain.rank,
+          $createdAt: now
+        })
+      }
+
+      insertStatement.free()
+
+      database.run(
+        `
+          UPDATE trusted_sources
+          SET last_synced_at = $lastSyncedAt,
+              last_domain_count = $lastDomainCount,
+              last_sync_error = NULL,
+              updated_at = $updatedAt
+          WHERE id = $id
+        `,
+        {
+          $lastSyncedAt: now,
+          $lastDomainCount: domains.length,
+          $updatedAt: now,
+          $id: source.id
+        }
+      )
+
+      database.run('COMMIT')
+    } catch (error) {
+      database.run('ROLLBACK')
+      throw error
+    }
+
+    saveTrustedDomainsDatabase(database)
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : 'Nie udało się zsynchronizować źródła.'
+
+    database.run(
+      `
+        UPDATE trusted_sources
+        SET last_sync_error = $lastSyncError, updated_at = $updatedAt
+        WHERE id = $id
+      `,
+      {
+        $lastSyncError: errorMessage,
+        $updatedAt: new Date().toISOString(),
+        $id: source.id
+      }
+    )
+    saveTrustedDomainsDatabase(database)
+    throw error
+  }
+
+  return getTrustedDomainSourceRows(database)
+}
+
+async function ensureTrustedDomainSourcesReady(): Promise<void> {
+  const sources = await loadTrustedDomainSources()
+  const trancoSource = sources.find((source) => source.kind === 'tranco')
+
+  if (trancoSource && trancoSource.lastDomainCount === 0 && trancoSource.enabled) {
+    try {
+      await syncTrustedDomainSource(trancoSource.id)
+    } catch {
+      // Keep the app usable even if the initial trusted-domain sync fails.
+    }
+  }
+}
+
+async function isTrustedDomain(hostname: string): Promise<boolean> {
+  const normalizedHostname = normalizeTrustedDomain(hostname)
+
+  if (!normalizedHostname) {
+    return false
+  }
+
+  const database = await getTrustedDomainsDatabase()
+  const statement = database.prepare(
+    `
+      SELECT td.domain
+      FROM trusted_domains td
+      INNER JOIN trusted_sources ts ON ts.id = td.source_id
+      WHERE ts.enabled = 1 AND (td.domain = $hostname OR $hostname LIKE '%.' || td.domain)
+      LIMIT 1
+    `,
+    {
+      $hostname: normalizedHostname
+    }
+  )
+
+  const matched = statement.step()
+  statement.free()
+  return matched
 }
 
 function validateDomainBlocklistSourceUrl(value: string): string {
@@ -992,66 +1784,6 @@ function removeDomainBlocklistSource(id: string): DomainBlocklistSource[] {
   return saveDomainBlocklistSources(currentSources.filter((entry) => entry.id !== id))
 }
 
-function getUserDataKey(userId: string): Buffer {
-  const storedValue = loadUserKeyStore()[userId]
-
-  if (typeof storedValue !== 'string' || storedValue.length === 0) {
-    throw new Error('Nie znaleziono klucza danych użytkownika.')
-  }
-
-  if (storedValue.startsWith(DEV_PLAIN_KEY_PREFIX)) {
-    return Buffer.from(storedValue.slice(DEV_PLAIN_KEY_PREFIX.length), 'base64')
-  }
-
-  assertSecureUserKeyStorageAvailable()
-
-  if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
-  }
-
-  const decryptedValue = safeStorage.decryptString(Buffer.from(storedValue, 'base64'))
-  return Buffer.from(decryptedValue, 'base64')
-}
-
-function encryptUserPayload(userId: string, payload: string): string {
-  const key = createHash('sha256').update(getUserDataKey(userId)).digest()
-  const iv = randomBytes(12)
-  const cipher = createCipheriv('aes-256-gcm', key, iv)
-  const encryptedValue = Buffer.concat([cipher.update(payload, 'utf8'), cipher.final()])
-  const authTag = cipher.getAuthTag()
-
-  return JSON.stringify({
-    iv: iv.toString('base64'),
-    tag: authTag.toString('base64'),
-    content: encryptedValue.toString('base64')
-  })
-}
-
-function decryptUserPayload(userId: string, payload: string): string {
-  const parsedPayload = JSON.parse(payload) as {
-    iv?: string
-    tag?: string
-    content?: string
-  }
-
-  if (!parsedPayload.iv || !parsedPayload.tag || !parsedPayload.content) {
-    throw new Error('Nieprawidłowy format zaszyfrowanych danych użytkownika.')
-  }
-
-  const key = createHash('sha256').update(getUserDataKey(userId)).digest()
-  const decipher = createDecipheriv(
-    'aes-256-gcm',
-    key,
-    Buffer.from(parsedPayload.iv, 'base64')
-  )
-  decipher.setAuthTag(Buffer.from(parsedPayload.tag, 'base64'))
-
-  return Buffer.concat([
-    decipher.update(Buffer.from(parsedPayload.content, 'base64')),
-    decipher.final()
-  ]).toString('utf8')
-}
-
 function normalizeFavoriteEntries(entries: FavoriteEntry[]): FavoriteEntry[] {
   return entries
     .filter((entry) => {
@@ -1073,43 +1805,57 @@ function normalizeFavoriteEntries(entries: FavoriteEntry[]): FavoriteEntry[] {
 }
 
 function getUserFavorites(userId: string): FavoriteEntry[] {
-  const store = loadUserFavoritesStore()
+  const database = getAppDatabase()
+  const statement = database.prepare(
+    `
+      SELECT url, title, favicon_url, created_at, updated_at
+      FROM favorites
+      WHERE user_id = $userId
+      ORDER BY title COLLATE NOCASE ASC
+    `,
+    { $userId: userId }
+  )
+  const favorites: FavoriteEntry[] = []
 
-  if (store[userId]) {
-    return store[userId]
+  while (statement.step()) {
+    const row = statement.getAsObject() as Record<string, unknown>
+    favorites.push({
+      url: String(row.url),
+      title: String(row.title),
+      faviconUrl: typeof row.favicon_url === 'string' ? row.favicon_url : null,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    })
   }
 
-  const filePath = getUserFavoritesPath(userId)
-
-  try {
-    if (fs.existsSync(filePath)) {
-      const encryptedPayload = fs.readFileSync(filePath, 'utf8')
-      const decryptedPayload = decryptUserPayload(userId, encryptedPayload)
-      const parsedFavorites = JSON.parse(decryptedPayload) as FavoriteEntry[]
-      const normalizedFavorites = Array.isArray(parsedFavorites)
-        ? normalizeFavoriteEntries(parsedFavorites)
-        : []
-      store[userId] = normalizedFavorites
-      return normalizedFavorites
-    }
-  } catch {
-    // Fall back to empty favorites when encrypted data cannot be read.
-  }
-
-  store[userId] = []
-  return store[userId]
+  statement.free()
+  return normalizeFavoriteEntries(favorites)
 }
 
 function saveUserFavorites(userId: string, favorites: FavoriteEntry[]): void {
   const normalizedFavorites = normalizeFavoriteEntries(favorites)
-  const store = loadUserFavoritesStore()
-  store[userId] = normalizedFavorites
+  const database = getAppDatabase()
+  database.run('DELETE FROM favorites WHERE user_id = $userId', { $userId: userId })
 
-  const directoryPath = getUserFavoritesDirectoryPath()
-  fs.mkdirSync(directoryPath, { recursive: true })
+  const statement = database.prepare(`
+    INSERT INTO favorites (id, user_id, url, title, favicon_url, created_at, updated_at)
+    VALUES ($id, $userId, $url, $title, $faviconUrl, $createdAt, $updatedAt)
+  `)
 
-  const encryptedPayload = encryptUserPayload(userId, JSON.stringify(normalizedFavorites))
-  fs.writeFileSync(getUserFavoritesPath(userId), encryptedPayload, 'utf8')
+  for (const favorite of normalizedFavorites) {
+    statement.run({
+      $id: `favorite-${randomUUID()}`,
+      $userId: userId,
+      $url: favorite.url,
+      $title: favorite.title,
+      $faviconUrl: favorite.faviconUrl,
+      $createdAt: favorite.createdAt,
+      $updatedAt: favorite.updatedAt
+    })
+  }
+
+  statement.free()
+  saveTrustedDomainsDatabase(database)
 }
 
 function isFavoriteUrl(userId: string | null, rawUrl: string): boolean {
@@ -1262,17 +2008,9 @@ function clearUserMediaPermissions(userId: string): void {
 }
 
 function clearUserFavorites(userId: string): void {
-  const store = loadUserFavoritesStore()
-
-  if (userId in store) {
-    delete store[userId]
-  }
-
-  const filePath = getUserFavoritesPath(userId)
-
-  if (fs.existsSync(filePath)) {
-    fs.rmSync(filePath, { force: true })
-  }
+  const database = getAppDatabase()
+  database.run('DELETE FROM favorites WHERE user_id = $userId', { $userId: userId })
+  saveTrustedDomainsDatabase(database)
 }
 
 function isAllowedPermissionOrigin(rawUrl: string): boolean {
@@ -1813,6 +2551,10 @@ async function evaluateNonLatinScriptRule(
   candidate: NormalizedSiteCandidate,
   settings: ReputationSettings
 ): Promise<ReputationRuleResult | null> {
+  if (await isTrustedDomain(candidate.asciiHostname)) {
+    return null
+  }
+
   if (!hasNonLatinLetters(candidate.unicodeHostname)) {
     return null
   }
@@ -1883,6 +2625,10 @@ async function evaluateYoungDomainAgeRule(
     return null
   }
 
+  if (await isTrustedDomain(candidate.asciiHostname)) {
+    return null
+  }
+
   const ageDays = await getDomainAgeInDays(candidate.registrableDomain)
 
   if (ageDays === null || ageDays > settings.youngDomainMaxAgeDays) {
@@ -1912,6 +2658,15 @@ async function assessNavigationReputation(rawUrl: string): Promise<ReputationAss
   const settings = loadReputationSettings()
 
   if (!settings.enabled) {
+    return {
+      candidate,
+      score: 0,
+      decision: 'allow',
+      matchedRules: []
+    }
+  }
+
+  if (await isTrustedDomain(candidate.asciiHostname)) {
     return {
       candidate,
       score: 0,
@@ -2037,6 +2792,7 @@ async function shouldAllowNavigation(rawUrl: string): Promise<boolean> {
     return true
   }
 
+  recordSecurityEvent(assessment, interventionState)
   setReputationIntervention(interventionState)
   lastError = interventionState.message
   sendBrowserState()
@@ -2670,12 +3426,28 @@ function normalizeStore(store: UserStore): UserStore {
 }
 
 function saveUserStore(store: UserStore): void {
-  const encryptedPayload = encryptUserStorePayload(JSON.stringify(store, null, 2))
-  fs.writeFileSync(getUserStorePath(), encryptedPayload, 'utf8')
-}
+  const database = getAppDatabase()
+  database.run('DELETE FROM users')
 
-function saveUserKeyStore(store: UserKeyStore): void {
-  fs.writeFileSync(getUserKeyStorePath(), JSON.stringify(store, null, 2), 'utf8')
+  const statement = database.prepare(`
+    INSERT INTO users (id, name, initials, description, created_at, is_active)
+    VALUES ($id, $name, $initials, $description, $createdAt, $isActive)
+  `)
+
+  for (const user of store.users) {
+    statement.run({
+      $id: user.id,
+      $name: user.name,
+      $initials: user.initials,
+      $description: user.description,
+      $createdAt: user.createdAt,
+      $isActive: store.activeUserId === user.id ? 1 : 0
+    })
+  }
+
+  statement.free()
+  userStore = normalizeStore(store)
+  saveTrustedDomainsDatabase(database)
 }
 
 function loadUserStore(): UserStore {
@@ -2683,52 +3455,34 @@ function loadUserStore(): UserStore {
     return userStore
   }
 
-  const filePath = getUserStorePath()
+  const database = getAppDatabase()
+  const statement = database.prepare(`
+    SELECT id, name, initials, description, created_at, is_active
+    FROM users
+    ORDER BY created_at ASC
+  `)
+  const users: UserProfile[] = []
+  let activeUserId: string | null = null
 
-  try {
-    if (fs.existsSync(filePath)) {
-      const encryptedPayload = fs.readFileSync(filePath, 'utf8')
-      const decryptedPayload = decryptUserStorePayload(encryptedPayload)
-      const parsedStore = JSON.parse(decryptedPayload) as UserStore
-      userStore = normalizeStore(parsedStore)
-      return userStore
+  while (statement.step()) {
+    const row = statement.getAsObject() as Record<string, unknown>
+    const user: UserProfile = {
+      id: String(row.id),
+      name: String(row.name),
+      initials: String(row.initials),
+      description: String(row.description),
+      createdAt: String(row.created_at)
     }
-  } catch {
-    // Fall back to default users when local data is unreadable.
+    users.push(user)
+
+    if (Number(row.is_active) === 1) {
+      activeUserId = user.id
+    }
   }
 
-  userStore = {
-    users: DEFAULT_USERS,
-    activeUserId: null
-  }
-  saveUserStore(userStore)
+  statement.free()
+  userStore = normalizeStore({ users, activeUserId })
   return userStore
-}
-
-function loadUserKeyStore(): UserKeyStore {
-  if (userKeyStore) {
-    return userKeyStore
-  }
-
-  const filePath = getUserKeyStorePath()
-
-  try {
-    if (fs.existsSync(filePath)) {
-      const rawValue = fs.readFileSync(filePath, 'utf8')
-      const parsedStore = JSON.parse(rawValue) as UserKeyStore
-      userKeyStore =
-        parsedStore && typeof parsedStore === 'object' && !Array.isArray(parsedStore)
-          ? parsedStore
-          : {}
-      return userKeyStore
-    }
-  } catch {
-    // Fall back to an empty key store when local data is unreadable.
-  }
-
-  userKeyStore = {}
-  saveUserKeyStore(userKeyStore)
-  return userKeyStore
 }
 
 function assertSecureUserKeyStorageAvailable(): void {
@@ -2756,47 +3510,16 @@ function assertSecureUserKeyStorageAvailable(): void {
 }
 
 function createAndStoreUserDataKey(userId: string): void {
-  const dataKey = randomBytes(32).toString('base64')
-  const keyStore = loadUserKeyStore()
-  let storedValue: string
-
-  try {
-    assertSecureUserKeyStorageAvailable()
-
-    if (safeStorage.isEncryptionAvailable()) {
-      const encryptedDataKey = safeStorage.encryptString(dataKey)
-      storedValue = encryptedDataKey.toString('base64')
-    } else if (!app.isPackaged) {
-      storedValue = `${DEV_PLAIN_KEY_PREFIX}${dataKey}`
-    } else {
-      throw new Error('Systemowy magazyn kluczy nie jest dostępny.')
-    }
-  } catch (error) {
-    if (app.isPackaged) {
-      throw error
-    }
-
-    storedValue = `${DEV_PLAIN_KEY_PREFIX}${dataKey}`
-  }
-
-  keyStore[userId] = storedValue
-  saveUserKeyStore(keyStore)
+  void userId
 }
 
 function hasStoredUserDataKey(userId: string): boolean {
-  const keyStore = loadUserKeyStore()
-  return typeof keyStore[userId] === 'string' && keyStore[userId].length > 0
+  void userId
+  return true
 }
 
 function removeStoredUserDataKey(userId: string): void {
-  const keyStore = loadUserKeyStore()
-
-  if (!(userId in keyStore)) {
-    return
-  }
-
-  delete keyStore[userId]
-  saveUserKeyStore(keyStore)
+  void userId
 }
 
 function destroyBrowserView(): void {
@@ -3409,6 +4132,18 @@ ipcMain.handle('domain-blocklists:remove-source', (_event, id: string) => {
   return removeDomainBlocklistSource(id)
 })
 
+ipcMain.handle('trusted-domains:get-sources', () => {
+  return loadTrustedDomainSources()
+})
+
+ipcMain.handle('trusted-domains:set-enabled', (_event, id: string, enabled: boolean) => {
+  return setTrustedDomainSourceEnabled(id, enabled)
+})
+
+ipcMain.handle('trusted-domains:sync-source', (_event, id: string) => {
+  return syncTrustedDomainSource(id)
+})
+
 ipcMain.handle('browser:toggle-maximize', () => {
   if (!mainWindow) {
     return
@@ -3444,19 +4179,28 @@ ipcMain.handle('browser:set-chrome-height', (_event, height: number) => {
   updateBrowserBounds()
 })
 
-app.whenReady().then(() => {
-  const store = loadUserStore()
-  store.activeUserId = null
-  saveUserStore(store)
+app
+  .whenReady()
+  .then(async () => {
+    await initializeAppDatabase()
 
-  createMainWindow()
+    const store = loadUserStore()
+    store.activeUserId = null
+    saveUserStore(store)
+    void ensureTrustedDomainSourcesReady()
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createMainWindow()
-    }
+    createMainWindow()
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createMainWindow()
+      }
+    })
   })
-})
+  .catch((error) => {
+    console.error('[app-startup] failed to initialize application', error)
+    app.quit()
+  })
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

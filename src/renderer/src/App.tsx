@@ -413,6 +413,7 @@ function App() {
     googleSafeBrowsingApiKeyConfigured: false
   })
   const [domainBlocklistSources, setDomainBlocklistSources] = useState<DomainBlocklistSource[]>([])
+  const [trustedDomainSources, setTrustedDomainSources] = useState<TrustedDomainSource[]>([])
   const [filterSettingsDraft, setFilterSettingsDraft] = useState(() =>
     getFilterDraftFromSettings({
       enabled: true,
@@ -434,6 +435,7 @@ function App() {
   const [reputationTestError, setReputationTestError] = useState<string | null>(null)
   const [isCheckingReputationTest, setIsCheckingReputationTest] = useState(false)
   const [isSavingFilterSettings, setIsSavingFilterSettings] = useState(false)
+  const [syncingTrustedDomainSourceId, setSyncingTrustedDomainSourceId] = useState<string | null>(null)
   const [isHttpRuleExpanded, setIsHttpRuleExpanded] = useState(false)
   const [isNonLatinRuleExpanded, setIsNonLatinRuleExpanded] = useState(false)
   const [isIpRuleExpanded, setIsIpRuleExpanded] = useState(false)
@@ -489,14 +491,16 @@ function App() {
           nextAdminPinStatus,
           nextAccessibilitySettings,
           nextReputationSettings,
-          nextDomainBlocklistSources
+          nextDomainBlocklistSources,
+          nextTrustedDomainSources
         ] =
           await Promise.all([
           window.easybrowser.getUserState(),
           window.easybrowser.getAdminPinStatus(),
           window.easybrowser.getAccessibilitySettings(),
           window.easybrowser.getReputationSettings(),
-          window.easybrowser.getDomainBlocklistSources()
+          window.easybrowser.getDomainBlocklistSources(),
+          window.easybrowser.getTrustedDomainSources()
         ])
         setUsers(state.users)
         setSelectedUserId(state.activeUserId)
@@ -505,6 +509,7 @@ function App() {
         setAccessibilitySettings(nextAccessibilitySettings)
         setReputationSettings(nextReputationSettings)
         setDomainBlocklistSources(nextDomainBlocklistSources)
+        setTrustedDomainSources(nextTrustedDomainSources)
       } catch (error) {
         setErrorMessage(
           error instanceof Error ? error.message : 'Nie udało się wczytać użytkowników.'
@@ -1050,6 +1055,33 @@ function App() {
       setErrorMessage(
         error instanceof Error ? error.message : 'Nie udało się usunąć listy ostrzeżeń.'
       )
+    }
+  }
+
+  const handleToggleTrustedDomainSource = async (id: string, enabled: boolean) => {
+    try {
+      const nextSources = await window.easybrowser.setTrustedDomainSourceEnabled(id, enabled)
+      setTrustedDomainSources(nextSources)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zmienić źródła zaufanych domen.'
+      )
+    }
+  }
+
+  const handleSyncTrustedDomainSource = async (id: string) => {
+    try {
+      setSyncingTrustedDomainSourceId(id)
+      const nextSources = await window.easybrowser.syncTrustedDomainSource(id)
+      setTrustedDomainSources(nextSources)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zsynchronizować źródła zaufanych domen.'
+      )
+    } finally {
+      setSyncingTrustedDomainSourceId(null)
     }
   }
 
@@ -2549,6 +2581,96 @@ function App() {
                       >
                         {isSavingFilterSettings ? 'Zapisywanie...' : 'Zapisz'}
                       </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="max-w-3xl">
+                        <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          Trusted Domains
+                        </p>
+                        <h2 className="mt-2 text-2xl font-bold text-app-text">
+                          Zaufane źródła whitelisty
+                        </h2>
+                        <p className="mt-3 text-sm leading-6 text-slate-500">
+                          Te źródła budują lokalną bazę zaufanych domen w SQLite. Whitelista nie
+                          omija blocklist ani Google Safe Browsing, ale może obniżać czułość części
+                          heurystyk.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 space-y-3">
+                      {trustedDomainSources.map((source) => (
+                        <div
+                          key={source.id}
+                          className="rounded-[24px] border border-app-tile-border bg-slate-50/70 p-5"
+                        >
+                          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <p className="text-lg font-bold text-app-text">{source.name}</p>
+                                {source.isDefault ? (
+                                  <span className="rounded-full bg-slate-200 px-3 py-1 text-[11px] font-bold tracking-[0.12em] text-slate-600 uppercase">
+                                    Domyślna
+                                  </span>
+                                ) : null}
+                              </div>
+                              <p className="mt-2 break-all text-sm text-slate-500">{source.url}</p>
+                              <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-500">
+                                <span className="rounded-full border border-app-tile-border bg-white px-3 py-1">
+                                  Limit: {source.maxDomains.toLocaleString('pl-PL')}
+                                </span>
+                                <span className="rounded-full border border-app-tile-border bg-white px-3 py-1">
+                                  Domeny: {source.lastDomainCount.toLocaleString('pl-PL')}
+                                </span>
+                                <span className="rounded-full border border-app-tile-border bg-white px-3 py-1">
+                                  Ostatnia synchronizacja:{' '}
+                                  {source.lastSyncedAt
+                                    ? new Date(source.lastSyncedAt).toLocaleString('pl-PL')
+                                    : 'brak'}
+                                </span>
+                              </div>
+                              {source.lastSyncError ? (
+                                <div className="mt-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                                  {source.lastSyncError}
+                                </div>
+                              ) : null}
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-3 lg:justify-end">
+                              <label className="app-no-drag flex items-center gap-3 rounded-full border border-app-tile-border bg-white px-4 py-3 text-sm font-bold text-app-text">
+                                <input
+                                  type="checkbox"
+                                  className="focus-ring h-5 w-5 rounded border border-app-tile-border accent-[#1e3a8a]"
+                                  checked={source.enabled}
+                                  onChange={(event) => {
+                                    void handleToggleTrustedDomainSource(
+                                      source.id,
+                                      event.target.checked
+                                    )
+                                  }}
+                                />
+                                <span>{source.enabled ? 'Włączona' : 'Wyłączona'}</span>
+                              </label>
+
+                              <button
+                                type="button"
+                                className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-wait disabled:opacity-70"
+                                disabled={syncingTrustedDomainSourceId === source.id}
+                                onClick={() => {
+                                  void handleSyncTrustedDomainSource(source.id)
+                                }}
+                              >
+                                {syncingTrustedDomainSourceId === source.id
+                                  ? 'Synchronizacja...'
+                                  : 'Synchronizuj'}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   </div>
                 </>
