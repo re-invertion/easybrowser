@@ -180,6 +180,8 @@ Easybrowser is a very simple and security-focused browser based on Electron.
   - It uses a lightweight skeleton for common substitutions such as `0` to `o`, `1` to `l`, and similar characters.
   - It also uses a small edit-distance threshold to catch close typos.
   - The rule adds warning score and can be configured from the admin panel.
+  - This rule is intentionally heuristic and local; it does not use an external model or remote reputation API.
+  - Exact trusted-domain matches are allowed before this rule runs, so the rule only affects similar but different domains.
 - `is-ip`
   - Detects direct navigation to an IP address instead of a named domain.
 - `google-safe-browsing`
@@ -216,6 +218,7 @@ Easybrowser is a very simple and security-focused browser based on Electron.
 - Tranco data is downloaded as a ZIP archive and parsed locally.
 - Manually added domains use the internal `manual` trusted source and are managed directly in the admin panel.
 - Manual trusted domains are normalized before saving and IP addresses are rejected.
+- Manual trusted domains are displayed as a list with one row per domain, including the creation timestamp and a remove action.
 - If a domain is trusted, reputation rules are bypassed and the navigation assessment is allowed.
 - Trusted source synchronization errors are stored on the source row and do not prevent the app from starting.
 
