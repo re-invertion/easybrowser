@@ -81,6 +81,7 @@ type ReputationRuleId =
   | 'insecure-http'
   | 'domain-blocklist'
   | 'non-latin-script'
+  | 'lookalike-trusted-domain'
   | 'is-ip'
   | 'google-safe-browsing'
   | 'young-domain-age'
@@ -165,7 +166,7 @@ type DomainBlocklistSource = {
   createdAt: string
   updatedAt: string
 }
-type TrustedDomainSourceKind = 'tranco'
+type TrustedDomainSourceKind = 'tranco' | 'manual'
 type TrustedDomainSource = {
   id: string
   name: string
@@ -179,6 +180,10 @@ type TrustedDomainSource = {
   lastSyncError: string | null
   createdAt: string
   updatedAt: string
+}
+type CustomTrustedDomain = {
+  domain: string
+  createdAt: string
 }
 type BrowserSettings = {
   accessibility: AccessibilitySettings
@@ -237,6 +242,7 @@ const ADMIN_PIN_LOCK_MS = 60_000
 const DOMAIN_BLOCKLIST_FETCH_TIMEOUT_MS = 8_000
 const DEFAULT_DOMAIN_BLOCKLIST_SCORE_DELTA = 100
 const DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA = 25
+const DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA = 60
 const DEFAULT_IP_ADDRESS_SCORE_DELTA = 40
 const DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA = 100
 const DEFAULT_YOUNG_DOMAIN_SCORE_DELTA = 35
@@ -245,6 +251,7 @@ const DEFAULT_REPUTATION_WARNING_THRESHOLD = 50
 const DEFAULT_REPUTATION_BLOCKED_THRESHOLD = 70
 const DEFAULT_TRANCO_TRUSTED_DOMAINS_URL = 'https://tranco-list.eu/top-1m.csv.zip'
 const DEFAULT_TRANCO_TRUSTED_DOMAINS_LIMIT = 50_000
+const MANUAL_TRUSTED_DOMAIN_SOURCE_ID = 'trusted-source-manual'
 const RDAP_BOOTSTRAP_URL = 'https://data.iana.org/rdap/dns.json'
 const RDAP_FETCH_TIMEOUT_MS = 5_000
 const RDAP_DOMAIN_AGE_CACHE_TTL_MS = 1000 * 60 * 60 * 12
@@ -255,6 +262,20 @@ const GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS = 1000 * 60 * 5
 const TRUSTED_DOMAINS_FETCH_TIMEOUT_MS = 15_000
 const DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT = '2026-07-08T00:00:00.000Z'
 const DEFAULT_TRUSTED_DOMAIN_SOURCES: TrustedDomainSource[] = [
+  {
+    id: MANUAL_TRUSTED_DOMAIN_SOURCE_ID,
+    name: 'Własne zaufane domeny',
+    kind: 'manual',
+    url: 'manual://trusted-domains',
+    enabled: true,
+    isDefault: true,
+    maxDomains: 0,
+    lastSyncedAt: null,
+    lastDomainCount: 0,
+    lastSyncError: null,
+    createdAt: '2026-07-12T00:00:00.000Z',
+    updatedAt: '2026-07-12T00:00:00.000Z'
+  },
   {
     id: 'trusted-source-tranco-default',
     name: 'Tranco top domains',
@@ -583,6 +604,7 @@ function normalizeReputationSettings(value: unknown): ReputationSettings {
       disabledRuleIds: [],
       ruleWeights: {
         'non-latin-script': DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA,
+        'lookalike-trusted-domain': DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA,
         'is-ip': DEFAULT_IP_ADDRESS_SCORE_DELTA,
         'google-safe-browsing': DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA
       },
@@ -598,6 +620,7 @@ function normalizeReputationSettings(value: unknown): ReputationSettings {
           value === 'insecure-http' ||
           value === 'domain-blocklist' ||
           value === 'non-latin-script' ||
+          value === 'lookalike-trusted-domain' ||
           value === 'is-ip' ||
           value === 'google-safe-browsing' ||
           value === 'young-domain-age'
@@ -635,6 +658,11 @@ function normalizeReputationSettings(value: unknown): ReputationSettings {
         Number.isFinite(nextRuleWeights['non-latin-script'])
           ? Math.max(0, Math.floor(nextRuleWeights['non-latin-script']))
           : DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA,
+      'lookalike-trusted-domain':
+        typeof nextRuleWeights['lookalike-trusted-domain'] === 'number' &&
+        Number.isFinite(nextRuleWeights['lookalike-trusted-domain'])
+          ? Math.max(0, Math.floor(nextRuleWeights['lookalike-trusted-domain']))
+          : DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA,
       'is-ip':
         typeof nextRuleWeights['is-ip'] === 'number' &&
         Number.isFinite(nextRuleWeights['is-ip'])
@@ -1273,6 +1301,12 @@ function ensureAppDatabaseDefaults(database: SqlJsDatabase): void {
       severity: 'warning'
     },
     {
+      ruleId: 'lookalike-trusted-domain',
+      enabled: true,
+      scoreDelta: DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
       ruleId: 'is-ip',
       enabled: true,
       scoreDelta: DEFAULT_IP_ADDRESS_SCORE_DELTA,
@@ -1377,10 +1411,11 @@ function getTrustedDomainSourceRows(database: SqlJsDatabase): TrustedDomainSourc
 
   while (statement.step()) {
     const row = statement.getAsObject() as Record<string, unknown>
+    const kind = row.kind === 'manual' ? 'manual' : 'tranco'
     rows.push({
       id: String(row.id),
       name: String(row.name),
-      kind: 'tranco',
+      kind,
       url: String(row.url),
       enabled: Number(row.enabled) === 1,
       isDefault: Number(row.is_default) === 1,
@@ -1499,6 +1534,115 @@ async function setTrustedDomainSourceEnabled(
   )
   saveTrustedDomainsDatabase(database)
   return getTrustedDomainSourceRows(database)
+}
+
+async function loadCustomTrustedDomains(): Promise<CustomTrustedDomain[]> {
+  const database = await getTrustedDomainsDatabase()
+  const statement = database.prepare(
+    `
+      SELECT domain, created_at
+      FROM trusted_domains
+      WHERE source_id = $sourceId
+      ORDER BY domain COLLATE NOCASE ASC
+    `,
+    {
+      $sourceId: MANUAL_TRUSTED_DOMAIN_SOURCE_ID
+    }
+  )
+  const rows: CustomTrustedDomain[] = []
+
+  while (statement.step()) {
+    const row = statement.getAsObject() as Record<string, unknown>
+    rows.push({
+      domain: String(row.domain),
+      createdAt: String(row.created_at)
+    })
+  }
+
+  statement.free()
+  return rows
+}
+
+async function addCustomTrustedDomain(value: string): Promise<CustomTrustedDomain[]> {
+  const normalizedDomain = normalizeTrustedDomain(value)
+
+  if (!normalizedDomain) {
+    throw new Error('Wpisz poprawną domenę, na przykład example.com.')
+  }
+
+  const database = await getTrustedDomainsDatabase()
+  const now = new Date().toISOString()
+
+  database.run(
+    `
+      INSERT INTO trusted_domains (source_id, domain, rank, created_at)
+      VALUES ($sourceId, $domain, NULL, $createdAt)
+      ON CONFLICT(source_id, domain) DO NOTHING
+    `,
+    {
+      $sourceId: MANUAL_TRUSTED_DOMAIN_SOURCE_ID,
+      $domain: normalizedDomain,
+      $createdAt: now
+    }
+  )
+  database.run(
+    `
+      UPDATE trusted_sources
+      SET last_domain_count = (
+            SELECT COUNT(*)
+            FROM trusted_domains
+            WHERE source_id = $sourceId
+          ),
+          updated_at = $updatedAt
+      WHERE id = $sourceId
+    `,
+    {
+      $sourceId: MANUAL_TRUSTED_DOMAIN_SOURCE_ID,
+      $updatedAt: now
+    }
+  )
+  saveTrustedDomainsDatabase(database)
+  return loadCustomTrustedDomains()
+}
+
+async function removeCustomTrustedDomain(domain: string): Promise<CustomTrustedDomain[]> {
+  const normalizedDomain = normalizeTrustedDomain(domain)
+
+  if (!normalizedDomain) {
+    throw new Error('Nie znaleziono wskazanej domeny.')
+  }
+
+  const database = await getTrustedDomainsDatabase()
+  const now = new Date().toISOString()
+
+  database.run(
+    `
+      DELETE FROM trusted_domains
+      WHERE source_id = $sourceId AND domain = $domain
+    `,
+    {
+      $sourceId: MANUAL_TRUSTED_DOMAIN_SOURCE_ID,
+      $domain: normalizedDomain
+    }
+  )
+  database.run(
+    `
+      UPDATE trusted_sources
+      SET last_domain_count = (
+            SELECT COUNT(*)
+            FROM trusted_domains
+            WHERE source_id = $sourceId
+          ),
+          updated_at = $updatedAt
+      WHERE id = $sourceId
+    `,
+    {
+      $sourceId: MANUAL_TRUSTED_DOMAIN_SOURCE_ID,
+      $updatedAt: now
+    }
+  )
+  saveTrustedDomainsDatabase(database)
+  return loadCustomTrustedDomains()
 }
 
 function extractTrancoDomainsFromZipPayload(
@@ -2073,21 +2217,53 @@ function getHostnameFromUrl(rawUrl: string): string | null {
 }
 
 function loadReputationSettings(): ReputationSettings {
+  const browserSettings = loadBrowserSettings()
+  const hasApiKey = hasGoogleSafeBrowsingApiKey(browserSettings)
+  const disabledRuleIds: ReputationRuleId[] = hasApiKey
+    ? browserSettings.reputation.disabledRuleIds
+    : Array.from(
+        new Set<ReputationRuleId>([
+          ...browserSettings.reputation.disabledRuleIds,
+          'google-safe-browsing'
+        ])
+      )
+
   return {
-    ...loadBrowserSettings().reputation,
-    googleSafeBrowsingApiKeyConfigured: hasGoogleSafeBrowsingApiKey()
+    ...browserSettings.reputation,
+    disabledRuleIds,
+    googleSafeBrowsingApiKeyConfigured: hasApiKey
+  }
+}
+
+function normalizeReputationSettingsForApiKey(
+  settings: ReputationSettings,
+  hasApiKey: boolean
+): ReputationSettings {
+  if (hasApiKey) {
+    return settings
+  }
+
+  return {
+    ...settings,
+    disabledRuleIds: Array.from(
+      new Set<ReputationRuleId>([...settings.disabledRuleIds, 'google-safe-browsing'])
+    )
   }
 }
 
 function saveReputationSettings(value: ReputationSettings): ReputationSettings {
+  const currentBrowserSettings = loadBrowserSettings()
+  const hasApiKey = hasGoogleSafeBrowsingApiKey(currentBrowserSettings)
+  const normalizedReputation = normalizeReputationSettingsForApiKey(value, hasApiKey)
   const nextBrowserSettings = saveBrowserSettings({
-    ...loadBrowserSettings(),
-    reputation: normalizeReputationSettings(value)
+    ...currentBrowserSettings,
+    reputation: normalizeReputationSettings(normalizedReputation)
   })
+  const nextHasApiKey = hasGoogleSafeBrowsingApiKey(nextBrowserSettings)
 
   return {
-    ...nextBrowserSettings.reputation,
-    googleSafeBrowsingApiKeyConfigured: hasGoogleSafeBrowsingApiKey(nextBrowserSettings)
+    ...normalizeReputationSettingsForApiKey(nextBrowserSettings.reputation, nextHasApiKey),
+    googleSafeBrowsingApiKeyConfigured: nextHasApiKey
   }
 }
 
@@ -2128,10 +2304,15 @@ function getGoogleSafeBrowsingApiKey(): string | null {
 function setGoogleSafeBrowsingApiKey(value: string | null): ReputationSettings {
   const normalizedValue =
     typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+  const currentBrowserSettings = loadBrowserSettings()
+  const nextReputation = normalizedValue
+    ? currentBrowserSettings.reputation
+    : normalizeReputationSettingsForApiKey(currentBrowserSettings.reputation, false)
 
   const nextBrowserSettings = saveBrowserSettings({
-    ...loadBrowserSettings(),
-    googleSafeBrowsingApiKey: normalizedValue
+    ...currentBrowserSettings,
+    googleSafeBrowsingApiKey: normalizedValue,
+    reputation: nextReputation
   })
 
   googleSafeBrowsingCache.clear()
@@ -2279,6 +2460,126 @@ function hasNonLatinLetters(value: string): boolean {
   }
 
   return false
+}
+
+function getDomainLabelForLookalike(domain: string): string {
+  return domain.split('.')[0]?.toLowerCase() ?? domain.toLowerCase()
+}
+
+function getLookalikeSkeleton(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[0]/g, 'o')
+    .replace(/[1!|]/g, 'l')
+    .replace(/[3]/g, 'e')
+    .replace(/[4@]/g, 'a')
+    .replace(/[5$]/g, 's')
+    .replace(/[7]/g, 't')
+    .replace(/[8]/g, 'b')
+}
+
+function getLevenshteinDistance(left: string, right: string): number {
+  if (left === right) {
+    return 0
+  }
+
+  if (left.length === 0) {
+    return right.length
+  }
+
+  if (right.length === 0) {
+    return left.length
+  }
+
+  const previous = Array.from({ length: right.length + 1 }, (_value, index) => index)
+  const current = Array.from({ length: right.length + 1 }, () => 0)
+
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    current[0] = leftIndex
+
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      const substitutionCost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1
+      current[rightIndex] = Math.min(
+        current[rightIndex - 1] + 1,
+        previous[rightIndex] + 1,
+        previous[rightIndex - 1] + substitutionCost
+      )
+    }
+
+    for (let index = 0; index < previous.length; index += 1) {
+      previous[index] = current[index]
+    }
+  }
+
+  return previous[right.length] ?? Number.MAX_SAFE_INTEGER
+}
+
+function isLookalikeDomain(candidateDomain: string, trustedDomain: string): boolean {
+  if (candidateDomain === trustedDomain) {
+    return false
+  }
+
+  const candidateLabel = getDomainLabelForLookalike(candidateDomain)
+  const trustedLabel = getDomainLabelForLookalike(trustedDomain)
+
+  if (candidateLabel.length < 4 || trustedLabel.length < 4) {
+    return false
+  }
+
+  if (Math.abs(candidateLabel.length - trustedLabel.length) > 2) {
+    return false
+  }
+
+  const candidateSkeleton = getLookalikeSkeleton(candidateLabel)
+  const trustedSkeleton = getLookalikeSkeleton(trustedLabel)
+
+  if (candidateSkeleton === trustedSkeleton) {
+    return true
+  }
+
+  const maxDistance = Math.max(candidateSkeleton.length, trustedSkeleton.length) <= 6 ? 1 : 2
+  return getLevenshteinDistance(candidateSkeleton, trustedSkeleton) <= maxDistance
+}
+
+async function findLookalikeTrustedDomain(candidateDomain: string): Promise<string | null> {
+  const database = await getTrustedDomainsDatabase()
+  const labelLength = getDomainLabelForLookalike(candidateDomain).length
+  const statement = database.prepare(
+    `
+      SELECT td.domain
+      FROM trusted_domains td
+      INNER JOIN trusted_sources ts ON ts.id = td.source_id
+      WHERE ts.enabled = 1
+        AND td.domain != $domain
+        AND length(td.domain) BETWEEN $minLength AND $maxLength
+      ORDER BY ts.kind = 'manual' DESC, td.rank IS NULL ASC, td.rank ASC
+      LIMIT 500
+    `,
+    {
+      $domain: candidateDomain,
+      $minLength: Math.max(1, candidateDomain.length - 4),
+      $maxLength: candidateDomain.length + 4
+    }
+  )
+
+  try {
+    while (statement.step()) {
+      const row = statement.getAsObject() as Record<string, unknown>
+      const trustedDomain = String(row.domain)
+
+      if (Math.abs(getDomainLabelForLookalike(trustedDomain).length - labelLength) > 2) {
+        continue
+      }
+
+      if (isLookalikeDomain(candidateDomain, trustedDomain)) {
+        return trustedDomain
+      }
+    }
+  } finally {
+    statement.free()
+  }
+
+  return null
 }
 
 async function loadRdapBootstrap(): Promise<RdapBootstrap> {
@@ -2574,6 +2875,35 @@ async function evaluateNonLatinScriptRule(
   }
 }
 
+async function evaluateLookalikeTrustedDomainRule(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult | null> {
+  if (!candidate.registrableDomain || candidate.isIp) {
+    return null
+  }
+
+  const matchedTrustedDomain = await findLookalikeTrustedDomain(candidate.registrableDomain)
+
+  if (!matchedTrustedDomain) {
+    return null
+  }
+
+  return {
+    ruleId: 'lookalike-trusted-domain',
+    matched: true,
+    scoreDelta: getRuleScoreDelta(
+      'lookalike-trusted-domain',
+      DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA,
+      settings
+    ),
+    severity: 'warning',
+    code: `lookalike-trusted-domain:${matchedTrustedDomain}`,
+    message:
+      'Domena wygląda podobnie do jednej z zaufanych domen, ale nie jest tą samą domeną.'
+  }
+}
+
 async function evaluateIpAddressRule(
   candidate: NormalizedSiteCandidate,
   settings: ReputationSettings
@@ -2687,6 +3017,10 @@ async function assessNavigationReputation(rawUrl: string): Promise<ReputationAss
     {
       id: 'non-latin-script' as const,
       evaluate: evaluateNonLatinScriptRule
+    },
+    {
+      id: 'lookalike-trusted-domain' as const,
+      evaluate: evaluateLookalikeTrustedDomainRule
     },
     {
       id: 'is-ip' as const,
@@ -4142,6 +4476,18 @@ ipcMain.handle('trusted-domains:set-enabled', (_event, id: string, enabled: bool
 
 ipcMain.handle('trusted-domains:sync-source', (_event, id: string) => {
   return syncTrustedDomainSource(id)
+})
+
+ipcMain.handle('trusted-domains:get-custom-domains', () => {
+  return loadCustomTrustedDomains()
+})
+
+ipcMain.handle('trusted-domains:add-custom-domain', (_event, value: string) => {
+  return addCustomTrustedDomain(value)
+})
+
+ipcMain.handle('trusted-domains:remove-custom-domain', (_event, domain: string) => {
+  return removeCustomTrustedDomain(domain)
 })
 
 ipcMain.handle('browser:toggle-maximize', () => {

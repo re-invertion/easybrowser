@@ -25,6 +25,7 @@ type BrowserState = {
         | 'insecure-http'
         | 'domain-blocklist'
         | 'non-latin-script'
+        | 'lookalike-trusted-domain'
         | 'is-ip'
         | 'google-safe-browsing'
         | 'young-domain-age'
@@ -81,7 +82,8 @@ type ReputationSettings = {
   disabledRuleIds: Array<
     | 'insecure-http'
     | 'domain-blocklist'
-    | 'non-latin-script'
+        | 'non-latin-script'
+        | 'lookalike-trusted-domain'
     | 'is-ip'
     | 'google-safe-browsing'
     | 'young-domain-age'
@@ -90,7 +92,8 @@ type ReputationSettings = {
     Record<
       | 'insecure-http'
       | 'domain-blocklist'
-      | 'non-latin-script'
+        | 'non-latin-script'
+        | 'lookalike-trusted-domain'
       | 'is-ip'
       | 'google-safe-browsing'
       | 'young-domain-age',
@@ -108,7 +111,8 @@ type ReputationAssessmentPreview = {
     ruleId:
       | 'insecure-http'
       | 'domain-blocklist'
-      | 'non-latin-script'
+        | 'non-latin-script'
+        | 'lookalike-trusted-domain'
       | 'is-ip'
       | 'google-safe-browsing'
       | 'young-domain-age'
@@ -131,7 +135,7 @@ type DomainBlocklistSource = {
 type TrustedDomainSource = {
   id: string
   name: string
-  kind: 'tranco'
+  kind: 'tranco' | 'manual'
   url: string
   enabled: boolean
   isDefault: boolean
@@ -141,6 +145,10 @@ type TrustedDomainSource = {
   lastSyncError: string | null
   createdAt: string
   updatedAt: string
+}
+type CustomTrustedDomain = {
+  domain: string
+  createdAt: string
 }
 
 contextBridge.exposeInMainWorld('easybrowser', {
@@ -208,6 +216,12 @@ contextBridge.exposeInMainWorld('easybrowser', {
     ipcRenderer.invoke('trusted-domains:set-enabled', id, enabled) as Promise<TrustedDomainSource[]>,
   syncTrustedDomainSource: (id: string) =>
     ipcRenderer.invoke('trusted-domains:sync-source', id) as Promise<TrustedDomainSource[]>,
+  getCustomTrustedDomains: () =>
+    ipcRenderer.invoke('trusted-domains:get-custom-domains') as Promise<CustomTrustedDomain[]>,
+  addCustomTrustedDomain: (value: string) =>
+    ipcRenderer.invoke('trusted-domains:add-custom-domain', value) as Promise<CustomTrustedDomain[]>,
+  removeCustomTrustedDomain: (domain: string) =>
+    ipcRenderer.invoke('trusted-domains:remove-custom-domain', domain) as Promise<CustomTrustedDomain[]>,
   toggleMaximize: () => ipcRenderer.invoke('browser:toggle-maximize'),
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),

@@ -25,7 +25,8 @@ declare global {
         ruleId:
           | 'insecure-http'
           | 'domain-blocklist'
-          | 'non-latin-script'
+        | 'non-latin-script'
+        | 'lookalike-trusted-domain'
           | 'is-ip'
           | 'google-safe-browsing'
           | 'young-domain-age'
@@ -83,7 +84,8 @@ declare global {
     disabledRuleIds: Array<
       | 'insecure-http'
       | 'domain-blocklist'
-      | 'non-latin-script'
+        | 'non-latin-script'
+        | 'lookalike-trusted-domain'
       | 'is-ip'
       | 'google-safe-browsing'
       | 'young-domain-age'
@@ -93,6 +95,7 @@ declare global {
         | 'insecure-http'
         | 'domain-blocklist'
         | 'non-latin-script'
+        | 'lookalike-trusted-domain'
         | 'is-ip'
         | 'google-safe-browsing'
         | 'young-domain-age',
@@ -112,6 +115,7 @@ declare global {
         | 'insecure-http'
         | 'domain-blocklist'
         | 'non-latin-script'
+        | 'lookalike-trusted-domain'
         | 'is-ip'
         | 'google-safe-browsing'
         | 'young-domain-age'
@@ -136,7 +140,7 @@ declare global {
   type TrustedDomainSource = {
     id: string
     name: string
-    kind: 'tranco'
+    kind: 'tranco' | 'manual'
     url: string
     enabled: boolean
     isDefault: boolean
@@ -146,6 +150,11 @@ declare global {
     lastSyncError: string | null
     createdAt: string
     updatedAt: string
+  }
+
+  type CustomTrustedDomain = {
+    domain: string
+    createdAt: string
   }
 
   interface Window {
@@ -203,6 +212,9 @@ declare global {
         enabled: boolean
       ) => Promise<TrustedDomainSource[]>
       syncTrustedDomainSource: (id: string) => Promise<TrustedDomainSource[]>
+      getCustomTrustedDomains: () => Promise<CustomTrustedDomain[]>
+      addCustomTrustedDomain: (value: string) => Promise<CustomTrustedDomain[]>
+      removeCustomTrustedDomain: (domain: string) => Promise<CustomTrustedDomain[]>
       toggleMaximize: () => Promise<void>
       minimizeWindow: () => Promise<void>
       closeWindow: () => Promise<void>

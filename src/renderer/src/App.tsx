@@ -126,9 +126,13 @@ function getFilterDraftFromSettings(settings: ReputationSettings) {
     httpScore: settings.ruleWeights['insecure-http'] ?? 50,
     nonLatinEnabled: !settings.disabledRuleIds.includes('non-latin-script'),
     nonLatinScore: settings.ruleWeights['non-latin-script'] ?? 25,
+    lookalikeTrustedDomainEnabled: !settings.disabledRuleIds.includes('lookalike-trusted-domain'),
+    lookalikeTrustedDomainScore: settings.ruleWeights['lookalike-trusted-domain'] ?? 60,
     ipEnabled: !settings.disabledRuleIds.includes('is-ip'),
     ipScore: settings.ruleWeights['is-ip'] ?? 40,
-    googleSafeBrowsingEnabled: !settings.disabledRuleIds.includes('google-safe-browsing'),
+    googleSafeBrowsingEnabled:
+      settings.googleSafeBrowsingApiKeyConfigured &&
+      !settings.disabledRuleIds.includes('google-safe-browsing'),
     googleSafeBrowsingScore: settings.ruleWeights['google-safe-browsing'] ?? 100,
     youngDomainEnabled: !settings.disabledRuleIds.includes('young-domain-age'),
     youngDomainScore: settings.ruleWeights['young-domain-age'] ?? 35,
@@ -414,6 +418,7 @@ function App() {
   })
   const [domainBlocklistSources, setDomainBlocklistSources] = useState<DomainBlocklistSource[]>([])
   const [trustedDomainSources, setTrustedDomainSources] = useState<TrustedDomainSource[]>([])
+  const [customTrustedDomains, setCustomTrustedDomains] = useState<CustomTrustedDomain[]>([])
   const [filterSettingsDraft, setFilterSettingsDraft] = useState(() =>
     getFilterDraftFromSettings({
       enabled: true,
@@ -427,6 +432,7 @@ function App() {
   )
   const [domainBlocklistSourcesDraft, setDomainBlocklistSourcesDraft] = useState<DomainBlocklistSource[]>([])
   const [newDomainBlocklistUrl, setNewDomainBlocklistUrl] = useState('')
+  const [newCustomTrustedDomain, setNewCustomTrustedDomain] = useState('')
   const [googleSafeBrowsingApiKeyInput, setGoogleSafeBrowsingApiKeyInput] = useState('')
   const [shouldClearGoogleSafeBrowsingApiKey, setShouldClearGoogleSafeBrowsingApiKey] =
     useState(false)
@@ -438,6 +444,8 @@ function App() {
   const [syncingTrustedDomainSourceId, setSyncingTrustedDomainSourceId] = useState<string | null>(null)
   const [isHttpRuleExpanded, setIsHttpRuleExpanded] = useState(false)
   const [isNonLatinRuleExpanded, setIsNonLatinRuleExpanded] = useState(false)
+  const [isLookalikeTrustedDomainRuleExpanded, setIsLookalikeTrustedDomainRuleExpanded] =
+    useState(false)
   const [isIpRuleExpanded, setIsIpRuleExpanded] = useState(false)
   const [isGoogleSafeBrowsingRuleExpanded, setIsGoogleSafeBrowsingRuleExpanded] =
     useState(false)
@@ -446,6 +454,13 @@ function App() {
   const [userPendingDeletion, setUserPendingDeletion] = useState<UserProfile | null>(null)
 
   const selectedUser = users.find((user) => user.id === selectedUserId) ?? null
+  const hasPendingGoogleSafeBrowsingApiKey = googleSafeBrowsingApiKeyInput.trim().length > 0
+  const canEnableGoogleSafeBrowsing =
+    hasPendingGoogleSafeBrowsingApiKey ||
+    (reputationSettings.googleSafeBrowsingApiKeyConfigured && !shouldClearGoogleSafeBrowsingApiKey)
+  const currentGoogleSafeBrowsingEnabled =
+    reputationSettings.googleSafeBrowsingApiKeyConfigured &&
+    !reputationSettings.disabledRuleIds.includes('google-safe-browsing')
   const hasFilterSettingsChanges =
     filterSettingsDraft.httpEnabled !==
       !reputationSettings.disabledRuleIds.includes('insecure-http') ||
@@ -454,10 +469,13 @@ function App() {
       !reputationSettings.disabledRuleIds.includes('non-latin-script') ||
     filterSettingsDraft.nonLatinScore !==
       (reputationSettings.ruleWeights['non-latin-script'] ?? 25) ||
+    filterSettingsDraft.lookalikeTrustedDomainEnabled !==
+      !reputationSettings.disabledRuleIds.includes('lookalike-trusted-domain') ||
+    filterSettingsDraft.lookalikeTrustedDomainScore !==
+      (reputationSettings.ruleWeights['lookalike-trusted-domain'] ?? 60) ||
     filterSettingsDraft.ipEnabled !== !reputationSettings.disabledRuleIds.includes('is-ip') ||
     filterSettingsDraft.ipScore !== (reputationSettings.ruleWeights['is-ip'] ?? 40) ||
-    filterSettingsDraft.googleSafeBrowsingEnabled !==
-      !reputationSettings.disabledRuleIds.includes('google-safe-browsing') ||
+    filterSettingsDraft.googleSafeBrowsingEnabled !== currentGoogleSafeBrowsingEnabled ||
     filterSettingsDraft.googleSafeBrowsingScore !==
       (reputationSettings.ruleWeights['google-safe-browsing'] ?? 100) ||
     filterSettingsDraft.youngDomainEnabled !==
@@ -492,7 +510,8 @@ function App() {
           nextAccessibilitySettings,
           nextReputationSettings,
           nextDomainBlocklistSources,
-          nextTrustedDomainSources
+          nextTrustedDomainSources,
+          nextCustomTrustedDomains
         ] =
           await Promise.all([
           window.easybrowser.getUserState(),
@@ -500,7 +519,8 @@ function App() {
           window.easybrowser.getAccessibilitySettings(),
           window.easybrowser.getReputationSettings(),
           window.easybrowser.getDomainBlocklistSources(),
-          window.easybrowser.getTrustedDomainSources()
+          window.easybrowser.getTrustedDomainSources(),
+          window.easybrowser.getCustomTrustedDomains()
         ])
         setUsers(state.users)
         setSelectedUserId(state.activeUserId)
@@ -510,6 +530,7 @@ function App() {
         setReputationSettings(nextReputationSettings)
         setDomainBlocklistSources(nextDomainBlocklistSources)
         setTrustedDomainSources(nextTrustedDomainSources)
+        setCustomTrustedDomains(nextCustomTrustedDomains)
       } catch (error) {
         setErrorMessage(
           error instanceof Error ? error.message : 'Nie udało się wczytać użytkowników.'
@@ -646,6 +667,15 @@ function App() {
     setGoogleSafeBrowsingApiKeyInput('')
     setShouldClearGoogleSafeBrowsingApiKey(false)
   }, [reputationSettings.googleSafeBrowsingApiKeyConfigured])
+
+  useEffect(() => {
+    if (!canEnableGoogleSafeBrowsing) {
+      setFilterSettingsDraft((current) => ({
+        ...current,
+        googleSafeBrowsingEnabled: false
+      }))
+    }
+  }, [canEnableGoogleSafeBrowsing])
 
   const applyUserState = (state: UserState) => {
     setUsers(state.users)
@@ -967,11 +997,15 @@ function App() {
         nextDisabledRuleIds.push('non-latin-script')
       }
 
+      if (!filterSettingsDraft.lookalikeTrustedDomainEnabled) {
+        nextDisabledRuleIds.push('lookalike-trusted-domain')
+      }
+
       if (!filterSettingsDraft.ipEnabled) {
         nextDisabledRuleIds.push('is-ip')
       }
 
-      if (!filterSettingsDraft.googleSafeBrowsingEnabled) {
+      if (!filterSettingsDraft.googleSafeBrowsingEnabled || !canEnableGoogleSafeBrowsing) {
         nextDisabledRuleIds.push('google-safe-browsing')
       }
 
@@ -983,27 +1017,24 @@ function App() {
         nextDisabledRuleIds.push('domain-blocklist')
       }
 
-      const nextSettings = await window.easybrowser.updateReputationSettings({
+      if (shouldClearGoogleSafeBrowsingApiKey) {
+        await window.easybrowser.setGoogleSafeBrowsingApiKey(null)
+      } else if (googleSafeBrowsingApiKeyInput.trim().length > 0) {
+        await window.easybrowser.setGoogleSafeBrowsingApiKey(googleSafeBrowsingApiKeyInput)
+      }
+
+      const savedSettings = await window.easybrowser.updateReputationSettings({
         disabledRuleIds: nextDisabledRuleIds,
         ruleWeights: {
           'insecure-http': filterSettingsDraft.httpScore,
           'non-latin-script': filterSettingsDraft.nonLatinScore,
+          'lookalike-trusted-domain': filterSettingsDraft.lookalikeTrustedDomainScore,
           'is-ip': filterSettingsDraft.ipScore,
           'google-safe-browsing': filterSettingsDraft.googleSafeBrowsingScore,
           'young-domain-age': filterSettingsDraft.youngDomainScore
         },
         youngDomainMaxAgeDays: filterSettingsDraft.youngDomainMaxAgeDays
       })
-
-      let savedSettings = nextSettings
-
-      if (shouldClearGoogleSafeBrowsingApiKey) {
-        savedSettings = await window.easybrowser.setGoogleSafeBrowsingApiKey(null)
-      } else if (googleSafeBrowsingApiKeyInput.trim().length > 0) {
-        savedSettings = await window.easybrowser.setGoogleSafeBrowsingApiKey(
-          googleSafeBrowsingApiKeyInput
-        )
-      }
 
       let nextSources = domainBlocklistSources
 
@@ -1082,6 +1113,33 @@ function App() {
       )
     } finally {
       setSyncingTrustedDomainSourceId(null)
+    }
+  }
+
+  const handleAddCustomTrustedDomain = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    try {
+      const nextDomains = await window.easybrowser.addCustomTrustedDomain(newCustomTrustedDomain)
+      setCustomTrustedDomains(nextDomains)
+      setNewCustomTrustedDomain('')
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się dodać domeny do allowlisty.'
+      )
+    }
+  }
+
+  const handleRemoveCustomTrustedDomain = async (domain: string) => {
+    try {
+      const nextDomains = await window.easybrowser.removeCustomTrustedDomain(domain)
+      setCustomTrustedDomains(nextDomains)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się usunąć domeny z allowlisty.'
+      )
     }
   }
 
@@ -2060,6 +2118,90 @@ function App() {
                       <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
                         <div>
                           <p className="text-lg font-bold text-app-text">
+                            Podobne do zaufanych domen
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Filtr wykrywa adresy, które wyglądają podobnie do domen z allowlisty,
+                            ale nie są dokładnie tą samą domeną.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.lookalikeTrustedDomainEnabled}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  lookalikeTrustedDomainEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>
+                              {filterSettingsDraft.lookalikeTrustedDomainEnabled
+                                ? 'Włączona'
+                                : 'Wyłączona'}
+                            </span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setIsLookalikeTrustedDomainRuleExpanded((current) => !current)
+                            }}
+                            aria-expanded={isLookalikeTrustedDomainRuleExpanded}
+                            aria-label="Rozwiń regułę podobieństwa do zaufanych domen"
+                          >
+                          {isLookalikeTrustedDomainRuleExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {isLookalikeTrustedDomainRuleExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <label className="mt-5 block max-w-sm">
+                            <span className="text-sm font-bold text-app-text">
+                              Punkty dla domen podobnych do zaufanych
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              value={filterSettingsDraft.lookalikeTrustedDomainScore}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  lookalikeTrustedDomainScore: Math.max(
+                                    0,
+                                    Number(event.target.value) || 0
+                                  )
+                                }))
+                              }}
+                              className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                            />
+                          </label>
+
+                          <div className="mt-5">
+                            <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                              Efekt
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">
+                              Jeśli adres jest bardzo podobny do domeny z allowlisty, ale nie jest
+                              tą samą domeną, do wyniku reputacji zostanie dodane ustawione score.
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div>
+                          <p className="text-lg font-bold text-app-text">
                             Znaki spoza lacinskich
                           </p>
                           <p className="mt-2 text-sm leading-6 text-slate-500">
@@ -2135,7 +2277,14 @@ function App() {
                     <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
                       <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
                         <div>
-                          <p className="text-lg font-bold text-app-text">Google Safe Browsing</p>
+                          <div className="flex flex-wrap items-center gap-3">
+                            <p className="text-lg font-bold text-app-text">Google Safe Browsing</p>
+                            {!canEnableGoogleSafeBrowsing ? (
+                              <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-bold text-amber-800">
+                                Brak klucza API
+                              </span>
+                            ) : null}
+                          </div>
                           <p className="mt-2 text-sm leading-6 text-slate-500">
                             Filtr sprawdza URL w Google Safe Browsing i może mocno podnieść score
                             dla phishingu, malware lub niechcianego oprogramowania.
@@ -2147,7 +2296,12 @@ function App() {
                               type="checkbox"
                               className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
                               checked={filterSettingsDraft.googleSafeBrowsingEnabled}
+                              disabled={!canEnableGoogleSafeBrowsing}
                               onChange={(event) => {
+                                if (!canEnableGoogleSafeBrowsing) {
+                                  return
+                                }
+
                                 setFilterSettingsDraft((current) => ({
                                   ...current,
                                   googleSafeBrowsingEnabled: event.target.checked
@@ -2176,19 +2330,6 @@ function App() {
 
                       {isGoogleSafeBrowsingRuleExpanded ? (
                         <div className="border-t border-app-tile-border px-5 pb-5">
-                          <div className="mt-5 flex flex-wrap items-center gap-3">
-                            <span className="rounded-full border border-app-tile-border bg-white px-3 py-1 text-xs font-bold text-slate-600">
-                              {reputationSettings.googleSafeBrowsingApiKeyConfigured
-                                ? 'Klucz API ustawiony'
-                                : 'Brak klucza API'}
-                            </span>
-                            {shouldClearGoogleSafeBrowsingApiKey ? (
-                              <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700">
-                                Klucz zostanie usunięty po zapisie
-                              </span>
-                            ) : null}
-                          </div>
-
                           <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
                             <label className="block">
                               <span className="text-sm font-bold text-app-text">
@@ -2205,7 +2346,7 @@ function App() {
                                 }}
                                 placeholder={
                                   reputationSettings.googleSafeBrowsingApiKeyConfigured
-                                    ? 'Wklej nowy klucz, aby podmienić obecny'
+                                    ? '••••••••••••••••••••••••••••••••'
                                     : 'Wklej klucz API Google Safe Browsing'
                                 }
                                 className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
@@ -2601,8 +2742,86 @@ function App() {
                       </div>
                     </div>
 
+                    <div className="mt-5 rounded-[24px] border border-app-tile-border bg-slate-50/70 p-5">
+                      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                        <div className="max-w-2xl">
+                          <p className="text-lg font-bold text-app-text">
+                            Własne domeny allowlisty
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Dodane tutaj domeny będą traktowane jako zaufane i ominą reguły
+                            reputacji strony. Wpisuj tylko domeny, którym naprawdę ufasz.
+                          </p>
+                        </div>
+                        <form
+                          className="flex w-full flex-col gap-3 sm:flex-row lg:max-w-xl"
+                          onSubmit={(event) => {
+                            void handleAddCustomTrustedDomain(event)
+                          }}
+                        >
+                          <label className="min-w-0 flex-1">
+                            <span className="sr-only">Domena do dodania do allowlisty</span>
+                            <input
+                              type="text"
+                              value={newCustomTrustedDomain}
+                              onChange={(event) => {
+                                setNewCustomTrustedDomain(event.target.value)
+                              }}
+                              placeholder="example.com"
+                              className="focus-ring w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
+                            />
+                          </label>
+                          <button
+                            type="submit"
+                            className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-not-allowed disabled:opacity-60"
+                            disabled={newCustomTrustedDomain.trim().length === 0}
+                          >
+                            Dodaj domenę
+                          </button>
+                        </form>
+                      </div>
+
+                      <div className="mt-5">
+                        {customTrustedDomains.length > 0 ? (
+                          <div className="overflow-hidden rounded-2xl border border-app-tile-border bg-white">
+                            {customTrustedDomains.map((entry) => (
+                              <div
+                                key={entry.domain}
+                                className="flex flex-col gap-3 border-b border-app-tile-border px-4 py-4 last:border-b-0 sm:flex-row sm:items-center sm:justify-between"
+                              >
+                                <div className="min-w-0">
+                                  <p className="break-all text-sm font-bold text-app-text">
+                                    {entry.domain}
+                                  </p>
+                                  <p className="mt-1 text-xs text-slate-500">
+                                    Dodano:{' '}
+                                    {new Date(entry.createdAt).toLocaleString('pl-PL')}
+                                  </p>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="focus-ring inline-flex items-center justify-center gap-2 self-start rounded-full border border-red-200 bg-red-50 px-4 py-2 text-sm font-bold text-red-600 transition hover:bg-red-100 sm:self-center"
+                                  aria-label={`Usuń domenę ${entry.domain} z allowlisty`}
+                                  onClick={() => {
+                                    void handleRemoveCustomTrustedDomain(entry.domain)
+                                  }}
+                                >
+                                  <FiX aria-hidden="true" className="h-4 w-4" />
+                                  Usuń
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="rounded-2xl border border-dashed border-app-tile-border bg-white px-4 py-3 text-sm text-slate-500">
+                            Nie dodano jeszcze własnych zaufanych domen.
+                          </p>
+                        )}
+                      </div>
+                    </div>
+
                     <div className="mt-5 space-y-3">
-                      {trustedDomainSources.map((source) => (
+                      {trustedDomainSources.filter((source) => source.kind === 'tranco').map((source) => (
                         <div
                           key={source.id}
                           className="rounded-[24px] border border-app-tile-border bg-slate-50/70 p-5"

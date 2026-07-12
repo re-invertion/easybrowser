@@ -174,6 +174,12 @@ Easybrowser is a very simple and security-focused browser based on Electron.
 - `non-latin-script`
   - Detects hostnames containing letters outside the Latin alphabet.
   - This helps catch lookalike domains using mixed scripts.
+- `lookalike-trusted-domain`
+  - Detects domains that are not trusted themselves but look very similar to a trusted domain.
+  - The rule compares the registrable domain against enabled trusted domains.
+  - It uses a lightweight skeleton for common substitutions such as `0` to `o`, `1` to `l`, and similar characters.
+  - It also uses a small edit-distance threshold to catch close typos.
+  - The rule adds warning score and can be configured from the admin panel.
 - `is-ip`
   - Detects direct navigation to an IP address instead of a named domain.
 - `google-safe-browsing`
@@ -199,13 +205,17 @@ Easybrowser is a very simple and security-focused browser based on Electron.
 
 ## Trusted Domains
 - Trusted domains are intended as a whitelist-style bypass for reputation filters.
-- The current trusted source is Tranco.
+- Trusted domains can come from:
+  - the default Tranco source,
+  - manually added administrator domains.
 - Trusted source metadata is stored in `trusted_sources`.
 - Trusted domain entries are stored in `trusted_domains`.
 - The default Tranco source is:
   - `https://tranco-list.eu/top-1m.csv.zip`.
 - The default local limit is `50_000` domains.
 - Tranco data is downloaded as a ZIP archive and parsed locally.
+- Manually added domains use the internal `manual` trusted source and are managed directly in the admin panel.
+- Manual trusted domains are normalized before saving and IP addresses are rejected.
 - If a domain is trusted, reputation rules are bypassed and the navigation assessment is allowed.
 - Trusted source synchronization errors are stored on the source row and do not prevent the app from starting.
 
@@ -314,9 +324,9 @@ Easybrowser is a very simple and security-focused browser based on Electron.
 - `domain_blocklist_sources`
   - configured remote phishing/blocklist source URLs and score values.
 - `trusted_sources`
-  - configured trusted-domain source metadata and synchronization status.
+  - configured trusted-domain source metadata, including Tranco and the internal manual source.
 - `trusted_domains`
-  - trusted domain rows imported from enabled trusted sources.
+  - trusted domain rows imported from enabled trusted sources or added manually by the administrator.
 - `security_events`
   - local records of warning/block security decisions.
 
