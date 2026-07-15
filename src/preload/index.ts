@@ -13,6 +13,33 @@ type BrowserState = {
   hasCameraAccess: boolean
   isFavorite: boolean
   browserFaviconUrl: string | null
+  reputationIntervention: {
+    url: string
+    decision: 'warning' | 'blocked'
+    eventCode: string
+    title: string
+    message: string
+    canContinue: boolean
+    matchedRules: Array<{
+      ruleId:
+        | 'insecure-http'
+        | 'domain-blocklist'
+        | 'non-latin-script'
+        | 'lookalike-trusted-domain'
+        | 'is-ip'
+        | 'google-safe-browsing'
+        | 'young-domain-age'
+      matched: boolean
+      scoreDelta: number
+      severity: 'warning' | 'blocking'
+      code: string
+      message: string
+    }>
+  } | null
+  dnsFailure: {
+    url: string
+    eventCode: 'no-dns-found'
+  } | null
 }
 
 type UserProfile = {
@@ -48,6 +75,81 @@ type AdminPinStatus = {
 type AccessibilitySettings = {
   visibleFocus: boolean
 }
+type ReputationSettings = {
+  enabled: boolean
+  warningThreshold: number
+  blockedThreshold: number
+  disabledRuleIds: Array<
+    | 'insecure-http'
+    | 'domain-blocklist'
+        | 'non-latin-script'
+        | 'lookalike-trusted-domain'
+    | 'is-ip'
+    | 'google-safe-browsing'
+    | 'young-domain-age'
+  >
+  ruleWeights: Partial<
+    Record<
+      | 'insecure-http'
+      | 'domain-blocklist'
+        | 'non-latin-script'
+        | 'lookalike-trusted-domain'
+      | 'is-ip'
+      | 'google-safe-browsing'
+      | 'young-domain-age',
+      number
+    >
+  >
+  youngDomainMaxAgeDays: number
+  googleSafeBrowsingApiKeyConfigured: boolean
+}
+type ReputationAssessmentPreview = {
+  normalizedUrl: string
+  score: number
+  decision: 'allow' | 'warning' | 'blocked'
+  matchedRules: Array<{
+    ruleId:
+      | 'insecure-http'
+      | 'domain-blocklist'
+        | 'non-latin-script'
+        | 'lookalike-trusted-domain'
+      | 'is-ip'
+      | 'google-safe-browsing'
+      | 'young-domain-age'
+    matched: boolean
+    scoreDelta: number
+    severity: 'warning' | 'blocking'
+    code: string
+    message: string
+  }>
+}
+type DomainBlocklistSource = {
+  id: string
+  url: string
+  enabled: boolean
+  scoreDelta: number
+  isDefault: boolean
+  createdAt: string
+  updatedAt: string
+}
+type TrustedDomainSource = {
+  id: string
+  name: string
+  kind: 'tranco' | 'manual'
+  url: string
+  enabled: boolean
+  isDefault: boolean
+  maxDomains: number
+  lastSyncedAt: string | null
+  lastDomainCount: number
+  lastSyncError: string | null
+  createdAt: string
+  updatedAt: string
+}
+type CustomTrustedDomain = {
+  domain: string
+  createdAt: string
+}
 
 contextBridge.exposeInMainWorld('easybrowser', {
   version: '1.0.0',
@@ -62,6 +164,7 @@ contextBridge.exposeInMainWorld('easybrowser', {
     ipcRenderer.invoke('users:delete', userId) as Promise<UserState>,
   navigate: (value: string) => ipcRenderer.invoke('browser:navigate', value),
   goHome: () => ipcRenderer.invoke('browser:home'),
+  continueReputationWarning: () => ipcRenderer.invoke('browser:continue-reputation-warning'),
   goBack: () => ipcRenderer.invoke('browser:back'),
   goForward: () => ipcRenderer.invoke('browser:forward'),
   reload: () => ipcRenderer.invoke('browser:reload'),
@@ -78,6 +181,47 @@ contextBridge.exposeInMainWorld('easybrowser', {
     ipcRenderer.invoke('accessibility:get-settings') as Promise<AccessibilitySettings>,
   setVisibleFocus: (visibleFocus: boolean) =>
     ipcRenderer.invoke('accessibility:set-visible-focus', visibleFocus) as Promise<AccessibilitySettings>,
+  getReputationSettings: () =>
+    ipcRenderer.invoke('reputation:get-settings') as Promise<ReputationSettings>,
+  updateReputationSettings: (
+    value: Partial<
+      Pick<
+        ReputationSettings,
+        | 'enabled'
+        | 'warningThreshold'
+        | 'blockedThreshold'
+        | 'ruleWeights'
+        | 'youngDomainMaxAgeDays'
+        | 'disabledRuleIds'
+      >
+    >
+  ) => ipcRenderer.invoke('reputation:update-settings', value) as Promise<ReputationSettings>,
+  setGoogleSafeBrowsingApiKey: (value: string | null) =>
+    ipcRenderer.invoke('reputation:set-google-safe-browsing-api-key', value) as Promise<ReputationSettings>,
+  assessReputationUrl: (rawUrl: string) =>
+    ipcRenderer.invoke('reputation:assess-url', rawUrl) as Promise<ReputationAssessmentPreview>,
+  getDomainBlocklistSources: () =>
+    ipcRenderer.invoke('domain-blocklists:get-sources') as Promise<DomainBlocklistSource[]>,
+  addDomainBlocklistSource: (url: string) =>
+    ipcRenderer.invoke('domain-blocklists:add-source', url) as Promise<DomainBlocklistSource[]>,
+  setDomainBlocklistSourceEnabled: (id: string, enabled: boolean) =>
+    ipcRenderer.invoke('domain-blocklists:set-enabled', id, enabled) as Promise<DomainBlocklistSource[]>,
+  setDomainBlocklistSourceScoreDelta: (id: string, scoreDelta: number) =>
+    ipcRenderer.invoke('domain-blocklists:set-score-delta', id, scoreDelta) as Promise<DomainBlocklistSource[]>,
+  removeDomainBlocklistSource: (id: string) =>
+    ipcRenderer.invoke('domain-blocklists:remove-source', id) as Promise<DomainBlocklistSource[]>,
+  getTrustedDomainSources: () =>
+    ipcRenderer.invoke('trusted-domains:get-sources') as Promise<TrustedDomainSource[]>,
+  setTrustedDomainSourceEnabled: (id: string, enabled: boolean) =>
+    ipcRenderer.invoke('trusted-domains:set-enabled', id, enabled) as Promise<TrustedDomainSource[]>,
+  syncTrustedDomainSource: (id: string) =>
+    ipcRenderer.invoke('trusted-domains:sync-source', id) as Promise<TrustedDomainSource[]>,
+  getCustomTrustedDomains: () =>
+    ipcRenderer.invoke('trusted-domains:get-custom-domains') as Promise<CustomTrustedDomain[]>,
+  addCustomTrustedDomain: (value: string) =>
+    ipcRenderer.invoke('trusted-domains:add-custom-domain', value) as Promise<CustomTrustedDomain[]>,
+  removeCustomTrustedDomain: (domain: string) =>
+    ipcRenderer.invoke('trusted-domains:remove-custom-domain', domain) as Promise<CustomTrustedDomain[]>,
   toggleMaximize: () => ipcRenderer.invoke('browser:toggle-maximize'),
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),

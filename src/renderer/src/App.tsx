@@ -2,8 +2,11 @@ import { FormEvent, useEffect, useRef, useState } from 'react'
 import {
   FiAlertTriangle,
   FiCamera,
+  FiChevronDown,
+  FiChevronUp,
   FiMic,
   FiMoreVertical,
+  FiShield,
   FiStar,
   FiTrash2,
   FiX
@@ -12,6 +15,7 @@ import {
 type ViewMode = 'home' | 'browser'
 type AppMenuMode = 'closed' | 'main'
 type AdminGateMode = 'closed' | 'setup' | 'verify'
+type AdminTab = 'overview' | 'security'
 
 type BrowserAccessIndicatorState = {
   hasMicrophoneAccess: boolean
@@ -96,6 +100,45 @@ function normalizeAddress(value: string): string {
   }
 
   return `https://www.google.pl/search?hl=pl&gl=PL&pws=0&q=${encodeURIComponent(trimmed)}`
+}
+
+function normalizeReputationTestUrl(value: string): string {
+  const trimmed = value.trim()
+
+  if (trimmed.length === 0) {
+    throw new Error('Wpisz adres URL do sprawdzenia.')
+  }
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed
+  }
+
+  if (/^[^\s]+\.[^\s]+$/.test(trimmed)) {
+    return `https://${trimmed}`
+  }
+
+  throw new Error('Wpisz poprawny adres URL, na przykład https://example.com.')
+}
+
+function getFilterDraftFromSettings(settings: ReputationSettings) {
+  return {
+    httpEnabled: !settings.disabledRuleIds.includes('insecure-http'),
+    httpScore: settings.ruleWeights['insecure-http'] ?? 50,
+    nonLatinEnabled: !settings.disabledRuleIds.includes('non-latin-script'),
+    nonLatinScore: settings.ruleWeights['non-latin-script'] ?? 25,
+    lookalikeTrustedDomainEnabled: !settings.disabledRuleIds.includes('lookalike-trusted-domain'),
+    lookalikeTrustedDomainScore: settings.ruleWeights['lookalike-trusted-domain'] ?? 60,
+    ipEnabled: !settings.disabledRuleIds.includes('is-ip'),
+    ipScore: settings.ruleWeights['is-ip'] ?? 40,
+    googleSafeBrowsingEnabled:
+      settings.googleSafeBrowsingApiKeyConfigured &&
+      !settings.disabledRuleIds.includes('google-safe-browsing'),
+    googleSafeBrowsingScore: settings.ruleWeights['google-safe-browsing'] ?? 100,
+    youngDomainEnabled: !settings.disabledRuleIds.includes('young-domain-age'),
+    youngDomainScore: settings.ruleWeights['young-domain-age'] ?? 35,
+    youngDomainMaxAgeDays: settings.youngDomainMaxAgeDays,
+    blocklistsEnabled: !settings.disabledRuleIds.includes('domain-blocklist')
+  }
 }
 
 function WindowControls({
@@ -345,12 +388,16 @@ function App() {
   const [hasCameraAccess, setHasCameraAccess] = useState(false)
   const [isFavorite, setIsFavorite] = useState(false)
   const [browserFaviconUrl, setBrowserFaviconUrl] = useState<string | null>(null)
+  const [reputationIntervention, setReputationIntervention] =
+    useState<BrowserState['reputationIntervention']>(null)
+  const [dnsFailure, setDnsFailure] = useState<BrowserState['dnsFailure']>(null)
   const [copyNoticeVisible, setCopyNoticeVisible] = useState(false)
   const [isAddingUser, setIsAddingUser] = useState(false)
   const [newUserName, setNewUserName] = useState('')
   const [openUserMenuId, setOpenUserMenuId] = useState<string | null>(null)
   const [openAppMenu, setOpenAppMenu] = useState<AppMenuMode>('closed')
   const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false)
+  const [adminTab, setAdminTab] = useState<AdminTab>('overview')
   const [adminPinStatus, setAdminPinStatus] = useState<AdminPinStatus | null>(null)
   const [adminGateMode, setAdminGateMode] = useState<AdminGateMode>('closed')
   const [adminPinValue, setAdminPinValue] = useState('')
@@ -360,23 +407,130 @@ function App() {
   const [accessibilitySettings, setAccessibilitySettings] = useState<AccessibilitySettings>({
     visibleFocus: true
   })
+  const [reputationSettings, setReputationSettings] = useState<ReputationSettings>({
+    enabled: true,
+    warningThreshold: 50,
+    blockedThreshold: 70,
+    disabledRuleIds: [],
+    ruleWeights: {},
+    youngDomainMaxAgeDays: 30,
+    googleSafeBrowsingApiKeyConfigured: false
+  })
+  const [domainBlocklistSources, setDomainBlocklistSources] = useState<DomainBlocklistSource[]>([])
+  const [trustedDomainSources, setTrustedDomainSources] = useState<TrustedDomainSource[]>([])
+  const [customTrustedDomains, setCustomTrustedDomains] = useState<CustomTrustedDomain[]>([])
+  const [filterSettingsDraft, setFilterSettingsDraft] = useState(() =>
+    getFilterDraftFromSettings({
+      enabled: true,
+      warningThreshold: 50,
+      blockedThreshold: 70,
+      disabledRuleIds: [],
+      ruleWeights: {},
+      youngDomainMaxAgeDays: 30,
+      googleSafeBrowsingApiKeyConfigured: false
+    })
+  )
+  const [domainBlocklistSourcesDraft, setDomainBlocklistSourcesDraft] = useState<DomainBlocklistSource[]>([])
+  const [newDomainBlocklistUrl, setNewDomainBlocklistUrl] = useState('')
+  const [newCustomTrustedDomain, setNewCustomTrustedDomain] = useState('')
+  const [googleSafeBrowsingApiKeyInput, setGoogleSafeBrowsingApiKeyInput] = useState('')
+  const [shouldClearGoogleSafeBrowsingApiKey, setShouldClearGoogleSafeBrowsingApiKey] =
+    useState(false)
+  const [reputationTestUrl, setReputationTestUrl] = useState('')
+  const [reputationTestResult, setReputationTestResult] = useState<ReputationAssessmentPreview | null>(null)
+  const [reputationTestError, setReputationTestError] = useState<string | null>(null)
+  const [isCheckingReputationTest, setIsCheckingReputationTest] = useState(false)
+  const [isSavingFilterSettings, setIsSavingFilterSettings] = useState(false)
+  const [syncingTrustedDomainSourceId, setSyncingTrustedDomainSourceId] = useState<string | null>(null)
+  const [isHttpRuleExpanded, setIsHttpRuleExpanded] = useState(false)
+  const [isNonLatinRuleExpanded, setIsNonLatinRuleExpanded] = useState(false)
+  const [isLookalikeTrustedDomainRuleExpanded, setIsLookalikeTrustedDomainRuleExpanded] =
+    useState(false)
+  const [isIpRuleExpanded, setIsIpRuleExpanded] = useState(false)
+  const [isGoogleSafeBrowsingRuleExpanded, setIsGoogleSafeBrowsingRuleExpanded] =
+    useState(false)
+  const [isYoungDomainRuleExpanded, setIsYoungDomainRuleExpanded] = useState(false)
+  const [areBlocklistsExpanded, setAreBlocklistsExpanded] = useState(false)
   const [userPendingDeletion, setUserPendingDeletion] = useState<UserProfile | null>(null)
 
   const selectedUser = users.find((user) => user.id === selectedUserId) ?? null
+  const hasPendingGoogleSafeBrowsingApiKey = googleSafeBrowsingApiKeyInput.trim().length > 0
+  const canEnableGoogleSafeBrowsing =
+    hasPendingGoogleSafeBrowsingApiKey ||
+    (reputationSettings.googleSafeBrowsingApiKeyConfigured && !shouldClearGoogleSafeBrowsingApiKey)
+  const currentGoogleSafeBrowsingEnabled =
+    reputationSettings.googleSafeBrowsingApiKeyConfigured &&
+    !reputationSettings.disabledRuleIds.includes('google-safe-browsing')
+  const hasFilterSettingsChanges =
+    filterSettingsDraft.httpEnabled !==
+      !reputationSettings.disabledRuleIds.includes('insecure-http') ||
+    filterSettingsDraft.httpScore !== (reputationSettings.ruleWeights['insecure-http'] ?? 50) ||
+    filterSettingsDraft.nonLatinEnabled !==
+      !reputationSettings.disabledRuleIds.includes('non-latin-script') ||
+    filterSettingsDraft.nonLatinScore !==
+      (reputationSettings.ruleWeights['non-latin-script'] ?? 25) ||
+    filterSettingsDraft.lookalikeTrustedDomainEnabled !==
+      !reputationSettings.disabledRuleIds.includes('lookalike-trusted-domain') ||
+    filterSettingsDraft.lookalikeTrustedDomainScore !==
+      (reputationSettings.ruleWeights['lookalike-trusted-domain'] ?? 60) ||
+    filterSettingsDraft.ipEnabled !== !reputationSettings.disabledRuleIds.includes('is-ip') ||
+    filterSettingsDraft.ipScore !== (reputationSettings.ruleWeights['is-ip'] ?? 40) ||
+    filterSettingsDraft.googleSafeBrowsingEnabled !== currentGoogleSafeBrowsingEnabled ||
+    filterSettingsDraft.googleSafeBrowsingScore !==
+      (reputationSettings.ruleWeights['google-safe-browsing'] ?? 100) ||
+    filterSettingsDraft.youngDomainEnabled !==
+      !reputationSettings.disabledRuleIds.includes('young-domain-age') ||
+    filterSettingsDraft.youngDomainScore !==
+      (reputationSettings.ruleWeights['young-domain-age'] ?? 35) ||
+    filterSettingsDraft.youngDomainMaxAgeDays !== reputationSettings.youngDomainMaxAgeDays ||
+    filterSettingsDraft.blocklistsEnabled !==
+      !reputationSettings.disabledRuleIds.includes('domain-blocklist') ||
+    googleSafeBrowsingApiKeyInput.trim().length > 0 ||
+    shouldClearGoogleSafeBrowsingApiKey ||
+    domainBlocklistSourcesDraft.length !== domainBlocklistSources.length ||
+    domainBlocklistSourcesDraft.some((draftSource) => {
+      const currentSource = domainBlocklistSources.find((source) => source.id === draftSource.id)
+
+      if (!currentSource) {
+        return true
+      }
+
+      return (
+        currentSource.enabled !== draftSource.enabled ||
+        currentSource.scoreDelta !== draftSource.scoreDelta
+      )
+    })
 
   useEffect(() => {
     const loadUsers = async () => {
       try {
-        const [state, nextAdminPinStatus, nextAccessibilitySettings] = await Promise.all([
+        const [
+          state,
+          nextAdminPinStatus,
+          nextAccessibilitySettings,
+          nextReputationSettings,
+          nextDomainBlocklistSources,
+          nextTrustedDomainSources,
+          nextCustomTrustedDomains
+        ] =
+          await Promise.all([
           window.easybrowser.getUserState(),
           window.easybrowser.getAdminPinStatus(),
-          window.easybrowser.getAccessibilitySettings()
+          window.easybrowser.getAccessibilitySettings(),
+          window.easybrowser.getReputationSettings(),
+          window.easybrowser.getDomainBlocklistSources(),
+          window.easybrowser.getTrustedDomainSources(),
+          window.easybrowser.getCustomTrustedDomains()
         ])
         setUsers(state.users)
         setSelectedUserId(state.activeUserId)
         setFavorites(state.favorites)
         setAdminPinStatus(nextAdminPinStatus)
         setAccessibilitySettings(nextAccessibilitySettings)
+        setReputationSettings(nextReputationSettings)
+        setDomainBlocklistSources(nextDomainBlocklistSources)
+        setTrustedDomainSources(nextTrustedDomainSources)
+        setCustomTrustedDomains(nextCustomTrustedDomains)
       } catch (error) {
         setErrorMessage(
           error instanceof Error ? error.message : 'Nie udało się wczytać użytkowników.'
@@ -403,6 +557,8 @@ function App() {
       setHasCameraAccess(state.hasCameraAccess)
       setIsFavorite(state.isFavorite)
       setBrowserFaviconUrl(state.browserFaviconUrl)
+      setReputationIntervention(state.reputationIntervention)
+      setDnsFailure(state.dnsFailure)
       setErrorMessage(state.error)
     })
 
@@ -498,6 +654,28 @@ function App() {
       ? 'on'
       : 'off'
   }, [accessibilitySettings.visibleFocus])
+
+  useEffect(() => {
+    setFilterSettingsDraft(getFilterDraftFromSettings(reputationSettings))
+  }, [reputationSettings])
+
+  useEffect(() => {
+    setDomainBlocklistSourcesDraft(domainBlocklistSources)
+  }, [domainBlocklistSources])
+
+  useEffect(() => {
+    setGoogleSafeBrowsingApiKeyInput('')
+    setShouldClearGoogleSafeBrowsingApiKey(false)
+  }, [reputationSettings.googleSafeBrowsingApiKeyConfigured])
+
+  useEffect(() => {
+    if (!canEnableGoogleSafeBrowsing) {
+      setFilterSettingsDraft((current) => ({
+        ...current,
+        googleSafeBrowsingEnabled: false
+      }))
+    }
+  }, [canEnableGoogleSafeBrowsing])
 
   const applyUserState = (state: UserState) => {
     setUsers(state.users)
@@ -672,6 +850,7 @@ function App() {
   const finishOpeningAdminPanel = async () => {
     resetAdminPinForm()
     setAdminGateMode('closed')
+    setAdminTab('overview')
     setIsAdminPanelOpen(true)
   }
 
@@ -726,6 +905,240 @@ function App() {
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : 'Nie udało się zmienić ustawień dostępności.'
+      )
+    }
+  }
+
+  const applyReputationSettings = async (
+    value: Partial<
+      Pick<
+        ReputationSettings,
+        'enabled' | 'warningThreshold' | 'blockedThreshold' | 'ruleWeights' | 'youngDomainMaxAgeDays'
+      >
+    >
+  ) => {
+    try {
+      const nextSettings = await window.easybrowser.updateReputationSettings(value)
+      setReputationSettings(nextSettings)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zmienić ustawień bezpieczeństwa.'
+      )
+    }
+  }
+
+  const updateDomainBlocklistSourceDraft = (
+    id: string,
+    value: Partial<Pick<DomainBlocklistSource, 'enabled' | 'scoreDelta'>>
+  ) => {
+    setDomainBlocklistSourcesDraft((current) =>
+      current.map((source) => (source.id === id ? { ...source, ...value } : source))
+    )
+  }
+
+  const handleReputationTestSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    try {
+      setIsCheckingReputationTest(true)
+      setReputationTestError(null)
+      const normalizedUrl = normalizeReputationTestUrl(reputationTestUrl)
+      const result = await window.easybrowser.assessReputationUrl(normalizedUrl)
+      setReputationTestResult(result)
+    } catch (error) {
+      setReputationTestResult(null)
+      setReputationTestError(
+        error instanceof Error ? error.message : 'Nie udało się sprawdzić reputacji adresu.'
+      )
+    } finally {
+      setIsCheckingReputationTest(false)
+    }
+  }
+
+  const handleAddDomainBlocklistSource = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    try {
+      const nextSources = await window.easybrowser.addDomainBlocklistSource(newDomainBlocklistUrl)
+      setDomainBlocklistSources(nextSources)
+      setNewDomainBlocklistUrl('')
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się dodać listy ostrzeżeń.'
+      )
+    }
+  }
+
+  const toggleDomainBlocklistSourceEnabled = async (id: string, enabled: boolean) => {
+    try {
+      const nextSources = await window.easybrowser.setDomainBlocklistSourceEnabled(id, enabled)
+      setDomainBlocklistSources(nextSources)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zmienić stanu listy ostrzeżeń.'
+      )
+    }
+  }
+
+  const handleSaveFilterSettings = async () => {
+    try {
+      setIsSavingFilterSettings(true)
+
+      const nextDisabledRuleIds: ReputationSettings['disabledRuleIds'] = []
+
+      if (!filterSettingsDraft.httpEnabled) {
+        nextDisabledRuleIds.push('insecure-http')
+      }
+
+      if (!filterSettingsDraft.nonLatinEnabled) {
+        nextDisabledRuleIds.push('non-latin-script')
+      }
+
+      if (!filterSettingsDraft.lookalikeTrustedDomainEnabled) {
+        nextDisabledRuleIds.push('lookalike-trusted-domain')
+      }
+
+      if (!filterSettingsDraft.ipEnabled) {
+        nextDisabledRuleIds.push('is-ip')
+      }
+
+      if (!filterSettingsDraft.googleSafeBrowsingEnabled || !canEnableGoogleSafeBrowsing) {
+        nextDisabledRuleIds.push('google-safe-browsing')
+      }
+
+      if (!filterSettingsDraft.youngDomainEnabled) {
+        nextDisabledRuleIds.push('young-domain-age')
+      }
+
+      if (!filterSettingsDraft.blocklistsEnabled) {
+        nextDisabledRuleIds.push('domain-blocklist')
+      }
+
+      if (shouldClearGoogleSafeBrowsingApiKey) {
+        await window.easybrowser.setGoogleSafeBrowsingApiKey(null)
+      } else if (googleSafeBrowsingApiKeyInput.trim().length > 0) {
+        await window.easybrowser.setGoogleSafeBrowsingApiKey(googleSafeBrowsingApiKeyInput)
+      }
+
+      const savedSettings = await window.easybrowser.updateReputationSettings({
+        disabledRuleIds: nextDisabledRuleIds,
+        ruleWeights: {
+          'insecure-http': filterSettingsDraft.httpScore,
+          'non-latin-script': filterSettingsDraft.nonLatinScore,
+          'lookalike-trusted-domain': filterSettingsDraft.lookalikeTrustedDomainScore,
+          'is-ip': filterSettingsDraft.ipScore,
+          'google-safe-browsing': filterSettingsDraft.googleSafeBrowsingScore,
+          'young-domain-age': filterSettingsDraft.youngDomainScore
+        },
+        youngDomainMaxAgeDays: filterSettingsDraft.youngDomainMaxAgeDays
+      })
+
+      let nextSources = domainBlocklistSources
+
+      for (const draftSource of domainBlocklistSourcesDraft) {
+        const currentSource = nextSources.find((source) => source.id === draftSource.id)
+
+        if (!currentSource) {
+          continue
+        }
+
+        if (currentSource.enabled !== draftSource.enabled) {
+          nextSources = await window.easybrowser.setDomainBlocklistSourceEnabled(
+            draftSource.id,
+            draftSource.enabled
+          )
+        }
+
+        const sourceAfterEnabledUpdate = nextSources.find((source) => source.id === draftSource.id)
+
+        if (
+          sourceAfterEnabledUpdate &&
+          sourceAfterEnabledUpdate.scoreDelta !== draftSource.scoreDelta
+        ) {
+          nextSources = await window.easybrowser.setDomainBlocklistSourceScoreDelta(
+            draftSource.id,
+            draftSource.scoreDelta
+          )
+        }
+      }
+
+      setReputationSettings(savedSettings)
+      setDomainBlocklistSources(nextSources)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zapisać ustawień filtrów.'
+      )
+    } finally {
+      setIsSavingFilterSettings(false)
+    }
+  }
+
+  const handleRemoveDomainBlocklistSource = async (id: string) => {
+    try {
+      const nextSources = await window.easybrowser.removeDomainBlocklistSource(id)
+      setDomainBlocklistSources(nextSources)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się usunąć listy ostrzeżeń.'
+      )
+    }
+  }
+
+  const handleToggleTrustedDomainSource = async (id: string, enabled: boolean) => {
+    try {
+      const nextSources = await window.easybrowser.setTrustedDomainSourceEnabled(id, enabled)
+      setTrustedDomainSources(nextSources)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zmienić źródła zaufanych domen.'
+      )
+    }
+  }
+
+  const handleSyncTrustedDomainSource = async (id: string) => {
+    try {
+      setSyncingTrustedDomainSourceId(id)
+      const nextSources = await window.easybrowser.syncTrustedDomainSource(id)
+      setTrustedDomainSources(nextSources)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zsynchronizować źródła zaufanych domen.'
+      )
+    } finally {
+      setSyncingTrustedDomainSourceId(null)
+    }
+  }
+
+  const handleAddCustomTrustedDomain = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    try {
+      const nextDomains = await window.easybrowser.addCustomTrustedDomain(newCustomTrustedDomain)
+      setCustomTrustedDomains(nextDomains)
+      setNewCustomTrustedDomain('')
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się dodać domeny do allowlisty.'
+      )
+    }
+  }
+
+  const handleRemoveCustomTrustedDomain = async (domain: string) => {
+    try {
+      const nextDomains = await window.easybrowser.removeCustomTrustedDomain(domain)
+      setCustomTrustedDomains(nextDomains)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się usunąć domeny z allowlisty.'
       )
     }
   }
@@ -1083,7 +1496,125 @@ function App() {
             </div>
           </header>
 
-          <section className="min-h-0 flex-1 overflow-hidden bg-white" />
+          <section className="min-h-0 flex-1 overflow-hidden bg-white">
+            {reputationIntervention ? (
+              <div
+                className={`flex h-full w-full items-center justify-center px-4 py-8 ${
+                  reputationIntervention.decision === 'blocked'
+                    ? 'bg-[radial-gradient(circle_at_top,#fca5a5_0%,#ef4444_38%,#991b1b_100%)]'
+                    : 'bg-[radial-gradient(circle_at_top,#fde68a_0%,#fcd34d_38%,#f59e0b_100%)]'
+                }`}
+              >
+                <div
+                  className={`w-full max-w-2xl rounded-[32px] bg-white/96 p-8 text-center backdrop-blur ${
+                    reputationIntervention.decision === 'blocked'
+                      ? 'border border-red-200/50 shadow-[0_30px_90px_rgba(127,29,29,0.35)]'
+                      : 'border border-amber-200/70 shadow-[0_30px_90px_rgba(180,83,9,0.22)]'
+                  }`}
+                >
+                  <div
+                    className={`mx-auto flex h-16 w-16 items-center justify-center rounded-full ${
+                      reputationIntervention.decision === 'blocked'
+                        ? 'bg-red-100 text-red-600'
+                        : 'bg-amber-100 text-amber-700'
+                    }`}
+                  >
+                    <FiAlertTriangle aria-hidden="true" className="h-8 w-8" />
+                  </div>
+
+                  <p
+                    className={`mt-5 text-sm font-bold tracking-[0.16em] uppercase ${
+                      reputationIntervention.decision === 'blocked'
+                        ? 'text-red-500'
+                        : 'text-amber-700'
+                    }`}
+                  >
+                    {reputationIntervention.decision === 'blocked'
+                      ? 'Ostrzeżenie bezpieczeństwa'
+                      : 'Ostrzeżenie o połączeniu'}
+                  </p>
+                  <h2 className="mt-3 text-3xl leading-tight font-bold text-slate-900">
+                    {reputationIntervention.title}
+                  </h2>
+                  <p className="mt-4 text-base leading-7 text-slate-600">
+                    {reputationIntervention.message}
+                  </p>
+                  <div className="mt-5 rounded-[20px] border border-slate-200 bg-slate-100 px-4 py-3">
+                    <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                      Kod zdarzenia
+                    </p>
+                    <p className="mt-1 break-all text-sm font-bold text-slate-700">
+                      {reputationIntervention.eventCode}
+                    </p>
+                  </div>
+
+                  <div className="mt-8 flex flex-wrap justify-center gap-3">
+                    {reputationIntervention.canContinue ? (
+                      <button
+                        type="button"
+                        className="focus-ring rounded-full bg-amber-500 px-6 py-3 text-sm font-bold text-slate-950 transition hover:bg-amber-400"
+                        onClick={() => {
+                          void window.easybrowser.continueReputationWarning()
+                        }}
+                      >
+                        Kontynuuj
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className={`focus-ring rounded-full px-6 py-3 text-sm font-bold transition ${
+                        reputationIntervention.canContinue
+                          ? 'border border-amber-300 bg-white text-slate-900 hover:bg-amber-50'
+                          : 'bg-red-600 text-white hover:bg-red-700'
+                      }`}
+                      onClick={() => {
+                        void goHome()
+                      }}
+                    >
+                      Wróć do panelu głównego
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : dnsFailure ? (
+              <div className="flex h-full w-full items-center justify-center bg-[radial-gradient(circle_at_top,#dbeafe_0%,#bfdbfe_38%,#93c5fd_100%)] px-4 py-8">
+                <div className="w-full max-w-2xl rounded-[32px] border border-blue-200/60 bg-white/96 p-8 text-center shadow-[0_30px_90px_rgba(30,64,175,0.18)] backdrop-blur">
+                  <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-blue-100 text-blue-700">
+                    <FiAlertTriangle aria-hidden="true" className="h-8 w-8" />
+                  </div>
+
+                  <p className="mt-5 text-sm font-bold tracking-[0.16em] text-blue-600 uppercase">
+                    Problem z adresem strony
+                  </p>
+                  <h2 className="mt-3 text-3xl leading-tight font-bold text-slate-900">
+                    Strona nie istnieje
+                  </h2>
+                  <p className="mt-4 text-base leading-7 text-slate-600">
+                    Nie udało się odnaleźć tej strony w DNS, więc przeglądarka nie mogła jej
+                    otworzyć.
+                  </p>
+                  <div className="mt-5 rounded-[20px] border border-slate-200 bg-slate-100 px-4 py-3">
+                    <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                      Kod zdarzenia
+                    </p>
+                    <p className="mt-1 break-all text-sm font-bold text-slate-700">
+                      {dnsFailure.eventCode}
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="focus-ring mt-8 rounded-full bg-blue-700 px-6 py-3 text-sm font-bold text-white transition hover:bg-blue-800"
+                    onClick={() => {
+                      void goHome()
+                    }}
+                  >
+                    Wróć do panelu głównego
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </section>
           {adminGateModal}
         </div>
       </main>
@@ -1122,8 +1653,8 @@ function App() {
             </div>
           </header>
 
-          <section className="mx-auto flex min-h-0 flex-1 w-full max-w-6xl overflow-hidden px-4 py-6 sm:px-5 sm:py-8">
-            <div className="w-full">
+          <section className="min-h-0 flex-1 overflow-y-auto">
+            <div className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-5 sm:py-8">
               <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
                 <div>
                   <p className="text-sm font-bold tracking-[0.16em] text-slate-500 uppercase">
@@ -1183,41 +1714,1186 @@ function App() {
                 </div>
               </div>
 
-              <div className="mt-6 rounded-[28px] border border-dashed border-app-tile-border bg-app-tile/70 p-6 shadow-[0_14px_34px_rgba(148,163,184,0.08)]">
-                <h2 className="text-xl font-bold text-app-text">Co dalej</h2>
-                <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-500">
-                  Panel jest już podłączony do nawigacji z nagłówka. W kolejnym kroku możemy
-                  dodać tutaj ochronę phishingową, zarządzanie zgodami, listę zaufanych stron
-                  albo ustawienia kont użytkowników.
-                </p>
+              <div className="mt-6 flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  className={`focus-ring rounded-full px-5 py-3 text-sm font-bold transition ${
+                    adminTab === 'overview'
+                      ? 'bg-app-primary text-app-primary-text'
+                      : 'border border-app-tile-border bg-app-tile text-app-text hover:bg-slate-50'
+                  }`}
+                  onClick={() => {
+                    setAdminTab('overview')
+                  }}
+                >
+                  Ogólne
+                </button>
+                <button
+                  type="button"
+                  className={`focus-ring rounded-full px-5 py-3 text-sm font-bold transition ${
+                    adminTab === 'security'
+                      ? 'bg-app-primary text-app-primary-text'
+                      : 'border border-app-tile-border bg-app-tile text-app-text hover:bg-slate-50'
+                  }`}
+                  onClick={() => {
+                    setAdminTab('security')
+                  }}
+                >
+                  Security
+                </button>
               </div>
 
-              <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
-                <div className="flex flex-wrap items-start justify-between gap-4">
-                  <div className="max-w-2xl">
-                    <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
-                      Dostępność
-                    </p>
-                    <h2 className="mt-2 text-xl font-bold text-app-text">Visible focus</h2>
-                    <p className="mt-3 text-sm leading-6 text-slate-500">
-                      Włącza albo wyłącza żółte obramowanie elementów, gdy są zaznaczone
-                      klawiaturą lub focusem.
+              {adminTab === 'overview' ? (
+                <>
+                  <div className="mt-6 rounded-[28px] border border-dashed border-app-tile-border bg-app-tile/70 p-6 shadow-[0_14px_34px_rgba(148,163,184,0.08)]">
+                    <h2 className="text-xl font-bold text-app-text">Co dalej</h2>
+                    <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-500">
+                      Tutaj zarządzasz ochroną przeglądarki, ustawieniami dostępności i źródłami
+                      list ostrzeżeń sprawdzanych na żywo przy każdej próbie wejścia na stronę.
                     </p>
                   </div>
 
-                  <label className="app-no-drag flex items-center gap-3 rounded-full border border-app-tile-border bg-slate-50 px-4 py-3 text-sm font-bold text-app-text">
-                    <input
-                      type="checkbox"
-                      className="focus-ring h-5 w-5 rounded border border-app-tile-border accent-[#1e3a8a]"
-                      checked={accessibilitySettings.visibleFocus}
-                      onChange={(event) => {
-                        void toggleVisibleFocus(event.target.checked)
-                      }}
-                    />
-                    <span>Włącz visible focus</span>
-                  </label>
-                </div>
-              </div>
+                  <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="max-w-2xl">
+                        <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          Dostępność
+                        </p>
+                        <h2 className="mt-2 text-xl font-bold text-app-text">Visible focus</h2>
+                        <p className="mt-3 text-sm leading-6 text-slate-500">
+                          Włącza albo wyłącza żółte obramowanie elementów, gdy są zaznaczone
+                          klawiaturą lub focusem.
+                        </p>
+                      </div>
+
+                      <label className="app-no-drag flex items-center gap-3 rounded-full border border-app-tile-border bg-slate-50 px-4 py-3 text-sm font-bold text-app-text">
+                        <input
+                          type="checkbox"
+                          className="focus-ring h-5 w-5 rounded border border-app-tile-border accent-[#1e3a8a]"
+                          checked={accessibilitySettings.visibleFocus}
+                          onChange={(event) => {
+                            void toggleVisibleFocus(event.target.checked)
+                          }}
+                        />
+                        <span>Włącz visible focus</span>
+                      </label>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="max-w-3xl">
+                        <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          Security
+                        </p>
+                        <h2 className="mt-2 text-xl font-bold text-app-text">
+                          Silnik reputacji strony
+                        </h2>
+                        <p className="mt-3 text-sm leading-6 text-slate-500">
+                          Tutaj ustawiasz progi reputacji, punktację reguł i aktywność źródeł,
+                          które wpływają na warning albo blokadę strony.
+                        </p>
+                      </div>
+
+                      <label className="app-no-drag flex items-center gap-3 rounded-full border border-app-tile-border bg-slate-50 px-4 py-3 text-sm font-bold text-app-text">
+                        <input
+                          type="checkbox"
+                          className="focus-ring h-5 w-5 rounded border border-app-tile-border accent-[#1e3a8a]"
+                          checked={reputationSettings.enabled}
+                          onChange={(event) => {
+                            void applyReputationSettings({ enabled: event.target.checked })
+                          }}
+                        />
+                        <span>{reputationSettings.enabled ? 'Ochrona włączona' : 'Ochrona wyłączona'}</span>
+                      </label>
+                    </div>
+
+                    <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                      <div className="rounded-[22px] border border-slate-200 bg-slate-50/80 p-4">
+                        <p className="text-[11px] font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          Warning
+                        </p>
+                        <p className="mt-2 text-3xl font-bold text-app-text">
+                          {reputationSettings.warningThreshold}
+                        </p>
+                        <p className="mt-1 text-sm text-slate-500">Punktów do ostrzeżenia</p>
+                      </div>
+
+                      <div className="rounded-[22px] border border-slate-200 bg-slate-50/80 p-4">
+                        <p className="text-[11px] font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          Blokada
+                        </p>
+                        <p className="mt-2 text-3xl font-bold text-app-text">
+                          {reputationSettings.blockedThreshold}
+                        </p>
+                        <p className="mt-1 text-sm text-slate-500">Punktów do zatrzymania strony</p>
+                      </div>
+
+                      <div className="rounded-[22px] border border-slate-200 bg-slate-50/80 p-4">
+                        <p className="text-[11px] font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          Aktywne listy
+                        </p>
+                        <p className="mt-2 text-3xl font-bold text-app-text">
+                          {domainBlocklistSources.filter((source) => source.enabled).length}
+                        </p>
+                        <p className="mt-1 text-sm text-slate-500">Źródła wpływające na reputację</p>
+                      </div>
+                    </div>
+
+                    <div className="mt-6 rounded-[24px] border border-app-tile-border bg-slate-50/70 p-5">
+                      <div className="flex flex-wrap items-start justify-between gap-4">
+                        <div className="max-w-3xl">
+                          <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                            Test reputacji
+                          </p>
+                          <h3 className="mt-2 text-xl font-bold text-app-text">
+                            Sprawdź dowolny adres URL
+                          </h3>
+                          <p className="mt-3 text-sm leading-6 text-slate-500">
+                            Wpisz adres, a silnik reputacji policzy wynik według aktualnych progów
+                            i aktywnych filtrów.
+                          </p>
+                        </div>
+                      </div>
+
+                      <form className="mt-5 flex flex-col gap-3 lg:flex-row" onSubmit={handleReputationTestSubmit}>
+                        <input
+                          type="text"
+                          inputMode="url"
+                          value={reputationTestUrl}
+                          onChange={(event) => {
+                            setReputationTestUrl(event.target.value)
+                            if (reputationTestError) {
+                              setReputationTestError(null)
+                            }
+                          }}
+                          placeholder="https://example.com"
+                          className="focus-ring min-w-0 flex-1 rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
+                        />
+                        <button
+                          type="submit"
+                          disabled={isCheckingReputationTest}
+                          className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-wait disabled:opacity-70"
+                        >
+                          {isCheckingReputationTest ? 'Sprawdzanie...' : 'Sprawdź URL'}
+                        </button>
+                      </form>
+
+                      {reputationTestError ? (
+                        <div className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                          {reputationTestError}
+                        </div>
+                      ) : null}
+
+                      {reputationTestResult ? (
+                        <div className="mt-4 rounded-[22px] border border-app-tile-border bg-white p-4">
+                          <div className="flex flex-wrap items-start justify-between gap-4">
+                            <div className="min-w-0 flex-1">
+                              <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                                Sprawdzony adres
+                              </p>
+                              <p className="mt-2 break-all text-sm font-bold text-app-text">
+                                {reputationTestResult.normalizedUrl}
+                              </p>
+                            </div>
+
+                            <div className="flex flex-wrap gap-3">
+                              <div className="rounded-2xl border border-app-tile-border bg-slate-50 px-4 py-3">
+                                <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                                  Score
+                                </p>
+                                <p className="mt-2 text-2xl font-bold text-app-text">
+                                  {reputationTestResult.score}
+                                </p>
+                              </div>
+
+                              <div className="rounded-2xl border border-app-tile-border bg-slate-50 px-4 py-3">
+                                <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                                  Wynik
+                                </p>
+                                <p className="mt-2 text-sm font-bold text-app-text">
+                                  {reputationTestResult.decision === 'blocked'
+                                    ? 'Zablokowana'
+                                    : reputationTestResult.decision === 'warning'
+                                      ? 'Ostrzeżenie'
+                                      : 'Dozwolona'}
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="mt-4">
+                            <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                              Trafione reguły
+                            </p>
+                            {reputationTestResult.matchedRules.length > 0 ? (
+                              <div className="mt-3 space-y-2">
+                                {reputationTestResult.matchedRules.map((rule) => (
+                                  <div
+                                    key={`${rule.ruleId}-${rule.code}`}
+                                    className="rounded-2xl border border-app-tile-border bg-slate-50 px-4 py-3"
+                                  >
+                                    <div className="flex flex-wrap items-center justify-between gap-3">
+                                      <p className="text-sm font-bold text-app-text">{rule.code}</p>
+                                      <span className="rounded-full border border-app-tile-border bg-white px-3 py-1 text-xs font-bold text-slate-600">
+                                        +{rule.scoreDelta} pkt
+                                      </span>
+                                    </div>
+                                    <p className="mt-2 text-sm leading-6 text-slate-500">
+                                      {rule.message}
+                                    </p>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="mt-3 text-sm text-slate-500">
+                                Brak trafionych reguł dla tego adresu.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                    <div className="flex flex-wrap items-start gap-4">
+                      <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700">
+                        <FiShield aria-hidden="true" className="h-7 w-7" />
+                      </div>
+
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-bold tracking-[0.14em] text-emerald-700 uppercase">
+                          Ocena reputacji
+                        </p>
+                        <h2 className="mt-2 text-2xl font-bold text-app-text">
+                          Jak działa scoring bezpieczeństwa
+                        </h2>
+                        <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">
+                          Każda reguła dodaje punkty do oceny strony. Gdy suma przekroczy próg
+                          warningu, użytkownik zobaczy ostrzeżenie. Gdy przekroczy próg blokady,
+                          strona zostanie zatrzymana.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
+                      <label className="block rounded-[24px] border border-app-tile-border bg-slate-50/80 p-4 transition hover:bg-slate-50">
+                        <span className="flex items-center gap-2 text-sm font-bold text-app-text">
+                          <FiAlertTriangle aria-hidden="true" className="h-4 w-4 text-amber-600" />
+                          Próg warning
+                        </span>
+                        <p className="mt-2 text-sm leading-6 text-slate-500">
+                          Po osiągnięciu tego wyniku pokazujemy ostrzeżenie, ale użytkownik może
+                          jeszcze kontynuować.
+                        </p>
+                        <input
+                          type="number"
+                          min="0"
+                          value={reputationSettings.warningThreshold}
+                          onChange={(event) => {
+                            void applyReputationSettings({
+                              warningThreshold: Math.max(0, Number(event.target.value) || 0)
+                            })
+                          }}
+                          className="focus-ring mt-4 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                        />
+                      </label>
+
+                      <label className="block rounded-[24px] border border-app-tile-border bg-slate-50/80 p-4 transition hover:bg-slate-50">
+                        <span className="flex items-center gap-2 text-sm font-bold text-app-text">
+                          <FiShield aria-hidden="true" className="h-4 w-4 text-red-600" />
+                          Próg blokady
+                        </span>
+                        <p className="mt-2 text-sm leading-6 text-slate-500">
+                          Po osiągnięciu tego wyniku przeglądarka zatrzyma wejście na stronę.
+                        </p>
+                        <input
+                          type="number"
+                          min="0"
+                          value={reputationSettings.blockedThreshold}
+                          onChange={(event) => {
+                            void applyReputationSettings({
+                              blockedThreshold: Math.max(0, Number(event.target.value) || 0)
+                            })
+                          }}
+                          className="focus-ring mt-4 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                    <div>
+                      <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                        Reguły filtracji
+                      </p>
+                      <h2 className="mt-2 text-2xl font-bold text-app-text">
+                        Filtry bezpieczeństwa
+                      </h2>
+                      <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-500">
+                        W tym miejscu konfigurujesz konkretne filtry używane przy sprawdzaniu
+                        domen: regułę HTTP, znaki spoza alfabetu łacińskiego, adres IP, Google
+                        Safe Browsing, wiek domeny oraz aktywne listy ostrzeżeń.
+                      </p>
+                    </div>
+
+                    <div className="mt-6 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div>
+                          <p className="text-lg font-bold text-app-text">
+                            HTTP
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Ta wartość określa, ile punktów dostaje strona działająca bez HTTPS.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.httpEnabled}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  httpEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>{filterSettingsDraft.httpEnabled ? 'Włączona' : 'Wyłączona'}</span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setIsHttpRuleExpanded((current) => !current)
+                            }}
+                            aria-expanded={isHttpRuleExpanded}
+                            aria-label="Rozwiń regułę HTTP"
+                          >
+                          {isHttpRuleExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {isHttpRuleExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <label className="mt-5 block max-w-sm">
+                            <span className="text-sm font-bold text-app-text">Punkty dla HTTP</span>
+                            <input
+                              type="number"
+                              min="0"
+                              value={filterSettingsDraft.httpScore}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  httpScore: Math.max(0, Number(event.target.value) || 0)
+                                }))
+                              }}
+                              className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                            />
+                          </label>
+
+                          <div className="mt-5">
+                            <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                              Efekt
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">
+                              Jeśli strona używa wyłącznie `http`, ta reguła podnosi jej wynik
+                              reputacji o ustawioną liczbę punktów.
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div>
+                          <p className="text-lg font-bold text-app-text">
+                            Podobne do zaufanych domen
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Filtr wykrywa adresy, które wyglądają podobnie do domen z allowlisty,
+                            ale nie są dokładnie tą samą domeną.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.lookalikeTrustedDomainEnabled}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  lookalikeTrustedDomainEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>
+                              {filterSettingsDraft.lookalikeTrustedDomainEnabled
+                                ? 'Włączona'
+                                : 'Wyłączona'}
+                            </span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setIsLookalikeTrustedDomainRuleExpanded((current) => !current)
+                            }}
+                            aria-expanded={isLookalikeTrustedDomainRuleExpanded}
+                            aria-label="Rozwiń regułę podobieństwa do zaufanych domen"
+                          >
+                          {isLookalikeTrustedDomainRuleExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {isLookalikeTrustedDomainRuleExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <label className="mt-5 block max-w-sm">
+                            <span className="text-sm font-bold text-app-text">
+                              Punkty dla domen podobnych do zaufanych
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              value={filterSettingsDraft.lookalikeTrustedDomainScore}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  lookalikeTrustedDomainScore: Math.max(
+                                    0,
+                                    Number(event.target.value) || 0
+                                  )
+                                }))
+                              }}
+                              className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                            />
+                          </label>
+
+                          <div className="mt-5">
+                            <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                              Efekt
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">
+                              Jeśli adres jest bardzo podobny do domeny z allowlisty, ale nie jest
+                              tą samą domeną, do wyniku reputacji zostanie dodane ustawione score.
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div>
+                          <p className="text-lg font-bold text-app-text">
+                            Znaki spoza lacinskich
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Ten filtr wykrywa domeny zawierające litery spoza alfabetu łacińskiego.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.nonLatinEnabled}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  nonLatinEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>{filterSettingsDraft.nonLatinEnabled ? 'Włączona' : 'Wyłączona'}</span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setIsNonLatinRuleExpanded((current) => !current)
+                            }}
+                            aria-expanded={isNonLatinRuleExpanded}
+                            aria-label="Rozwiń regułę znaków spoza łacińskich"
+                          >
+                          {isNonLatinRuleExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {isNonLatinRuleExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <label className="mt-5 block max-w-sm">
+                            <span className="text-sm font-bold text-app-text">
+                              Punkty dla znaków spoza łacińskich
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              value={filterSettingsDraft.nonLatinScore}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  nonLatinScore: Math.max(0, Number(event.target.value) || 0)
+                                }))
+                              }}
+                              className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                            />
+                          </label>
+
+                          <div className="mt-5">
+                            <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                              Efekt
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">
+                              Jeśli domena zawiera litery spoza alfabetu łacińskiego, do wyniku
+                              reputacji zostanie dodane domyślnie 25 punktów.
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-3">
+                            <p className="text-lg font-bold text-app-text">Google Safe Browsing</p>
+                            {!canEnableGoogleSafeBrowsing ? (
+                              <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-bold text-amber-800">
+                                Brak klucza API
+                              </span>
+                            ) : null}
+                          </div>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Filtr sprawdza URL w Google Safe Browsing i może mocno podnieść score
+                            dla phishingu, malware lub niechcianego oprogramowania.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.googleSafeBrowsingEnabled}
+                              disabled={!canEnableGoogleSafeBrowsing}
+                              onChange={(event) => {
+                                if (!canEnableGoogleSafeBrowsing) {
+                                  return
+                                }
+
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  googleSafeBrowsingEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>{filterSettingsDraft.googleSafeBrowsingEnabled ? 'Włączona' : 'Wyłączona'}</span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setIsGoogleSafeBrowsingRuleExpanded((current) => !current)
+                            }}
+                            aria-expanded={isGoogleSafeBrowsingRuleExpanded}
+                            aria-label="Rozwiń regułę Google Safe Browsing"
+                          >
+                          {isGoogleSafeBrowsingRuleExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {isGoogleSafeBrowsingRuleExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Nowy Google Safe Browsing API key
+                              </span>
+                              <input
+                                type="password"
+                                value={googleSafeBrowsingApiKeyInput}
+                                onChange={(event) => {
+                                  setGoogleSafeBrowsingApiKeyInput(event.target.value)
+                                  if (shouldClearGoogleSafeBrowsingApiKey) {
+                                    setShouldClearGoogleSafeBrowsingApiKey(false)
+                                  }
+                                }}
+                                placeholder={
+                                  reputationSettings.googleSafeBrowsingApiKeyConfigured
+                                    ? '••••••••••••••••••••••••••••••••'
+                                    : 'Wklej klucz API Google Safe Browsing'
+                                }
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Punkty dla trafienia Google
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={filterSettingsDraft.googleSafeBrowsingScore}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    googleSafeBrowsingScore: Math.max(
+                                      0,
+                                      Number(event.target.value) || 0
+                                    )
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+                          </div>
+
+                          <div className="mt-4 flex flex-wrap gap-3">
+                            <button
+                              type="button"
+                              className="focus-ring rounded-full border border-app-tile-border bg-white px-4 py-2.5 text-sm font-bold text-app-text"
+                              onClick={() => {
+                                setShouldClearGoogleSafeBrowsingApiKey((current) => !current)
+                                if (!shouldClearGoogleSafeBrowsingApiKey) {
+                                  setGoogleSafeBrowsingApiKeyInput('')
+                                }
+                              }}
+                            >
+                              {shouldClearGoogleSafeBrowsingApiKey
+                                ? 'Anuluj usuwanie klucza'
+                                : 'Usuń klucz API'}
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div>
+                          <p className="text-lg font-bold text-app-text">Adres IP</p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Ten filtr wykrywa wejście bezpośrednio na numer IP zamiast na domenę.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.ipEnabled}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  ipEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>{filterSettingsDraft.ipEnabled ? 'Włączona' : 'Wyłączona'}</span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setIsIpRuleExpanded((current) => !current)
+                            }}
+                            aria-expanded={isIpRuleExpanded}
+                            aria-label="Rozwiń regułę adresu IP"
+                          >
+                          {isIpRuleExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {isIpRuleExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <label className="mt-5 block max-w-sm">
+                            <span className="text-sm font-bold text-app-text">
+                              Punkty dla adresu IP
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              value={filterSettingsDraft.ipScore}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  ipScore: Math.max(0, Number(event.target.value) || 0)
+                                }))
+                              }}
+                              className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                            />
+                          </label>
+
+                          <div className="mt-5">
+                            <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                              Efekt
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">
+                              Jeśli adres prowadzi bezpośrednio na numer IP, do wyniku reputacji
+                              zostanie dodane ustawione score.
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div>
+                          <p className="text-lg font-bold text-app-text">Wiek domeny</p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Filtr sprawdza po RDAP, czy domena jest bardzo młoda i przez to bardziej
+                            podejrzana.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.youngDomainEnabled}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  youngDomainEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>{filterSettingsDraft.youngDomainEnabled ? 'Włączona' : 'Wyłączona'}</span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setIsYoungDomainRuleExpanded((current) => !current)
+                            }}
+                            aria-expanded={isYoungDomainRuleExpanded}
+                            aria-label="Rozwiń regułę wieku domeny"
+                          >
+                          {isYoungDomainRuleExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {isYoungDomainRuleExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Maksymalny wiek domeny w dniach
+                              </span>
+                              <input
+                                type="number"
+                                min="1"
+                                value={filterSettingsDraft.youngDomainMaxAgeDays}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    youngDomainMaxAgeDays: Math.max(
+                                      1,
+                                      Number(event.target.value) || 1
+                                    )
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Punkty dla młodej domeny
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={filterSettingsDraft.youngDomainScore}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    youngDomainScore: Math.max(0, Number(event.target.value) || 0)
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+                          </div>
+
+                          <div className="mt-5">
+                            <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                              Efekt
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">
+                              Jeśli RDAP pokaże, że domena ma nie więcej niż{' '}
+                              {filterSettingsDraft.youngDomainMaxAgeDays} dni, do wyniku reputacji
+                              zostanie dodane ustawione score.
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div className="max-w-3xl">
+                          <p className="text-lg font-bold text-app-text">
+                            Listy ostrzeżeń
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Każda aktywna lista pobierana jest na żywo, a jej punktacja wpływa na
+                            końcowy score reputacji domeny.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.blocklistsEnabled}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  blocklistsEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>{filterSettingsDraft.blocklistsEnabled ? 'Włączona' : 'Wyłączona'}</span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setAreBlocklistsExpanded((current) => !current)
+                            }}
+                            aria-expanded={areBlocklistsExpanded}
+                            aria-label="Rozwiń regułę list ostrzeżeń"
+                          >
+                          {areBlocklistsExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {areBlocklistsExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <form className="mt-5 flex flex-col gap-3 lg:flex-row" onSubmit={handleAddDomainBlocklistSource}>
+                            <input
+                              type="url"
+                              inputMode="url"
+                              value={newDomainBlocklistUrl}
+                              onChange={(event) => setNewDomainBlocklistUrl(event.target.value)}
+                              placeholder="https://example.com/lista.txt"
+                              className="focus-ring min-w-0 flex-1 rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
+                            />
+                            <button
+                              type="submit"
+                              className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text"
+                            >
+                              Dodaj listę
+                            </button>
+                          </form>
+
+                          <div className="mt-5 space-y-3">
+                            {domainBlocklistSourcesDraft.map((source) => (
+                              <div
+                                key={source.id}
+                                className="flex flex-col gap-4 rounded-[24px] border border-app-tile-border bg-white p-5 transition hover:bg-slate-50/90 lg:flex-row lg:items-center lg:justify-between"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <p className="break-all text-sm font-bold text-app-text">{source.url}</p>
+                                    {source.isDefault ? (
+                                      <span className="rounded-full bg-slate-200 px-3 py-1 text-[11px] font-bold tracking-[0.12em] text-slate-600 uppercase">
+                                        Domyślna
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                  <p className="mt-2 text-sm text-slate-500">
+                                    {source.enabled
+                                      ? 'Ta lista jest aktywna i bierze udział w sprawdzaniu reputacji domen.'
+                                      : 'Ta lista jest wyłączona i nie bierze udziału w sprawdzaniu reputacji domen.'}
+                                  </p>
+                                </div>
+
+                                <div className="flex flex-col gap-3 lg:min-w-[340px] lg:items-end">
+                                  <div className="flex flex-wrap items-center gap-3 lg:justify-end">
+                                    <label className="app-no-drag flex items-center gap-3 rounded-full border border-app-tile-border bg-white px-4 py-3 text-sm font-bold text-app-text">
+                                      <input
+                                        type="checkbox"
+                                        className="focus-ring h-5 w-5 rounded border border-app-tile-border accent-[#1e3a8a]"
+                                        checked={source.enabled}
+                                        onChange={(event) => {
+                                          updateDomainBlocklistSourceDraft(source.id, {
+                                            enabled: event.target.checked
+                                          })
+                                        }}
+                                      />
+                                      <span>{source.enabled ? 'Włączona' : 'Wyłączona'}</span>
+                                    </label>
+
+                                    <label className="block min-w-[190px]">
+                                      <span className="text-xs font-bold tracking-[0.12em] text-slate-500 uppercase">
+                                        Punkty listy
+                                      </span>
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        value={source.scoreDelta}
+                                        onChange={(event) => {
+                                          updateDomainBlocklistSourceDraft(source.id, {
+                                            scoreDelta: Math.max(0, Number(event.target.value) || 0)
+                                          })
+                                        }}
+                                        className="focus-ring mt-2 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                                      />
+                                    </label>
+                                    {!source.isDefault ? (
+                                      <button
+                                        type="button"
+                                        className="focus-ring flex h-11 w-11 items-center justify-center rounded-full border border-red-200 bg-red-50 text-red-600 transition hover:bg-red-100"
+                                        aria-label={`Usuń listę ${source.url}`}
+                                        onClick={() => {
+                                          void handleRemoveDomainBlocklistSource(source.id)
+                                        }}
+                                      >
+                                        <FiTrash2 aria-hidden="true" className="h-4 w-4" />
+                                      </button>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-[24px] border border-dashed border-app-tile-border bg-slate-50/70 px-5 py-4">
+                      <p className="text-sm text-slate-500">
+                        {hasFilterSettingsChanges
+                          ? 'Masz niezapisane zmiany w filtrach.'
+                          : 'Wszystkie ustawienia filtrów są zapisane.'}
+                      </p>
+                      <button
+                        type="button"
+                        disabled={!hasFilterSettingsChanges || isSavingFilterSettings}
+                        className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-not-allowed disabled:opacity-60"
+                        onClick={() => {
+                          void handleSaveFilterSettings()
+                        }}
+                      >
+                        {isSavingFilterSettings ? 'Zapisywanie...' : 'Zapisz'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="max-w-3xl">
+                        <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          Trusted Domains
+                        </p>
+                        <h2 className="mt-2 text-2xl font-bold text-app-text">
+                          Zaufane źródła whitelisty
+                        </h2>
+                        <p className="mt-3 text-sm leading-6 text-slate-500">
+                          Te źródła budują lokalną bazę zaufanych domen w SQLite. Whitelista nie
+                          omija blocklist ani Google Safe Browsing, ale może obniżać czułość części
+                          heurystyk.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 rounded-[24px] border border-app-tile-border bg-slate-50/70 p-5">
+                      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                        <div className="max-w-2xl">
+                          <p className="text-lg font-bold text-app-text">
+                            Własne domeny allowlisty
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Dodane tutaj domeny będą traktowane jako zaufane i ominą reguły
+                            reputacji strony. Wpisuj tylko domeny, którym naprawdę ufasz.
+                          </p>
+                        </div>
+                        <form
+                          className="flex w-full flex-col gap-3 sm:flex-row lg:max-w-xl"
+                          onSubmit={(event) => {
+                            void handleAddCustomTrustedDomain(event)
+                          }}
+                        >
+                          <label className="min-w-0 flex-1">
+                            <span className="sr-only">Domena do dodania do allowlisty</span>
+                            <input
+                              type="text"
+                              value={newCustomTrustedDomain}
+                              onChange={(event) => {
+                                setNewCustomTrustedDomain(event.target.value)
+                              }}
+                              placeholder="example.com"
+                              className="focus-ring w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
+                            />
+                          </label>
+                          <button
+                            type="submit"
+                            className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-not-allowed disabled:opacity-60"
+                            disabled={newCustomTrustedDomain.trim().length === 0}
+                          >
+                            Dodaj domenę
+                          </button>
+                        </form>
+                      </div>
+
+                      <div className="mt-5">
+                        {customTrustedDomains.length > 0 ? (
+                          <div className="overflow-hidden rounded-2xl border border-app-tile-border bg-white">
+                            {customTrustedDomains.map((entry) => (
+                              <div
+                                key={entry.domain}
+                                className="flex flex-col gap-3 border-b border-app-tile-border px-4 py-4 last:border-b-0 sm:flex-row sm:items-center sm:justify-between"
+                              >
+                                <div className="min-w-0">
+                                  <p className="break-all text-sm font-bold text-app-text">
+                                    {entry.domain}
+                                  </p>
+                                  <p className="mt-1 text-xs text-slate-500">
+                                    Dodano:{' '}
+                                    {new Date(entry.createdAt).toLocaleString('pl-PL')}
+                                  </p>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="focus-ring inline-flex items-center justify-center gap-2 self-start rounded-full border border-red-200 bg-red-50 px-4 py-2 text-sm font-bold text-red-600 transition hover:bg-red-100 sm:self-center"
+                                  aria-label={`Usuń domenę ${entry.domain} z allowlisty`}
+                                  onClick={() => {
+                                    void handleRemoveCustomTrustedDomain(entry.domain)
+                                  }}
+                                >
+                                  <FiX aria-hidden="true" className="h-4 w-4" />
+                                  Usuń
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="rounded-2xl border border-dashed border-app-tile-border bg-white px-4 py-3 text-sm text-slate-500">
+                            Nie dodano jeszcze własnych zaufanych domen.
+                          </p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="mt-5 space-y-3">
+                      {trustedDomainSources.filter((source) => source.kind === 'tranco').map((source) => (
+                        <div
+                          key={source.id}
+                          className="rounded-[24px] border border-app-tile-border bg-slate-50/70 p-5"
+                        >
+                          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <p className="text-lg font-bold text-app-text">{source.name}</p>
+                                {source.isDefault ? (
+                                  <span className="rounded-full bg-slate-200 px-3 py-1 text-[11px] font-bold tracking-[0.12em] text-slate-600 uppercase">
+                                    Domyślna
+                                  </span>
+                                ) : null}
+                              </div>
+                              <p className="mt-2 break-all text-sm text-slate-500">{source.url}</p>
+                              <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-500">
+                                <span className="rounded-full border border-app-tile-border bg-white px-3 py-1">
+                                  Limit: {source.maxDomains.toLocaleString('pl-PL')}
+                                </span>
+                                <span className="rounded-full border border-app-tile-border bg-white px-3 py-1">
+                                  Domeny: {source.lastDomainCount.toLocaleString('pl-PL')}
+                                </span>
+                                <span className="rounded-full border border-app-tile-border bg-white px-3 py-1">
+                                  Ostatnia synchronizacja:{' '}
+                                  {source.lastSyncedAt
+                                    ? new Date(source.lastSyncedAt).toLocaleString('pl-PL')
+                                    : 'brak'}
+                                </span>
+                              </div>
+                              {source.lastSyncError ? (
+                                <div className="mt-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                                  {source.lastSyncError}
+                                </div>
+                              ) : null}
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-3 lg:justify-end">
+                              <label className="app-no-drag flex items-center gap-3 rounded-full border border-app-tile-border bg-white px-4 py-3 text-sm font-bold text-app-text">
+                                <input
+                                  type="checkbox"
+                                  className="focus-ring h-5 w-5 rounded border border-app-tile-border accent-[#1e3a8a]"
+                                  checked={source.enabled}
+                                  onChange={(event) => {
+                                    void handleToggleTrustedDomainSource(
+                                      source.id,
+                                      event.target.checked
+                                    )
+                                  }}
+                                />
+                                <span>{source.enabled ? 'Włączona' : 'Wyłączona'}</span>
+                              </label>
+
+                              <button
+                                type="button"
+                                className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-wait disabled:opacity-70"
+                                disabled={syncingTrustedDomainSourceId === source.id}
+                                onClick={() => {
+                                  void handleSyncTrustedDomainSource(source.id)
+                                }}
+                              >
+                                {syncingTrustedDomainSourceId === source.id
+                                  ? 'Synchronizacja...'
+                                  : 'Synchronizuj'}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           </section>
           {adminGateModal}
