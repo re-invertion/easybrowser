@@ -26,6 +26,7 @@ type BrowserState = {
         | 'domain-blocklist'
         | 'non-latin-script'
         | 'lookalike-trusted-domain'
+        | 'trusted-domain-in-subdomain'
         | 'is-ip'
         | 'google-safe-browsing'
         | 'young-domain-age'
@@ -84,6 +85,7 @@ type ReputationSettings = {
     | 'domain-blocklist'
         | 'non-latin-script'
         | 'lookalike-trusted-domain'
+        | 'trusted-domain-in-subdomain'
     | 'is-ip'
     | 'google-safe-browsing'
     | 'young-domain-age'
@@ -94,6 +96,7 @@ type ReputationSettings = {
       | 'domain-blocklist'
         | 'non-latin-script'
         | 'lookalike-trusted-domain'
+        | 'trusted-domain-in-subdomain'
       | 'is-ip'
       | 'google-safe-browsing'
       | 'young-domain-age',
@@ -113,6 +116,7 @@ type ReputationAssessmentPreview = {
       | 'domain-blocklist'
         | 'non-latin-script'
         | 'lookalike-trusted-domain'
+        | 'trusted-domain-in-subdomain'
       | 'is-ip'
       | 'google-safe-browsing'
       | 'young-domain-age'
@@ -122,6 +126,22 @@ type ReputationAssessmentPreview = {
     code: string
     message: string
   }>
+}
+type SecurityEventLog = {
+  id: string
+  userId: string | null
+  url: string
+  hostname: string | null
+  decision: 'warning' | 'blocked'
+  eventCode: string
+  score: number
+  matchedRules: Array<{
+    ruleId: string
+    scoreDelta: number
+    severity: string
+    code: string
+  }>
+  createdAt: string
 }
 type DomainBlocklistSource = {
   id: string
@@ -200,6 +220,8 @@ contextBridge.exposeInMainWorld('easybrowser', {
     ipcRenderer.invoke('reputation:set-google-safe-browsing-api-key', value) as Promise<ReputationSettings>,
   assessReputationUrl: (rawUrl: string) =>
     ipcRenderer.invoke('reputation:assess-url', rawUrl) as Promise<ReputationAssessmentPreview>,
+  getSecurityEventLogs: () =>
+    ipcRenderer.invoke('security-events:list-recent') as Promise<SecurityEventLog[]>,
   getDomainBlocklistSources: () =>
     ipcRenderer.invoke('domain-blocklists:get-sources') as Promise<DomainBlocklistSource[]>,
   addDomainBlocklistSource: (url: string) =>

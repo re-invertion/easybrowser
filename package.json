@@ -10,6 +10,7 @@
     "dev": "sh -c 'unset ELECTRON_RUN_AS_NODE DISPLAY; export XDG_SESSION_TYPE=wayland ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_LOGGING=1; if [ -d /mnt/wslg/runtime-dir ]; then export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir; export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}; fi; exec electron-vite dev -- --enable-features=UseOzonePlatform --ozone-platform=wayland'",
     "dev:windows": "electron-vite dev",
     "dev:xvfb": "env -u ELECTRON_RUN_AS_NODE xvfb-run -a ./node_modules/.bin/electron-vite dev",
+    "test": "tsx scripts/reputation.test.ts",
     "build": "tsc --noEmit && electron-vite build",
     "preview": "sh -c 'unset ELECTRON_RUN_AS_NODE DISPLAY; export XDG_SESSION_TYPE=wayland ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_LOGGING=1; if [ -d /mnt/wslg/runtime-dir ]; then export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir; export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}; fi; exec electron-vite preview -- --enable-features=UseOzonePlatform --ozone-platform=wayland'"
   },
@@ -33,6 +34,7 @@
     "electron-vite": "^3.1.0",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.11",
+    "tsx": "^4.23.1",
     "typescript": "^5.8.3",
     "vite": "^6.3.5"
   }
