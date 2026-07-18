@@ -27,6 +27,7 @@ declare global {
           | 'domain-blocklist'
         | 'non-latin-script'
         | 'lookalike-trusted-domain'
+        | 'trusted-domain-in-subdomain'
           | 'is-ip'
           | 'google-safe-browsing'
           | 'young-domain-age'
@@ -86,6 +87,7 @@ declare global {
       | 'domain-blocklist'
         | 'non-latin-script'
         | 'lookalike-trusted-domain'
+        | 'trusted-domain-in-subdomain'
       | 'is-ip'
       | 'google-safe-browsing'
       | 'young-domain-age'
@@ -96,6 +98,7 @@ declare global {
         | 'domain-blocklist'
         | 'non-latin-script'
         | 'lookalike-trusted-domain'
+        | 'trusted-domain-in-subdomain'
         | 'is-ip'
         | 'google-safe-browsing'
         | 'young-domain-age',
@@ -116,6 +119,7 @@ declare global {
         | 'domain-blocklist'
         | 'non-latin-script'
         | 'lookalike-trusted-domain'
+        | 'trusted-domain-in-subdomain'
         | 'is-ip'
         | 'google-safe-browsing'
         | 'young-domain-age'
@@ -125,6 +129,23 @@ declare global {
       code: string
       message: string
     }>
+  }
+
+  type SecurityEventLog = {
+    id: string
+    userId: string | null
+    url: string
+    hostname: string | null
+    decision: 'warning' | 'blocked'
+    eventCode: string
+    score: number
+    matchedRules: Array<{
+      ruleId: string
+      scoreDelta: number
+      severity: string
+      code: string
+    }>
+    createdAt: string
   }
 
   type DomainBlocklistSource = {
@@ -195,6 +216,7 @@ declare global {
       ) => Promise<ReputationSettings>
       setGoogleSafeBrowsingApiKey: (value: string | null) => Promise<ReputationSettings>
       assessReputationUrl: (rawUrl: string) => Promise<ReputationAssessmentPreview>
+      getSecurityEventLogs: () => Promise<SecurityEventLog[]>
       getDomainBlocklistSources: () => Promise<DomainBlocklistSource[]>
       addDomainBlocklistSource: (url: string) => Promise<DomainBlocklistSource[]>
       setDomainBlocklistSourceEnabled: (

@@ -178,10 +178,18 @@ Easybrowser is a very simple and security-focused browser based on Electron.
   - Detects domains that are not trusted themselves but look very similar to a trusted domain.
   - The rule compares the registrable domain against enabled trusted domains.
   - It uses a lightweight skeleton for common substitutions such as `0` to `o`, `1` to `l`, and similar characters.
+  - The skeleton also maps common Cyrillic and Greek confusable characters to Latin equivalents.
   - It also uses a small edit-distance threshold to catch close typos.
+  - Trusted domains store precomputed `label`, `skeleton`, and `label_length` metadata in SQLite so navigation checks do not need to recompute every trusted domain.
+  - SQLite indexes on `skeleton` and `label_length` support a fast shortlist before edit-distance comparison.
   - The rule adds warning score and can be configured from the admin panel.
   - This rule is intentionally heuristic and local; it does not use an external model or remote reputation API.
   - Exact trusted-domain matches are allowed before this rule runs, so the rule only affects similar but different domains.
+- `trusted-domain-in-subdomain`
+  - Detects addresses where a trusted domain appears inside the subdomain while the real registrable domain is different.
+  - This catches bait patterns such as `paypal.com.example.net`, where the visible beginning may look trustworthy but the actual site is `example.net`.
+  - It also detects trusted brand labels in unofficial subdomains, such as `paypal.fake.xyz`, when the trusted label has at least five characters.
+  - The rule adds warning score and can be configured from the admin panel.
 - `is-ip`
   - Detects direct navigation to an IP address instead of a named domain.
 - `google-safe-browsing`
@@ -239,6 +247,9 @@ Easybrowser is a very simple and security-focused browser based on Electron.
 ## Security Events
 - Security events are stored in the `security_events` table.
 - A security event is currently written when reputation filters produce a warning or block intervention.
+- The admin panel Security tab exposes recent warning/block events in a right-side slide-out panel.
+- The log viewer shows events from the last 30 days, newest first.
+- At most 500 recent events are returned to the UI in one read.
 - Each stored event contains:
   - generated event id,
   - current user id when available,
@@ -248,6 +259,10 @@ Easybrowser is a very simple and security-focused browser based on Electron.
   - event code,
   - JSON details with score and matched rule metadata,
   - creation timestamp.
+- Events older than 30 days are purged automatically:
+  - during application database initialization,
+  - before writing a new security event,
+  - before listing events for the admin panel.
 - These events are local application state and are encrypted as part of the shared SQLite payload.
 
 ## Permissions
@@ -293,7 +308,8 @@ Easybrowser is a very simple and security-focused browser based on Electron.
   - warning and block thresholds,
   - remote blocklist source management,
   - trusted-domain source management,
-  - Google Safe Browsing API key management.
+  - Google Safe Browsing API key management,
+  - recent security event logs from the last 30 days in a slide-out side panel.
 - The panel content scrolls inside the panel area and does not scroll the custom window chrome.
 
 ## Accessibility
@@ -330,8 +346,10 @@ Easybrowser is a very simple and security-focused browser based on Electron.
   - configured trusted-domain source metadata, including Tranco and the internal manual source.
 - `trusted_domains`
   - trusted domain rows imported from enabled trusted sources or added manually by the administrator.
+  - stores lookalike metadata: `label`, `skeleton`, and `label_length`.
 - `security_events`
   - local records of warning/block security decisions.
+  - retained for 30 days and exposed in the admin Security tab side panel.
 
 ## Encryption Model
 - The SQLite database bytes are exported from `sql.js`.

@@ -19,9 +19,22 @@ import {
 import fs from 'node:fs'
 import { isIP } from 'node:net'
 import path from 'node:path'
-import { domainToUnicode } from 'node:url'
 import initSqlJs from 'sql.js'
-import { getDomain, getPublicSuffix, getSubdomain } from 'tldts'
+import { getDomain } from 'tldts'
+import {
+  getTrustedDomainLookalikeMetadata,
+  isLookalikeDomain
+} from './lookalike'
+import {
+  extractDomainBlocklistHostnames,
+  getHostnameFromUrl,
+  hasNonLatinLetters,
+  isHostnameBlocked,
+  isTrustedDomainEntryMentionedInSubdomain,
+  normalizeHostname,
+  normalizeSiteCandidate,
+  type NormalizedSiteCandidate
+} from './reputationCore'
 
 type SqlJsModule = Awaited<ReturnType<typeof initSqlJs>>
 type SqlJsDatabase = InstanceType<SqlJsModule['Database']>
@@ -82,24 +95,10 @@ type ReputationRuleId =
   | 'domain-blocklist'
   | 'non-latin-script'
   | 'lookalike-trusted-domain'
+  | 'trusted-domain-in-subdomain'
   | 'is-ip'
   | 'google-safe-browsing'
   | 'young-domain-age'
-type NormalizedSiteCandidate = {
-  rawUrl: string
-  normalizedUrl: string
-  protocol: 'http:' | 'https:'
-  hostname: string
-  asciiHostname: string
-  unicodeHostname: string
-  registrableDomain: string | null
-  publicSuffix: string | null
-  subdomain: string | null
-  isIp: boolean
-  port: string | null
-  path: string
-  query: string
-}
 type ReputationRuleResult = {
   ruleId: ReputationRuleId
   matched: boolean
@@ -128,6 +127,23 @@ type ReputationInterventionState = {
   message: string
   canContinue: boolean
   matchedRules: ReputationRuleResult[]
+}
+type SecurityEventLogRule = {
+  ruleId: string
+  scoreDelta: number
+  severity: string
+  code: string
+}
+type SecurityEventLog = {
+  id: string
+  userId: string | null
+  url: string
+  hostname: string | null
+  decision: Exclude<ReputationDecision, 'allow'>
+  eventCode: string
+  score: number
+  matchedRules: SecurityEventLogRule[]
+  createdAt: string
 }
 type ReputationSettings = {
   enabled: boolean
@@ -243,6 +259,7 @@ const DOMAIN_BLOCKLIST_FETCH_TIMEOUT_MS = 8_000
 const DEFAULT_DOMAIN_BLOCKLIST_SCORE_DELTA = 100
 const DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA = 25
 const DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA = 60
+const DEFAULT_TRUSTED_DOMAIN_IN_SUBDOMAIN_SCORE_DELTA = 50
 const DEFAULT_IP_ADDRESS_SCORE_DELTA = 40
 const DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA = 100
 const DEFAULT_YOUNG_DOMAIN_SCORE_DELTA = 35
@@ -260,6 +277,9 @@ const GOOGLE_SAFE_BROWSING_ENDPOINT =
 const GOOGLE_SAFE_BROWSING_FETCH_TIMEOUT_MS = 5_000
 const GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS = 1000 * 60 * 5
 const TRUSTED_DOMAINS_FETCH_TIMEOUT_MS = 15_000
+const SECURITY_EVENT_RETENTION_DAYS = 30
+const SECURITY_EVENT_RETENTION_MS = SECURITY_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000
+const SECURITY_EVENT_LIST_LIMIT = 500
 const DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT = '2026-07-08T00:00:00.000Z'
 const DEFAULT_TRUSTED_DOMAIN_SOURCES: TrustedDomainSource[] = [
   {
@@ -605,6 +625,7 @@ function normalizeReputationSettings(value: unknown): ReputationSettings {
       ruleWeights: {
         'non-latin-script': DEFAULT_NON_LATIN_SCRIPT_SCORE_DELTA,
         'lookalike-trusted-domain': DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA,
+        'trusted-domain-in-subdomain': DEFAULT_TRUSTED_DOMAIN_IN_SUBDOMAIN_SCORE_DELTA,
         'is-ip': DEFAULT_IP_ADDRESS_SCORE_DELTA,
         'google-safe-browsing': DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA
       },
@@ -621,6 +642,7 @@ function normalizeReputationSettings(value: unknown): ReputationSettings {
           value === 'domain-blocklist' ||
           value === 'non-latin-script' ||
           value === 'lookalike-trusted-domain' ||
+          value === 'trusted-domain-in-subdomain' ||
           value === 'is-ip' ||
           value === 'google-safe-browsing' ||
           value === 'young-domain-age'
@@ -663,6 +685,11 @@ function normalizeReputationSettings(value: unknown): ReputationSettings {
         Number.isFinite(nextRuleWeights['lookalike-trusted-domain'])
           ? Math.max(0, Math.floor(nextRuleWeights['lookalike-trusted-domain']))
           : DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA,
+      'trusted-domain-in-subdomain':
+        typeof nextRuleWeights['trusted-domain-in-subdomain'] === 'number' &&
+        Number.isFinite(nextRuleWeights['trusted-domain-in-subdomain'])
+          ? Math.max(0, Math.floor(nextRuleWeights['trusted-domain-in-subdomain']))
+          : DEFAULT_TRUSTED_DOMAIN_IN_SUBDOMAIN_SCORE_DELTA,
       'is-ip':
         typeof nextRuleWeights['is-ip'] === 'number' &&
         Number.isFinite(nextRuleWeights['is-ip'])
@@ -1160,6 +1187,9 @@ function applyTrustedDomainsDatabaseSchema(database: SqlJsDatabase): void {
     CREATE TABLE IF NOT EXISTS trusted_domains (
       source_id TEXT NOT NULL,
       domain TEXT NOT NULL,
+      label TEXT,
+      skeleton TEXT,
+      label_length INTEGER,
       rank INTEGER,
       created_at TEXT NOT NULL,
       PRIMARY KEY (source_id, domain),
@@ -1186,6 +1216,69 @@ function applyTrustedDomainsDatabaseSchema(database: SqlJsDatabase): void {
     CREATE INDEX IF NOT EXISTS idx_security_events_created_at
       ON security_events(created_at);
   `)
+}
+
+function ensureColumn(database: SqlJsDatabase, tableName: string, columnName: string, definition: string): void {
+  const tableInfo = database.exec(`PRAGMA table_info(${tableName})`)
+  const hasColumn = (tableInfo[0]?.values ?? []).some((row) => row[1] === columnName)
+
+  if (!hasColumn) {
+    database.run(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`)
+  }
+}
+
+function ensureTrustedDomainLookalikeColumns(database: SqlJsDatabase): void {
+  ensureColumn(database, 'trusted_domains', 'label', 'TEXT')
+  ensureColumn(database, 'trusted_domains', 'skeleton', 'TEXT')
+  ensureColumn(database, 'trusted_domains', 'label_length', 'INTEGER')
+  database.run('CREATE INDEX IF NOT EXISTS idx_trusted_domains_skeleton ON trusted_domains(skeleton)')
+  database.run(
+    'CREATE INDEX IF NOT EXISTS idx_trusted_domains_label_length ON trusted_domains(label_length)'
+  )
+}
+
+function backfillTrustedDomainLookalikeMetadata(database: SqlJsDatabase): void {
+  const statement = database.prepare(`
+    SELECT source_id, domain
+    FROM trusted_domains
+    WHERE label IS NULL OR skeleton IS NULL OR label_length IS NULL
+  `)
+  const rows: Array<{ sourceId: string; domain: string }> = []
+
+  while (statement.step()) {
+    const row = statement.getAsObject() as Record<string, unknown>
+    rows.push({
+      sourceId: String(row.source_id),
+      domain: String(row.domain)
+    })
+  }
+
+  statement.free()
+
+  if (rows.length === 0) {
+    return
+  }
+
+  const updateStatement = database.prepare(`
+    UPDATE trusted_domains
+    SET label = $label,
+        skeleton = $skeleton,
+        label_length = $labelLength
+    WHERE source_id = $sourceId AND domain = $domain
+  `)
+
+  for (const row of rows) {
+    const metadata = getTrustedDomainLookalikeMetadata(row.domain)
+    updateStatement.run({
+      $label: metadata.label,
+      $skeleton: metadata.skeleton,
+      $labelLength: metadata.labelLength,
+      $sourceId: row.sourceId,
+      $domain: row.domain
+    })
+  }
+
+  updateStatement.free()
 }
 
 function saveTrustedDomainsDatabase(database: SqlJsDatabase): void {
@@ -1304,6 +1397,12 @@ function ensureAppDatabaseDefaults(database: SqlJsDatabase): void {
       ruleId: 'lookalike-trusted-domain',
       enabled: true,
       scoreDelta: DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
+      ruleId: 'trusted-domain-in-subdomain',
+      enabled: true,
+      scoreDelta: DEFAULT_TRUSTED_DOMAIN_IN_SUBDOMAIN_SCORE_DELTA,
       severity: 'warning'
     },
     {
@@ -1453,7 +1552,10 @@ async function initializeAppDatabase(): Promise<void> {
   }
 
   applyTrustedDomainsDatabaseSchema(appDatabase)
+  ensureTrustedDomainLookalikeColumns(appDatabase)
   ensureAppDatabaseDefaults(appDatabase)
+  backfillTrustedDomainLookalikeMetadata(appDatabase)
+  purgeExpiredSecurityEvents(appDatabase)
   saveTrustedDomainsDatabase(appDatabase)
 }
 
@@ -1465,12 +1567,94 @@ function getAppDatabase(): SqlJsDatabase {
   return appDatabase
 }
 
+function getSecurityEventRetentionCutoff(): string {
+  return new Date(Date.now() - SECURITY_EVENT_RETENTION_MS).toISOString()
+}
+
+function purgeExpiredSecurityEvents(database = getAppDatabase()): void {
+  database.run('DELETE FROM security_events WHERE created_at < $cutoff', {
+    $cutoff: getSecurityEventRetentionCutoff()
+  })
+}
+
+function parseSecurityEventDetails(value: unknown): Pick<SecurityEventLog, 'score' | 'matchedRules'> {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return { score: 0, matchedRules: [] }
+  }
+
+  try {
+    const parsedValue = JSON.parse(value) as {
+      score?: unknown
+      matchedRules?: unknown
+    }
+    const matchedRules = Array.isArray(parsedValue.matchedRules)
+      ? parsedValue.matchedRules
+          .filter((rule): rule is Record<string, unknown> => Boolean(rule) && typeof rule === 'object')
+          .map((rule) => ({
+            ruleId: typeof rule.ruleId === 'string' ? rule.ruleId : 'unknown',
+            scoreDelta: Number(rule.scoreDelta) || 0,
+            severity: typeof rule.severity === 'string' ? rule.severity : 'warning',
+            code: typeof rule.code === 'string' ? rule.code : 'unknown'
+          }))
+      : []
+
+    return {
+      score: Number(parsedValue.score) || 0,
+      matchedRules
+    }
+  } catch {
+    return { score: 0, matchedRules: [] }
+  }
+}
+
+function listRecentSecurityEvents(): SecurityEventLog[] {
+  const database = getAppDatabase()
+  purgeExpiredSecurityEvents(database)
+
+  const statement = database.prepare(`
+    SELECT id, user_id, url, hostname, decision, event_code, details_json, created_at
+    FROM security_events
+    WHERE created_at >= $cutoff
+    ORDER BY created_at DESC
+    LIMIT $limit
+  `)
+  statement.bind({
+    $cutoff: getSecurityEventRetentionCutoff(),
+    $limit: SECURITY_EVENT_LIST_LIMIT
+  })
+
+  const rows: SecurityEventLog[] = []
+
+  while (statement.step()) {
+    const row = statement.getAsObject() as Record<string, unknown>
+    const details = parseSecurityEventDetails(row.details_json)
+    const decision = row.decision === 'blocked' ? 'blocked' : 'warning'
+
+    rows.push({
+      id: String(row.id),
+      userId: typeof row.user_id === 'string' ? row.user_id : null,
+      url: String(row.url),
+      hostname: typeof row.hostname === 'string' ? row.hostname : null,
+      decision,
+      eventCode: String(row.event_code),
+      score: details.score,
+      matchedRules: details.matchedRules,
+      createdAt: String(row.created_at)
+    })
+  }
+
+  statement.free()
+  saveTrustedDomainsDatabase(database)
+  return rows
+}
+
 function recordSecurityEvent(
   assessment: ReputationAssessment,
   interventionState: ReputationInterventionState
 ): void {
   try {
     const database = getAppDatabase()
+    purgeExpiredSecurityEvents(database)
     database.run(
       `
         INSERT INTO security_events (
@@ -1572,16 +1756,24 @@ async function addCustomTrustedDomain(value: string): Promise<CustomTrustedDomai
 
   const database = await getTrustedDomainsDatabase()
   const now = new Date().toISOString()
+  const metadata = getTrustedDomainLookalikeMetadata(normalizedDomain)
 
   database.run(
     `
-      INSERT INTO trusted_domains (source_id, domain, rank, created_at)
-      VALUES ($sourceId, $domain, NULL, $createdAt)
+      INSERT INTO trusted_domains (
+        source_id, domain, label, skeleton, label_length, rank, created_at
+      )
+      VALUES (
+        $sourceId, $domain, $label, $skeleton, $labelLength, NULL, $createdAt
+      )
       ON CONFLICT(source_id, domain) DO NOTHING
     `,
     {
       $sourceId: MANUAL_TRUSTED_DOMAIN_SOURCE_ID,
       $domain: normalizedDomain,
+      $label: metadata.label,
+      $skeleton: metadata.skeleton,
+      $labelLength: metadata.labelLength,
       $createdAt: now
     }
   )
@@ -1724,14 +1916,22 @@ async function syncTrustedDomainSource(sourceId: string): Promise<TrustedDomainS
       })
 
       const insertStatement = database.prepare(`
-        INSERT INTO trusted_domains (source_id, domain, rank, created_at)
-        VALUES ($sourceId, $domain, $rank, $createdAt)
+        INSERT INTO trusted_domains (
+          source_id, domain, label, skeleton, label_length, rank, created_at
+        )
+        VALUES (
+          $sourceId, $domain, $label, $skeleton, $labelLength, $rank, $createdAt
+        )
       `)
 
       for (const domain of domains) {
+        const metadata = getTrustedDomainLookalikeMetadata(domain.domain)
         insertStatement.run({
           $sourceId: source.id,
           $domain: domain.domain,
+          $label: metadata.label,
+          $skeleton: metadata.skeleton,
+          $labelLength: metadata.labelLength,
           $rank: domain.rank,
           $createdAt: now
         })
@@ -1809,7 +2009,7 @@ async function isTrustedDomain(hostname: string): Promise<boolean> {
   const database = await getTrustedDomainsDatabase()
   const statement = database.prepare(
     `
-      SELECT td.domain
+      SELECT td.domain, td.label
       FROM trusted_domains td
       INNER JOIN trusted_sources ts ON ts.id = td.source_id
       WHERE ts.enabled = 1 AND (td.domain = $hostname OR $hostname LIKE '%.' || td.domain)
@@ -2189,33 +2389,6 @@ function isSafeBrowserUrl(rawUrl: string): boolean {
   }
 }
 
-function normalizeHostname(value: string): string | null {
-  const trimmed = value.trim().toLowerCase().replace(/\.+$/g, '').replace(/^\*\./, '').replace(/^\./, '')
-
-  if (trimmed.length === 0) {
-    return null
-  }
-
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(trimmed)) {
-    return trimmed
-  }
-
-  if (!/^[a-z0-9.-]+$/i.test(trimmed)) {
-    return null
-  }
-
-  return trimmed
-}
-
-function getHostnameFromUrl(rawUrl: string): string | null {
-  try {
-    const parsedUrl = new URL(rawUrl)
-    return normalizeHostname(parsedUrl.hostname)
-  } catch {
-    return null
-  }
-}
-
 function loadReputationSettings(): ReputationSettings {
   const browserSettings = loadBrowserSettings()
   const hasApiKey = hasGoogleSafeBrowsingApiKey(browserSettings)
@@ -2328,47 +2501,6 @@ function getDomainBlocklistEventCode(sourceUrl: string): string {
   return `phising-detected-list-filter:${sourceHostname}`
 }
 
-function extractDomainBlocklistHostnames(payload: string): Set<string> {
-  const hostnames = new Set<string>()
-
-  for (const rawLine of payload.split(/\r?\n/)) {
-    const commentIndex = rawLine.indexOf('#')
-    const line = (commentIndex >= 0 ? rawLine.slice(0, commentIndex) : rawLine).trim()
-
-    if (line.length === 0) {
-      continue
-    }
-
-    const tokens = line.split(/\s+/).filter(Boolean)
-
-    for (const token of tokens) {
-      let nextHostname: string | null = null
-
-      if (/^https?:\/\//i.test(token)) {
-        nextHostname = getHostnameFromUrl(token)
-      } else {
-        nextHostname = normalizeHostname(token)
-      }
-
-      if (nextHostname) {
-        hostnames.add(nextHostname)
-      }
-    }
-  }
-
-  return hostnames
-}
-
-function isHostnameBlocked(hostname: string, blockedEntries: Set<string>): string | null {
-  for (const blockedEntry of blockedEntries) {
-    if (hostname === blockedEntry || hostname.endsWith(`.${blockedEntry}`)) {
-      return blockedEntry
-    }
-  }
-
-  return null
-}
-
 function setReputationIntervention(value: ReputationInterventionState | null): void {
   reputationInterventionState = value
   updateBrowserBounds()
@@ -2413,33 +2545,6 @@ async function fetchDomainBlocklistSourceEntries(source: DomainBlocklistSource):
   return extractDomainBlocklistHostnames(payload)
 }
 
-function normalizeSiteCandidate(rawUrl: string): NormalizedSiteCandidate {
-  const parsedUrl = new URL(rawUrl)
-  const asciiHostname = normalizeHostname(parsedUrl.hostname)
-
-  if (!asciiHostname) {
-    throw new Error(`Nie udało się znormalizować hosta dla adresu: ${rawUrl}`)
-  }
-
-  const unicodeHostname = domainToUnicode(asciiHostname).toLowerCase() || asciiHostname
-
-  return {
-    rawUrl,
-    normalizedUrl: parsedUrl.toString(),
-    protocol: parsedUrl.protocol as 'http:' | 'https:',
-    hostname: asciiHostname,
-    asciiHostname,
-    unicodeHostname,
-    registrableDomain: getDomain(asciiHostname) ?? null,
-    publicSuffix: getPublicSuffix(asciiHostname) ?? null,
-    subdomain: getSubdomain(asciiHostname) || null,
-    isIp: isIP(asciiHostname) !== 0,
-    port: parsedUrl.port || null,
-    path: parsedUrl.pathname,
-    query: parsedUrl.search
-  }
-}
-
 function getRuleScoreDelta(
   ruleId: ReputationRuleId,
   fallbackScoreDelta: number,
@@ -2448,130 +2553,151 @@ function getRuleScoreDelta(
   return settings.ruleWeights[ruleId] ?? fallbackScoreDelta
 }
 
-function hasNonLatinLetters(value: string): boolean {
-  for (const char of value) {
-    if (!/\p{Letter}/u.test(char)) {
-      continue
-    }
-
-    if (!/\p{Script=Latin}/u.test(char)) {
-      return true
-    }
-  }
-
-  return false
-}
-
-function getDomainLabelForLookalike(domain: string): string {
-  return domain.split('.')[0]?.toLowerCase() ?? domain.toLowerCase()
-}
-
-function getLookalikeSkeleton(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[0]/g, 'o')
-    .replace(/[1!|]/g, 'l')
-    .replace(/[3]/g, 'e')
-    .replace(/[4@]/g, 'a')
-    .replace(/[5$]/g, 's')
-    .replace(/[7]/g, 't')
-    .replace(/[8]/g, 'b')
-}
-
-function getLevenshteinDistance(left: string, right: string): number {
-  if (left === right) {
-    return 0
-  }
-
-  if (left.length === 0) {
-    return right.length
-  }
-
-  if (right.length === 0) {
-    return left.length
-  }
-
-  const previous = Array.from({ length: right.length + 1 }, (_value, index) => index)
-  const current = Array.from({ length: right.length + 1 }, () => 0)
-
-  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
-    current[0] = leftIndex
-
-    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
-      const substitutionCost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1
-      current[rightIndex] = Math.min(
-        current[rightIndex - 1] + 1,
-        previous[rightIndex] + 1,
-        previous[rightIndex - 1] + substitutionCost
-      )
-    }
-
-    for (let index = 0; index < previous.length; index += 1) {
-      previous[index] = current[index]
-    }
-  }
-
-  return previous[right.length] ?? Number.MAX_SAFE_INTEGER
-}
-
-function isLookalikeDomain(candidateDomain: string, trustedDomain: string): boolean {
-  if (candidateDomain === trustedDomain) {
-    return false
-  }
-
-  const candidateLabel = getDomainLabelForLookalike(candidateDomain)
-  const trustedLabel = getDomainLabelForLookalike(trustedDomain)
-
-  if (candidateLabel.length < 4 || trustedLabel.length < 4) {
-    return false
-  }
-
-  if (Math.abs(candidateLabel.length - trustedLabel.length) > 2) {
-    return false
-  }
-
-  const candidateSkeleton = getLookalikeSkeleton(candidateLabel)
-  const trustedSkeleton = getLookalikeSkeleton(trustedLabel)
-
-  if (candidateSkeleton === trustedSkeleton) {
-    return true
-  }
-
-  const maxDistance = Math.max(candidateSkeleton.length, trustedSkeleton.length) <= 6 ? 1 : 2
-  return getLevenshteinDistance(candidateSkeleton, trustedSkeleton) <= maxDistance
-}
-
 async function findLookalikeTrustedDomain(candidateDomain: string): Promise<string | null> {
   const database = await getTrustedDomainsDatabase()
-  const labelLength = getDomainLabelForLookalike(candidateDomain).length
-  const statement = database.prepare(
+  const metadata = getTrustedDomainLookalikeMetadata(candidateDomain)
+  const exactSkeletonStatement = database.prepare(
     `
       SELECT td.domain
       FROM trusted_domains td
       INNER JOIN trusted_sources ts ON ts.id = td.source_id
       WHERE ts.enabled = 1
         AND td.domain != $domain
-        AND length(td.domain) BETWEEN $minLength AND $maxLength
+        AND td.skeleton = $skeleton
       ORDER BY ts.kind = 'manual' DESC, td.rank IS NULL ASC, td.rank ASC
-      LIMIT 500
+      LIMIT 1
     `,
     {
       $domain: candidateDomain,
-      $minLength: Math.max(1, candidateDomain.length - 4),
-      $maxLength: candidateDomain.length + 4
+      $skeleton: metadata.skeleton
     }
   )
 
   try {
-    while (statement.step()) {
-      const row = statement.getAsObject() as Record<string, unknown>
+    if (exactSkeletonStatement.step()) {
+      const row = exactSkeletonStatement.getAsObject() as Record<string, unknown>
+      return String(row.domain)
+    }
+  } finally {
+    exactSkeletonStatement.free()
+  }
+
+  const manualStatement = database.prepare(
+    `
+      SELECT td.domain
+      FROM trusted_domains td
+      INNER JOIN trusted_sources ts ON ts.id = td.source_id
+      WHERE ts.enabled = 1
+        AND ts.kind = 'manual'
+        AND td.domain != $domain
+        AND td.label_length BETWEEN $minLabelLength AND $maxLabelLength
+      ORDER BY td.domain COLLATE NOCASE ASC
+    `,
+    {
+      $domain: candidateDomain,
+      $minLabelLength: Math.max(1, metadata.labelLength - 2),
+      $maxLabelLength: metadata.labelLength + 2
+    }
+  )
+
+  try {
+    while (manualStatement.step()) {
+      const row = manualStatement.getAsObject() as Record<string, unknown>
       const trustedDomain = String(row.domain)
 
-      if (Math.abs(getDomainLabelForLookalike(trustedDomain).length - labelLength) > 2) {
-        continue
+      if (isLookalikeDomain(candidateDomain, trustedDomain)) {
+        return trustedDomain
       }
+    }
+  } finally {
+    manualStatement.free()
+  }
+
+  const trancoStatement = database.prepare(
+    `
+      SELECT td.domain
+      FROM trusted_domains td
+      INNER JOIN trusted_sources ts ON ts.id = td.source_id
+      WHERE ts.enabled = 1
+        AND ts.kind = 'tranco'
+        AND td.domain != $domain
+        AND td.label_length BETWEEN $minLabelLength AND $maxLabelLength
+      ORDER BY td.rank IS NULL ASC, td.rank ASC
+      LIMIT 1000
+    `,
+    {
+      $domain: candidateDomain,
+      $minLabelLength: Math.max(1, metadata.labelLength - 2),
+      $maxLabelLength: metadata.labelLength + 2
+    }
+  )
+
+  try {
+    while (trancoStatement.step()) {
+      const row = trancoStatement.getAsObject() as Record<string, unknown>
+      const trustedDomain = String(row.domain)
 
       if (isLookalikeDomain(candidateDomain, trustedDomain)) {
+        return trustedDomain
+      }
+    }
+  } finally {
+    trancoStatement.free()
+  }
+
+  return null
+}
+
+async function findTrustedDomainMentionedInSubdomain(
+  candidate: NormalizedSiteCandidate
+): Promise<string | null> {
+  if (!candidate.registrableDomain || !candidate.subdomain || candidate.isIp) {
+    return null
+  }
+
+  const subdomain = candidate.subdomain.toLowerCase()
+  const database = await getTrustedDomainsDatabase()
+  const statement = database.prepare(
+    `
+      SELECT td.domain
+      FROM trusted_domains td
+      INNER JOIN trusted_sources ts ON ts.id = td.source_id
+      WHERE ts.enabled = 1
+        AND td.domain != $registrableDomain
+        AND (
+          $subdomain = td.domain
+          OR $subdomain LIKE td.domain || '.%'
+          OR $subdomain LIKE '%.' || td.domain
+          OR $subdomain LIKE '%.' || td.domain || '.%'
+          OR (
+            td.label_length >= 5
+            AND (
+              $subdomain = td.label
+              OR $subdomain LIKE td.label || '.%'
+              OR $subdomain LIKE '%.' || td.label
+              OR $subdomain LIKE '%.' || td.label || '.%'
+              OR $subdomain LIKE td.label || '-%'
+              OR $subdomain LIKE '%-' || td.label
+              OR $subdomain LIKE '%-' || td.label || '-%'
+            )
+          )
+        )
+      ORDER BY ts.kind = 'manual' DESC, td.rank IS NULL ASC, td.rank ASC
+      LIMIT 1
+    `,
+    {
+      $registrableDomain: candidate.registrableDomain,
+      $subdomain: subdomain
+    }
+  )
+
+  try {
+    if (statement.step()) {
+      const row = statement.getAsObject() as Record<string, unknown>
+      const trustedDomain = String(row.domain)
+      const trustedLabel = typeof row.label === 'string' ? row.label : null
+
+      if (isTrustedDomainEntryMentionedInSubdomain(candidate, trustedDomain, trustedLabel)) {
         return trustedDomain
       }
     }
@@ -2904,6 +3030,31 @@ async function evaluateLookalikeTrustedDomainRule(
   }
 }
 
+async function evaluateTrustedDomainInSubdomainRule(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult | null> {
+  const matchedTrustedDomain = await findTrustedDomainMentionedInSubdomain(candidate)
+
+  if (!matchedTrustedDomain) {
+    return null
+  }
+
+  return {
+    ruleId: 'trusted-domain-in-subdomain',
+    matched: true,
+    scoreDelta: getRuleScoreDelta(
+      'trusted-domain-in-subdomain',
+      DEFAULT_TRUSTED_DOMAIN_IN_SUBDOMAIN_SCORE_DELTA,
+      settings
+    ),
+    severity: 'warning',
+    code: `trusted-domain-in-subdomain:${matchedTrustedDomain}`,
+    message:
+      'Subdomena zawiera nazwę zaufanej domeny, ale prawdziwa domena strony jest inna.'
+  }
+}
+
 async function evaluateIpAddressRule(
   candidate: NormalizedSiteCandidate,
   settings: ReputationSettings
@@ -3021,6 +3172,10 @@ async function assessNavigationReputation(rawUrl: string): Promise<ReputationAss
     {
       id: 'lookalike-trusted-domain' as const,
       evaluate: evaluateLookalikeTrustedDomainRule
+    },
+    {
+      id: 'trusted-domain-in-subdomain' as const,
+      evaluate: evaluateTrustedDomainInSubdomainRule
     },
     {
       id: 'is-ip' as const,
@@ -4444,6 +4599,10 @@ ipcMain.handle('reputation:set-google-safe-browsing-api-key', (_event, value: st
 
 ipcMain.handle('reputation:assess-url', (_event, rawUrl: string) => {
   return assessReputationPreview(rawUrl)
+})
+
+ipcMain.handle('security-events:list-recent', () => {
+  return listRecentSecurityEvents()
 })
 
 ipcMain.handle('domain-blocklists:get-sources', () => {
