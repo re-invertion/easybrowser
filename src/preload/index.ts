@@ -13,6 +13,14 @@ type BrowserState = {
   hasCameraAccess: boolean
   isFavorite: boolean
   browserFaviconUrl: string | null
+  reputationStatus: {
+    url: string
+    score: number
+    decision: 'allow' | 'warning' | 'blocked'
+    warningThreshold: number
+    blockedThreshold: number
+    matchedRuleCount: number
+  } | null
   reputationIntervention: {
     url: string
     decision: 'warning' | 'blocked'
@@ -21,15 +29,7 @@ type BrowserState = {
     message: string
     canContinue: boolean
     matchedRules: Array<{
-      ruleId:
-        | 'insecure-http'
-        | 'domain-blocklist'
-        | 'non-latin-script'
-        | 'lookalike-trusted-domain'
-        | 'trusted-domain-in-subdomain'
-        | 'is-ip'
-        | 'google-safe-browsing'
-        | 'young-domain-age'
+      ruleId: ReputationRuleId
       matched: boolean
       scoreDelta: number
       severity: 'warning' | 'blocking'
@@ -76,33 +76,29 @@ type AdminPinStatus = {
 type AccessibilitySettings = {
   visibleFocus: boolean
 }
+type ReputationRuleId =
+  | 'insecure-http'
+  | 'domain-blocklist'
+  | 'non-latin-script'
+  | 'lookalike-trusted-domain'
+  | 'trusted-domain-in-subdomain'
+  | 'is-ip'
+  | 'google-safe-browsing'
+  | 'young-domain-age'
+  | 'url-risk-pattern'
+  | 'content-sensitive-form'
+  | 'content-cross-origin-form'
+  | 'content-brand-impersonation'
+  | 'content-urgent-language'
+  | 'content-suspicious-iframe'
+  | 'content-download-risk'
+  | 'content-threat-link-catalog'
 type ReputationSettings = {
   enabled: boolean
   warningThreshold: number
   blockedThreshold: number
-  disabledRuleIds: Array<
-    | 'insecure-http'
-    | 'domain-blocklist'
-        | 'non-latin-script'
-        | 'lookalike-trusted-domain'
-        | 'trusted-domain-in-subdomain'
-    | 'is-ip'
-    | 'google-safe-browsing'
-    | 'young-domain-age'
-  >
-  ruleWeights: Partial<
-    Record<
-      | 'insecure-http'
-      | 'domain-blocklist'
-        | 'non-latin-script'
-        | 'lookalike-trusted-domain'
-        | 'trusted-domain-in-subdomain'
-      | 'is-ip'
-      | 'google-safe-browsing'
-      | 'young-domain-age',
-      number
-    >
-  >
+  disabledRuleIds: ReputationRuleId[]
+  ruleWeights: Partial<Record<ReputationRuleId, number>>
   youngDomainMaxAgeDays: number
   googleSafeBrowsingApiKeyConfigured: boolean
 }
@@ -111,15 +107,7 @@ type ReputationAssessmentPreview = {
   score: number
   decision: 'allow' | 'warning' | 'blocked'
   matchedRules: Array<{
-    ruleId:
-      | 'insecure-http'
-      | 'domain-blocklist'
-        | 'non-latin-script'
-        | 'lookalike-trusted-domain'
-        | 'trusted-domain-in-subdomain'
-      | 'is-ip'
-      | 'google-safe-browsing'
-      | 'young-domain-age'
+    ruleId: ReputationRuleId
     matched: boolean
     scoreDelta: number
     severity: 'warning' | 'blocking'
@@ -169,6 +157,22 @@ type TrustedDomainSource = {
 type CustomTrustedDomain = {
   domain: string
   createdAt: string
+}
+type SecurityTooltipPayload = {
+  anchor: {
+    left: number
+    right: number
+    bottom: number
+  }
+  label: string
+  description: string
+  detail: string | null
+  color: string
+  score: number | null
+  decision: 'allow' | 'warning' | 'blocked' | null
+  warningThreshold: number | null
+  blockedThreshold: number | null
+  matchedRuleCount: number | null
 }
 
 contextBridge.exposeInMainWorld('easybrowser', {
@@ -248,6 +252,9 @@ contextBridge.exposeInMainWorld('easybrowser', {
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),
   copyText: (value: string) => ipcRenderer.invoke('clipboard:copy-text', value),
+  showSecurityTooltip: (payload: SecurityTooltipPayload) =>
+    ipcRenderer.invoke('security-tooltip:show', payload),
+  hideSecurityTooltip: () => ipcRenderer.invoke('security-tooltip:hide'),
   setBrowserChromeHeight: (height: number) =>
     ipcRenderer.invoke('browser:set-chrome-height', height),
   onBrowserStateChange: (callback: (state: BrowserState) => void) => {
