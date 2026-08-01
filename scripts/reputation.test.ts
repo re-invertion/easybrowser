@@ -35,6 +35,23 @@ function assertSameMembers<T>(actual: Iterable<T>, expected: Iterable<T>): void 
   assert.deepEqual(Array.from(actual).sort(), Array.from(expected).sort())
 }
 
+const GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD = 3
+
+function getGenericTrustedLabels(trustedDomains: string[]): Set<string> {
+  const counts = new Map<string, number>()
+
+  for (const domain of trustedDomains) {
+    const label = getTrustedDomainLookalikeMetadata(domain).label
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+
+  return new Set(
+    Array.from(counts.entries())
+      .filter(([, count]) => count >= GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD)
+      .map(([label]) => label)
+  )
+}
+
 function getRuleIdsForScenario(input: {
   url: string
   trustedDomains?: string[]
@@ -59,6 +76,7 @@ function getRuleIdsForScenario(input: {
   }
 
   const trustedDomains = input.trustedDomains ?? []
+  const genericTrustedLabels = getGenericTrustedLabels(trustedDomains)
   const blocklistedDomains = new Set(input.blocklistedDomains ?? [])
   const ruleIds: string[] = []
   let score = 0
@@ -92,7 +110,8 @@ function getRuleIdsForScenario(input: {
       isTrustedDomainEntryMentionedInSubdomain(
         candidate,
         domain,
-        getTrustedDomainLookalikeMetadata(domain).label
+        getTrustedDomainLookalikeMetadata(domain).label,
+        genericTrustedLabels.has(getTrustedDomainLookalikeMetadata(domain).label)
       )
     )
   ) {
@@ -135,7 +154,8 @@ function getRuleIdsForScenario(input: {
       candidate,
       trustedDomains.map((domain) => ({
         domain,
-        label: getTrustedDomainLookalikeMetadata(domain).label
+        label: getTrustedDomainLookalikeMetadata(domain).label,
+        isGenericLabel: genericTrustedLabels.has(getTrustedDomainLookalikeMetadata(domain).label)
       }))
     )
 
@@ -428,6 +448,34 @@ test('trusted domain in subdomain catches brand label surrounded by dot labels',
   assert.equal(isTrustedDomainEntryMentionedInSubdomain(candidate, 'paypal.com', 'paypal'), true)
 })
 
+test('trusted domain in subdomain ignores generic trusted labels', () => {
+  const candidate = normalizeSiteCandidate('https://portalpacjenta.cmp.med.pl')
+
+  assert.equal(
+    isTrustedDomainEntryMentionedInSubdomain(
+      candidate,
+      'portalpacjenta.gov.pl',
+      'portalpacjenta',
+      true
+    ),
+    false
+  )
+})
+
+test('trusted domain in subdomain still catches full generic trusted domain mentions', () => {
+  const candidate = normalizeSiteCandidate('https://portalpacjenta.gov.pl.fake.xyz')
+
+  assert.equal(
+    isTrustedDomainEntryMentionedInSubdomain(
+      candidate,
+      'portalpacjenta.gov.pl',
+      'portalpacjenta',
+      true
+    ),
+    true
+  )
+})
+
 test('trusted domain in subdomain ignores official domain and direct subdomains', () => {
   const direct = normalizeSiteCandidate('https://paypal.com')
   const officialSubdomain = normalizeSiteCandidate('https://login.paypal.com')
@@ -599,6 +647,16 @@ test('analyzePageContent detects trusted brand mentioned on unofficial domain', 
   )
 
   assert(findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores generic trusted service label mentions', () => {
+  const findings = analyzePageContent(
+    '<title>Portal pacjenta</title><main>Zaloguj się do portalu pacjenta.</main><form><input type="password"></form>',
+    normalizeSiteCandidate('https://portalpacjenta.cmp.med.pl'),
+    [{ domain: 'portalpacjenta.gov.pl', label: 'portalpacjenta', isGenericLabel: true }]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
 })
 
 test('analyzePageContent ignores trusted brand on official domain', () => {
@@ -967,6 +1025,21 @@ test('scenario scoring catches trusted brand in unofficial subdomain as warning'
   assert.equal(result.score, 50)
   assert.equal(result.decision, 'warning')
   assert.deepEqual(result.ruleIds, ['trusted-domain-in-subdomain'])
+})
+
+test('scenario scoring ignores generic trusted service label in subdomain', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://portalpacjenta.cmp.med.pl',
+    trustedDomains: [
+      'portalpacjenta.gov.pl',
+      'portalpacjenta.example.pl',
+      'portalpacjenta.medical.example'
+    ]
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
 })
 
 test('scenario scoring does not flag official trusted subdomain as brand-in-subdomain', () => {

@@ -321,6 +321,7 @@ const GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS = 1000 * 60 * 5
 const TRUSTED_DOMAINS_FETCH_TIMEOUT_MS = 15_000
 const CONTENT_ANALYSIS_FETCH_TIMEOUT_MS = 6_000
 const CONTENT_ANALYSIS_MAX_HTML_CHARS = 500_000
+const GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD = 3
 const SECURITY_EVENT_RETENTION_DAYS = 30
 const SECURITY_EVENT_RETENTION_MS = SECURITY_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000
 const SECURITY_EVENT_LIST_LIMIT = 500
@@ -3122,7 +3123,13 @@ async function findLookalikeTrustedDomain(candidateDomain: string): Promise<stri
   const metadata = getTrustedDomainLookalikeMetadata(candidateDomain)
   const exactSkeletonStatement = database.prepare(
     `
-      SELECT td.domain
+      SELECT td.domain, td.label,
+        (
+          SELECT COUNT(DISTINCT td2.domain)
+          FROM trusted_domains td2
+          INNER JOIN trusted_sources ts2 ON ts2.id = td2.source_id
+          WHERE ts2.enabled = 1 AND td2.label = td.label
+        ) AS label_domain_count
       FROM trusted_domains td
       INNER JOIN trusted_sources ts ON ts.id = td.source_id
       WHERE ts.enabled = 1
@@ -3247,7 +3254,7 @@ async function findTrustedDomainMentionedInSubdomain(
           )
         )
       ORDER BY ts.kind = 'manual' DESC, td.rank IS NULL ASC, td.rank ASC
-      LIMIT 1
+      LIMIT 50
     `,
     {
       $registrableDomain: candidate.registrableDomain,
@@ -3256,12 +3263,22 @@ async function findTrustedDomainMentionedInSubdomain(
   )
 
   try {
-    if (statement.step()) {
+    while (statement.step()) {
       const row = statement.getAsObject() as Record<string, unknown>
       const trustedDomain = String(row.domain)
       const trustedLabel = typeof row.label === 'string' ? row.label : null
+      const labelDomainCount = Number(row.label_domain_count) || 0
+      const isGenericTrustedLabel =
+        labelDomainCount >= GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD
 
-      if (isTrustedDomainEntryMentionedInSubdomain(candidate, trustedDomain, trustedLabel)) {
+      if (
+        isTrustedDomainEntryMentionedInSubdomain(
+          candidate,
+          trustedDomain,
+          trustedLabel,
+          isGenericTrustedLabel
+        )
+      ) {
         return trustedDomain
       }
     }
@@ -3275,7 +3292,13 @@ async function findTrustedDomainMentionedInSubdomain(
 async function loadContentTrustedBrands(): Promise<ContentTrustedBrand[]> {
   const database = await getTrustedDomainsDatabase()
   const statement = database.prepare(`
-    SELECT td.domain, td.label
+    SELECT td.domain, td.label,
+      (
+        SELECT COUNT(DISTINCT td2.domain)
+        FROM trusted_domains td2
+        INNER JOIN trusted_sources ts2 ON ts2.id = td2.source_id
+        WHERE ts2.enabled = 1 AND td2.label = td.label
+      ) AS label_domain_count
     FROM trusted_domains td
     INNER JOIN trusted_sources ts ON ts.id = td.source_id
     WHERE ts.enabled = 1
@@ -3291,9 +3314,14 @@ async function loadContentTrustedBrands(): Promise<ContentTrustedBrand[]> {
       const row = statement.getAsObject() as Record<string, unknown>
       const domain = typeof row.domain === 'string' ? row.domain : ''
       const label = typeof row.label === 'string' ? row.label : ''
+      const labelDomainCount = Number(row.label_domain_count) || 0
 
       if (domain && label) {
-        brands.push({ domain, label })
+        brands.push({
+          domain,
+          label,
+          isGenericLabel: labelDomainCount >= GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD
+        })
       }
     }
   } finally {

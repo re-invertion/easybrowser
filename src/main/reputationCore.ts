@@ -21,6 +21,7 @@ export type NormalizedSiteCandidate = {
 export type ContentTrustedBrand = {
   domain: string
   label: string
+  isGenericLabel?: boolean
 }
 
 export type ContentAnalysisFindingId =
@@ -236,15 +237,21 @@ function extractForms(html: string): HtmlForm[] {
 function containsBrand(value: string, brand: ContentTrustedBrand): boolean {
   const label = brand.label.toLowerCase()
   const domain = brand.domain.toLowerCase()
+  const lowerValue = value.toLowerCase()
 
   if (label.length < 5) {
+    return lowerValue.includes(domain)
+  }
+
+  if (lowerValue.includes(domain)) {
+    return true
+  }
+
+  if (brand.isGenericLabel) {
     return false
   }
 
-  return (
-    new RegExp(`(^|[^a-z0-9])${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(value) ||
-    value.toLowerCase().includes(domain)
-  )
+  return new RegExp(`(^|[^a-z0-9])${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(value)
 }
 
 export function analyzePageContent(
@@ -549,7 +556,8 @@ export function isTrustedDomainEntryMentionedInSubdomain(
     'asciiHostname' | 'registrableDomain' | 'subdomain' | 'isIp'
   >,
   trustedDomain: string,
-  trustedLabel?: string | null
+  trustedLabel?: string | null,
+  isGenericTrustedLabel = false
 ): boolean {
   if (!candidate.registrableDomain || !candidate.subdomain || candidate.isIp) {
     return false
@@ -578,7 +586,7 @@ export function isTrustedDomainEntryMentionedInSubdomain(
 
   const label = (trustedLabel ?? normalizedTrustedDomain.split('.')[0] ?? '').toLowerCase()
 
-  if (label.length < 5) {
+  if (label.length < 5 || isGenericTrustedLabel) {
     return false
   }
 
