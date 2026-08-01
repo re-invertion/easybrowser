@@ -305,6 +305,12 @@ test('government domain detection trusts public gov suffixes only', () => {
   assert.equal(isGovernmentDomainCandidate(normalizeSiteCandidate('https://www.gov.pl')), true)
   assert.equal(
     isGovernmentDomainCandidate(
+      normalizeSiteCandidate('https://login.gov.pl/login/SingleSignOnService')
+    ),
+    true
+  )
+  assert.equal(
+    isGovernmentDomainCandidate(
       normalizeSiteCandidate('https://find-and-update.company-information.service.gov.uk')
     ),
     true
@@ -480,6 +486,11 @@ test('trusted domain matching allows normal first-party subdomains', () => {
 test('trusted domain matching does not trust private hosting tenant subdomains', () => {
   assert.equal(isTrustedDomainMatchAllowed('testsafebrowsing.appspot.com', 'appspot.com'), false)
   assert.equal(isTrustedDomainMatchAllowed('example.github.io', 'github.io'), false)
+})
+
+test('trusted domain matching allows government public suffix subdomains', () => {
+  assert.equal(isTrustedDomainMatchAllowed('login.gov.pl', 'gov.pl'), true)
+  assert.equal(isTrustedDomainMatchAllowed('find-and-update.company-information.service.gov.uk', 'gov.uk'), true)
 })
 
 test('trusted domain matching still allows exact private hosting domains', () => {
@@ -831,6 +842,18 @@ test('scenario scoring always allows public gov suffix domains', () => {
     url: 'https://find-and-update.company-information.service.gov.uk/s/phishing.html',
     trustedDomains: ['company-information.service.gov.uk'],
     html: '<title>Security alert</title><form><input type="password"></form>'
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
+test('scenario scoring allows login.gov.pl SSO under gov.pl', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://login.gov.pl/login/SingleSignOnService',
+    trustedDomains: ['gov.pl'],
+    html: '<title>Login.gov.pl</title><form><input type="password"></form>'
   })
 
   assert.equal(result.score, 0)

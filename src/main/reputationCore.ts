@@ -511,6 +511,12 @@ export function isGovernmentDomainCandidate(
   return candidate.publicSuffix === 'gov' || candidate.publicSuffix.startsWith('gov.')
 }
 
+function isGovernmentPublicSuffix(value: string): boolean {
+  const publicSuffix = getPublicSuffix(value)
+
+  return publicSuffix === value && (value === 'gov' || value.startsWith('gov.'))
+}
+
 export function isTrustedDomainMatchAllowed(hostname: string, trustedDomain: string): boolean {
   const normalizedHostname = normalizeHostname(hostname)
   const normalizedTrustedDomain = normalizeHostname(trustedDomain)
@@ -525,6 +531,10 @@ export function isTrustedDomainMatchAllowed(hostname: string, trustedDomain: str
 
   if (!normalizedHostname.endsWith(`.${normalizedTrustedDomain}`)) {
     return false
+  }
+
+  if (isGovernmentPublicSuffix(normalizedTrustedDomain)) {
+    return true
   }
 
   const privateRegistrableDomain =
