@@ -266,6 +266,7 @@ const googleSafeBrowsingCache = new Map<string, CachedSafeBrowsingEntry>()
 let rdapBootstrapCache: RdapBootstrap | null = null
 let sqlJsModulePromise: Promise<SqlJsModule> | null = null
 let appDatabase: SqlJsDatabase | null = null
+let genericTrustedLabelCache: Set<string> | null = null
 
 const DEFAULT_USERS: UserProfile[] = []
 
@@ -1336,6 +1337,7 @@ function ensureTrustedDomainLookalikeColumns(database: SqlJsDatabase): void {
   database.run(
     'CREATE INDEX IF NOT EXISTS idx_trusted_domains_label_length ON trusted_domains(label_length)'
   )
+  database.run('CREATE INDEX IF NOT EXISTS idx_trusted_domains_label ON trusted_domains(label)')
 }
 
 function backfillTrustedDomainLookalikeMetadata(database: SqlJsDatabase): void {
@@ -1383,6 +1385,7 @@ function backfillTrustedDomainLookalikeMetadata(database: SqlJsDatabase): void {
 }
 
 function saveTrustedDomainsDatabase(database: SqlJsDatabase): void {
+  genericTrustedLabelCache = null
   const encryptedPayload = encryptTrustedDomainsDatabasePayload(database.export())
   fs.writeFileSync(getTrustedDomainsDatabasePath(), encryptedPayload, 'utf8')
 }
@@ -3123,13 +3126,7 @@ async function findLookalikeTrustedDomain(candidateDomain: string): Promise<stri
   const metadata = getTrustedDomainLookalikeMetadata(candidateDomain)
   const exactSkeletonStatement = database.prepare(
     `
-      SELECT td.domain, td.label,
-        (
-          SELECT COUNT(DISTINCT td2.domain)
-          FROM trusted_domains td2
-          INNER JOIN trusted_sources ts2 ON ts2.id = td2.source_id
-          WHERE ts2.enabled = 1 AND td2.label = td.label
-        ) AS label_domain_count
+      SELECT td.domain
       FROM trusted_domains td
       INNER JOIN trusted_sources ts ON ts.id = td.source_id
       WHERE ts.enabled = 1
@@ -3219,6 +3216,46 @@ async function findLookalikeTrustedDomain(candidateDomain: string): Promise<stri
   return null
 }
 
+async function loadGenericTrustedLabels(): Promise<Set<string>> {
+  if (genericTrustedLabelCache) {
+    return genericTrustedLabelCache
+  }
+
+  const database = await getTrustedDomainsDatabase()
+  const statement = database.prepare(
+    `
+      SELECT td.label
+      FROM trusted_domains td
+      INNER JOIN trusted_sources ts ON ts.id = td.source_id
+      WHERE ts.enabled = 1
+        AND td.label IS NOT NULL
+        AND td.label_length >= 5
+      GROUP BY td.label
+      HAVING COUNT(DISTINCT td.domain) >= $threshold
+    `,
+    {
+      $threshold: GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD
+    }
+  )
+  const labels = new Set<string>()
+
+  try {
+    while (statement.step()) {
+      const row = statement.getAsObject() as Record<string, unknown>
+      const label = typeof row.label === 'string' ? row.label : ''
+
+      if (label) {
+        labels.add(label)
+      }
+    }
+  } finally {
+    statement.free()
+  }
+
+  genericTrustedLabelCache = labels
+  return labels
+}
+
 async function findTrustedDomainMentionedInSubdomain(
   candidate: NormalizedSiteCandidate
 ): Promise<string | null> {
@@ -3228,9 +3265,10 @@ async function findTrustedDomainMentionedInSubdomain(
 
   const subdomain = candidate.subdomain.toLowerCase()
   const database = await getTrustedDomainsDatabase()
+  const genericTrustedLabels = await loadGenericTrustedLabels()
   const statement = database.prepare(
     `
-      SELECT td.domain
+      SELECT td.domain, td.label
       FROM trusted_domains td
       INNER JOIN trusted_sources ts ON ts.id = td.source_id
       WHERE ts.enabled = 1
@@ -3267,9 +3305,8 @@ async function findTrustedDomainMentionedInSubdomain(
       const row = statement.getAsObject() as Record<string, unknown>
       const trustedDomain = String(row.domain)
       const trustedLabel = typeof row.label === 'string' ? row.label : null
-      const labelDomainCount = Number(row.label_domain_count) || 0
       const isGenericTrustedLabel =
-        labelDomainCount >= GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD
+        typeof trustedLabel === 'string' && genericTrustedLabels.has(trustedLabel)
 
       if (
         isTrustedDomainEntryMentionedInSubdomain(
@@ -3291,14 +3328,9 @@ async function findTrustedDomainMentionedInSubdomain(
 
 async function loadContentTrustedBrands(): Promise<ContentTrustedBrand[]> {
   const database = await getTrustedDomainsDatabase()
+  const genericTrustedLabels = await loadGenericTrustedLabels()
   const statement = database.prepare(`
-    SELECT td.domain, td.label,
-      (
-        SELECT COUNT(DISTINCT td2.domain)
-        FROM trusted_domains td2
-        INNER JOIN trusted_sources ts2 ON ts2.id = td2.source_id
-        WHERE ts2.enabled = 1 AND td2.label = td.label
-      ) AS label_domain_count
+    SELECT td.domain, td.label
     FROM trusted_domains td
     INNER JOIN trusted_sources ts ON ts.id = td.source_id
     WHERE ts.enabled = 1
@@ -3314,13 +3346,12 @@ async function loadContentTrustedBrands(): Promise<ContentTrustedBrand[]> {
       const row = statement.getAsObject() as Record<string, unknown>
       const domain = typeof row.domain === 'string' ? row.domain : ''
       const label = typeof row.label === 'string' ? row.label : ''
-      const labelDomainCount = Number(row.label_domain_count) || 0
 
       if (domain && label) {
         brands.push({
           domain,
           label,
-          isGenericLabel: labelDomainCount >= GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD
+          isGenericLabel: genericTrustedLabels.has(label)
         })
       }
     }
