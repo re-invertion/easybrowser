@@ -4937,6 +4937,16 @@ function wireBrowserView(view: WebContentsView): void {
       return
     }
 
+    if (
+      isSafeBrowserUrl(navigationUrl) &&
+      isGovernmentDomainCandidate(normalizeSiteCandidate(navigationUrl))
+    ) {
+      setReputationIntervention(null)
+      setDnsFailure(null)
+      lastError = null
+      return
+    }
+
     event.preventDefault()
 
     void (async () => {
