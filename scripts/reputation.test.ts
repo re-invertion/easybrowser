@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { getPublicSuffix } from 'tldts'
 import {
   getDomainLabelForLookalike,
   getLevenshteinDistance,
@@ -37,6 +38,12 @@ function assertSameMembers<T>(actual: Iterable<T>, expected: Iterable<T>): void 
 
 const GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD = 3
 
+function isGovernmentTrustedDomain(domain: string): boolean {
+  const publicSuffix = getPublicSuffix(domain)
+
+  return publicSuffix === 'gov' || publicSuffix?.startsWith('gov.') === true
+}
+
 function getGenericTrustedLabels(trustedDomains: string[]): Set<string> {
   const counts = new Map<string, number>()
 
@@ -47,7 +54,15 @@ function getGenericTrustedLabels(trustedDomains: string[]): Set<string> {
 
   return new Set(
     Array.from(counts.entries())
-      .filter(([, count]) => count >= GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD)
+      .filter(
+        ([label, count]) =>
+          count >= GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD ||
+          trustedDomains.some(
+            (domain) =>
+              getTrustedDomainLookalikeMetadata(domain).label === label &&
+              isGovernmentTrustedDomain(domain)
+          )
+      )
       .map(([label]) => label)
   )
 }
@@ -659,6 +674,22 @@ test('analyzePageContent ignores generic trusted service label mentions', () => 
   assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
 })
 
+test('analyzePageContent ignores government service labels on healthcare portals', () => {
+  const findings = analyzePageContent(
+    `
+      <header><button>Zaloguj</button></header>
+      <main>
+        <h1>Usługi dla pacjenta</h1>
+        <p>Portal Pacjenta LUX MED umożliwia sprawdzenie wizyt i badań.</p>
+      </main>
+    `,
+    normalizeSiteCandidate('https://www.luxmed.pl/dla-pacjenta/uslugi'),
+    [{ domain: 'portalpacjenta.gov.pl', label: 'portalpacjenta', isGenericLabel: true }]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
 test('analyzePageContent ignores trusted brand on official domain', () => {
   const findings = analyzePageContent(
     '<title>PayPal Login</title><main>Verify your PayPal account</main><form><input type="password"></form>',
@@ -1035,6 +1066,24 @@ test('scenario scoring ignores generic trusted service label in subdomain', () =
       'portalpacjenta.example.pl',
       'portalpacjenta.medical.example'
     ]
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
+test('scenario scoring ignores government service labels on first-party healthcare sites', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://www.luxmed.pl/dla-pacjenta/uslugi?utm_source=google',
+    trustedDomains: ['portalpacjenta.gov.pl'],
+    html: `
+      <header><button>Zaloguj</button></header>
+      <main>
+        <h1>Usługi dla pacjenta</h1>
+        <p>Portal Pacjenta LUX MED umożliwia sprawdzenie wizyt i badań.</p>
+      </main>
+    `
   })
 
   assert.equal(result.score, 0)

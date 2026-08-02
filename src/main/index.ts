@@ -20,7 +20,7 @@ import fs from 'node:fs'
 import { isIP } from 'node:net'
 import path from 'node:path'
 import initSqlJs from 'sql.js'
-import { getDomain } from 'tldts'
+import { getDomain, getPublicSuffix } from 'tldts'
 import {
   getTrustedDomainLookalikeMetadata,
   isLookalikeDomain
@@ -357,6 +357,12 @@ const DEFAULT_TRUSTED_DOMAIN_SOURCES: TrustedDomainSource[] = [
     updatedAt: '2026-07-12T00:00:00.000Z'
   }
 ]
+
+function isGovernmentTrustedDomain(domain: string): boolean {
+  const publicSuffix = getPublicSuffix(domain)
+
+  return publicSuffix === 'gov' || publicSuffix?.startsWith('gov.') === true
+}
 const DEFAULT_DOMAIN_BLOCKLIST_SOURCES: DomainBlocklistSource[] = [
   {
     id: 'default-cert-hole',
@@ -3312,7 +3318,8 @@ async function findTrustedDomainMentionedInSubdomain(
       const trustedDomain = String(row.domain)
       const trustedLabel = typeof row.label === 'string' ? row.label : null
       const isGenericTrustedLabel =
-        typeof trustedLabel === 'string' && genericTrustedLabels.has(trustedLabel)
+        isGovernmentTrustedDomain(trustedDomain) ||
+        (typeof trustedLabel === 'string' && genericTrustedLabels.has(trustedLabel))
 
       if (
         isTrustedDomainEntryMentionedInSubdomain(
@@ -3357,7 +3364,7 @@ async function loadContentTrustedBrands(): Promise<ContentTrustedBrand[]> {
         brands.push({
           domain,
           label,
-          isGenericLabel: genericTrustedLabels.has(label)
+          isGenericLabel: isGovernmentTrustedDomain(domain) || genericTrustedLabels.has(label)
         })
       }
     }
