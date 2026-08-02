@@ -11,6 +11,7 @@
     "dev:windows": "electron-vite dev",
     "dev:xvfb": "env -u ELECTRON_RUN_AS_NODE xvfb-run -a ./node_modules/.bin/electron-vite dev",
     "test": "tsx scripts/reputation.test.ts",
+    "test:real-sites": "tsx scripts/reputation-real-sites.test.ts",
     "build": "tsc --noEmit && electron-vite build",
     "preview": "sh -c 'unset ELECTRON_RUN_AS_NODE DISPLAY; export XDG_SESSION_TYPE=wayland ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_LOGGING=1; if [ -d /mnt/wslg/runtime-dir ]; then export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir; export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}; fi; exec electron-vite preview -- --enable-features=UseOzonePlatform --ozone-platform=wayland'"
   },

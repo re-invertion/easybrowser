@@ -1,8 +1,7 @@
-@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap');
 @import "tailwindcss";
 
 :root {
-  font-family: "Atkinson Hyperlegible", sans-serif;
+  font-family: "Atkinson Hyperlegible", "Segoe UI", Verdana, sans-serif;
   color: #111827;
   background: #f8fafc;
 }
@@ -111,6 +110,32 @@ body {
   width: 0.75rem;
   border-radius: 9999px;
   background: currentColor;
+}
+
+.security-level-orb {
+  animation: security-level-breathe 2.8s ease-in-out infinite;
+}
+
+.security-level-orb::after {
+  position: absolute;
+  inset: -3px;
+  border-radius: 9999px;
+  background: inherit;
+  content: "";
+  opacity: 0.18;
+  filter: blur(8px);
+  z-index: -1;
+}
+
+@keyframes security-level-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+
+  50% {
+    transform: scale(1.06);
+  }
 }
 
 button {

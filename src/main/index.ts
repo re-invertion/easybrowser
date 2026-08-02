@@ -20,19 +20,25 @@ import fs from 'node:fs'
 import { isIP } from 'node:net'
 import path from 'node:path'
 import initSqlJs from 'sql.js'
-import { getDomain } from 'tldts'
+import { getDomain, getPublicSuffix } from 'tldts'
 import {
   getTrustedDomainLookalikeMetadata,
   isLookalikeDomain
 } from './lookalike'
 import {
+  analyzePageContent,
   extractDomainBlocklistHostnames,
   getHostnameFromUrl,
   hasNonLatinLetters,
+  isGovernmentDomainCandidate,
   isHostnameBlocked,
+  isTrustedDomainMatchAllowed,
   isTrustedDomainEntryMentionedInSubdomain,
+  normalizeCustomTrustedDomain,
   normalizeHostname,
   normalizeSiteCandidate,
+  type ContentAnalysisFindingId,
+  type ContentTrustedBrand,
   type NormalizedSiteCandidate
 } from './reputationCore'
 
@@ -99,6 +105,8 @@ type ReputationRuleId =
   | 'is-ip'
   | 'google-safe-browsing'
   | 'young-domain-age'
+  | 'url-risk-pattern'
+  | ContentAnalysisFindingId
 type ReputationRuleResult = {
   ruleId: ReputationRuleId
   matched: boolean
@@ -118,6 +126,30 @@ type ReputationAssessmentPreview = {
   score: number
   decision: ReputationDecision
   matchedRules: ReputationRuleResult[]
+}
+type ReputationStatusSnapshot = {
+  url: string
+  score: number
+  decision: ReputationDecision
+  warningThreshold: number
+  blockedThreshold: number
+  matchedRuleCount: number
+} | null
+type SecurityTooltipPayload = {
+  anchor: {
+    left: number
+    right: number
+    bottom: number
+  }
+  label: string
+  description: string
+  detail: string | null
+  color: string
+  score: number | null
+  decision: ReputationDecision | null
+  warningThreshold: number | null
+  blockedThreshold: number | null
+  matchedRuleCount: number | null
 }
 type ReputationInterventionState = {
   url: string
@@ -201,17 +233,28 @@ type CustomTrustedDomain = {
   domain: string
   createdAt: string
 }
+type SsoProvider = {
+  id: string
+  name: string
+  hostname: string
+  enabled: boolean
+  isDefault: boolean
+  createdAt: string
+  updatedAt: string
+}
 type BrowserSettings = {
   accessibility: AccessibilitySettings
   adminSecurity: AdminSecurityStore
   domainBlocklistSources: DomainBlocklistSource[]
   googleSafeBrowsingApiKey: string | null
   reputation: ReputationSettings
+  ssoProviders: SsoProvider[]
 }
 
 let mainWindow: BrowserWindow | null = null
 let browserView: WebContentsView | null = null
 let permissionPromptWindow: BrowserWindow | null = null
+let securityTooltipWindow: BrowserWindow | null = null
 let browserMode: BrowserMode = 'home'
 let lastError: string | null = null
 let browserChromeHeight = 122
@@ -220,7 +263,10 @@ let browserFaviconUrl: string | null = null
 let allowedBrowserNavigationUrl: string | null = null
 let reputationInterventionState: ReputationInterventionState | null = null
 let dnsFailureState: DnsFailureState | null = null
+let lastReputationStatus: ReputationStatusSnapshot = null
 let continuedWarningNavigationUrl: string | null = null
+let activeSsoNavigationFlow: { providerHostname: string; startedAt: number; updatedAt: number } | null =
+  null
 let userStore: UserStore | null = null
 let userMediaPermissionStore: UserMediaPermissionStore | null = null
 let isAdminSessionUnlocked = false
@@ -232,6 +278,7 @@ const googleSafeBrowsingCache = new Map<string, CachedSafeBrowsingEntry>()
 let rdapBootstrapCache: RdapBootstrap | null = null
 let sqlJsModulePromise: Promise<SqlJsModule> | null = null
 let appDatabase: SqlJsDatabase | null = null
+let genericTrustedLabelCache: Set<string> | null = null
 
 const DEFAULT_USERS: UserProfile[] = []
 
@@ -250,7 +297,7 @@ const BROWSER_INPUT_RING_CSS = `
   }
 `
 
-const GOOGLE_HOME_URL = 'https://www.google.pl/?hl=pl&gl=PL&pws=0'
+const DEFAULT_SEARCH_HOME_URL = 'https://www.google.pl/?hl=pl&gl=PL&pws=0'
 const ALLOWED_BROWSER_PERMISSION_ORIGINS = new Set<string>([])
 const ALLOWED_BROWSER_PROTOCOLS = new Set(['https:', 'http:'])
 const ADMIN_PIN_ATTEMPT_LIMIT = 5
@@ -263,6 +310,14 @@ const DEFAULT_TRUSTED_DOMAIN_IN_SUBDOMAIN_SCORE_DELTA = 50
 const DEFAULT_IP_ADDRESS_SCORE_DELTA = 40
 const DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA = 100
 const DEFAULT_YOUNG_DOMAIN_SCORE_DELTA = 35
+const DEFAULT_URL_RISK_PATTERN_SCORE_DELTA = 70
+const DEFAULT_CONTENT_SENSITIVE_FORM_SCORE_DELTA = 30
+const DEFAULT_CONTENT_CROSS_ORIGIN_FORM_SCORE_DELTA = 45
+const DEFAULT_CONTENT_BRAND_IMPERSONATION_SCORE_DELTA = 55
+const DEFAULT_CONTENT_URGENT_LANGUAGE_SCORE_DELTA = 15
+const DEFAULT_CONTENT_SUSPICIOUS_IFRAME_SCORE_DELTA = 25
+const DEFAULT_CONTENT_DOWNLOAD_RISK_SCORE_DELTA = 30
+const DEFAULT_CONTENT_THREAT_LINK_CATALOG_SCORE_DELTA = 70
 const DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS = 30
 const DEFAULT_REPUTATION_WARNING_THRESHOLD = 50
 const DEFAULT_REPUTATION_BLOCKED_THRESHOLD = 70
@@ -277,9 +332,13 @@ const GOOGLE_SAFE_BROWSING_ENDPOINT =
 const GOOGLE_SAFE_BROWSING_FETCH_TIMEOUT_MS = 5_000
 const GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS = 1000 * 60 * 5
 const TRUSTED_DOMAINS_FETCH_TIMEOUT_MS = 15_000
+const CONTENT_ANALYSIS_FETCH_TIMEOUT_MS = 6_000
+const CONTENT_ANALYSIS_MAX_HTML_CHARS = 500_000
+const GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD = 3
 const SECURITY_EVENT_RETENTION_DAYS = 30
 const SECURITY_EVENT_RETENTION_MS = SECURITY_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000
 const SECURITY_EVENT_LIST_LIMIT = 500
+const SSO_NAVIGATION_FLOW_TTL_MS = 5 * 60 * 1000
 const DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT = '2026-07-08T00:00:00.000Z'
 const DEFAULT_TRUSTED_DOMAIN_SOURCES: TrustedDomainSource[] = [
   {
@@ -311,6 +370,12 @@ const DEFAULT_TRUSTED_DOMAIN_SOURCES: TrustedDomainSource[] = [
     updatedAt: '2026-07-12T00:00:00.000Z'
   }
 ]
+
+function isGovernmentTrustedDomain(domain: string): boolean {
+  const publicSuffix = getPublicSuffix(domain)
+
+  return publicSuffix === 'gov' || publicSuffix?.startsWith('gov.') === true
+}
 const DEFAULT_DOMAIN_BLOCKLIST_SOURCES: DomainBlocklistSource[] = [
   {
     id: 'default-cert-hole',
@@ -329,6 +394,72 @@ const DEFAULT_DOMAIN_BLOCKLIST_SOURCES: DomainBlocklistSource[] = [
     isDefault: true,
     createdAt: DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT,
     updatedAt: DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT
+  }
+]
+const DEFAULT_SSO_PROVIDER_CREATED_AT = '2026-08-02T00:00:00.000Z'
+const DEFAULT_SSO_PROVIDERS: SsoProvider[] = [
+  {
+    id: 'default-sso-login-gov-pl',
+    name: 'Login.gov.pl',
+    hostname: 'login.gov.pl',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-google-accounts',
+    name: 'Google Accounts',
+    hostname: 'accounts.google.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-microsoft-login',
+    name: 'Microsoft Entra ID',
+    hostname: 'login.microsoftonline.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-apple-id',
+    name: 'Apple ID',
+    hostname: 'appleid.apple.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-facebook',
+    name: 'Facebook Login',
+    hostname: 'www.facebook.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-auth0',
+    name: 'Auth0',
+    hostname: 'auth0.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-okta',
+    name: 'Okta',
+    hostname: 'okta.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
   }
 ]
 
@@ -627,7 +758,15 @@ function normalizeReputationSettings(value: unknown): ReputationSettings {
         'lookalike-trusted-domain': DEFAULT_LOOKALIKE_TRUSTED_DOMAIN_SCORE_DELTA,
         'trusted-domain-in-subdomain': DEFAULT_TRUSTED_DOMAIN_IN_SUBDOMAIN_SCORE_DELTA,
         'is-ip': DEFAULT_IP_ADDRESS_SCORE_DELTA,
-        'google-safe-browsing': DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA
+        'google-safe-browsing': DEFAULT_GOOGLE_SAFE_BROWSING_SCORE_DELTA,
+        'url-risk-pattern': DEFAULT_URL_RISK_PATTERN_SCORE_DELTA,
+        'content-sensitive-form': DEFAULT_CONTENT_SENSITIVE_FORM_SCORE_DELTA,
+        'content-cross-origin-form': DEFAULT_CONTENT_CROSS_ORIGIN_FORM_SCORE_DELTA,
+        'content-brand-impersonation': DEFAULT_CONTENT_BRAND_IMPERSONATION_SCORE_DELTA,
+        'content-urgent-language': DEFAULT_CONTENT_URGENT_LANGUAGE_SCORE_DELTA,
+        'content-suspicious-iframe': DEFAULT_CONTENT_SUSPICIOUS_IFRAME_SCORE_DELTA,
+        'content-download-risk': DEFAULT_CONTENT_DOWNLOAD_RISK_SCORE_DELTA,
+        'content-threat-link-catalog': DEFAULT_CONTENT_THREAT_LINK_CATALOG_SCORE_DELTA
       },
       youngDomainMaxAgeDays: DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS,
       googleSafeBrowsingApiKeyConfigured: false
@@ -645,7 +784,15 @@ function normalizeReputationSettings(value: unknown): ReputationSettings {
           value === 'trusted-domain-in-subdomain' ||
           value === 'is-ip' ||
           value === 'google-safe-browsing' ||
-          value === 'young-domain-age'
+          value === 'young-domain-age' ||
+          value === 'url-risk-pattern' ||
+          value === 'content-sensitive-form' ||
+          value === 'content-cross-origin-form' ||
+          value === 'content-brand-impersonation' ||
+          value === 'content-urgent-language' ||
+          value === 'content-suspicious-iframe' ||
+          value === 'content-download-risk' ||
+          value === 'content-threat-link-catalog'
         )
       })
     : []
@@ -704,7 +851,47 @@ function normalizeReputationSettings(value: unknown): ReputationSettings {
         typeof nextRuleWeights['young-domain-age'] === 'number' &&
         Number.isFinite(nextRuleWeights['young-domain-age'])
           ? Math.max(0, Math.floor(nextRuleWeights['young-domain-age']))
-          : DEFAULT_YOUNG_DOMAIN_SCORE_DELTA
+          : DEFAULT_YOUNG_DOMAIN_SCORE_DELTA,
+      'url-risk-pattern':
+        typeof nextRuleWeights['url-risk-pattern'] === 'number' &&
+        Number.isFinite(nextRuleWeights['url-risk-pattern'])
+          ? Math.max(0, Math.floor(nextRuleWeights['url-risk-pattern']))
+          : DEFAULT_URL_RISK_PATTERN_SCORE_DELTA,
+      'content-sensitive-form':
+        typeof nextRuleWeights['content-sensitive-form'] === 'number' &&
+        Number.isFinite(nextRuleWeights['content-sensitive-form'])
+          ? Math.max(0, Math.floor(nextRuleWeights['content-sensitive-form']))
+          : DEFAULT_CONTENT_SENSITIVE_FORM_SCORE_DELTA,
+      'content-cross-origin-form':
+        typeof nextRuleWeights['content-cross-origin-form'] === 'number' &&
+        Number.isFinite(nextRuleWeights['content-cross-origin-form'])
+          ? Math.max(0, Math.floor(nextRuleWeights['content-cross-origin-form']))
+          : DEFAULT_CONTENT_CROSS_ORIGIN_FORM_SCORE_DELTA,
+      'content-brand-impersonation':
+        typeof nextRuleWeights['content-brand-impersonation'] === 'number' &&
+        Number.isFinite(nextRuleWeights['content-brand-impersonation'])
+          ? Math.max(0, Math.floor(nextRuleWeights['content-brand-impersonation']))
+          : DEFAULT_CONTENT_BRAND_IMPERSONATION_SCORE_DELTA,
+      'content-urgent-language':
+        typeof nextRuleWeights['content-urgent-language'] === 'number' &&
+        Number.isFinite(nextRuleWeights['content-urgent-language'])
+          ? Math.max(0, Math.floor(nextRuleWeights['content-urgent-language']))
+          : DEFAULT_CONTENT_URGENT_LANGUAGE_SCORE_DELTA,
+      'content-suspicious-iframe':
+        typeof nextRuleWeights['content-suspicious-iframe'] === 'number' &&
+        Number.isFinite(nextRuleWeights['content-suspicious-iframe'])
+          ? Math.max(0, Math.floor(nextRuleWeights['content-suspicious-iframe']))
+          : DEFAULT_CONTENT_SUSPICIOUS_IFRAME_SCORE_DELTA,
+      'content-download-risk':
+        typeof nextRuleWeights['content-download-risk'] === 'number' &&
+        Number.isFinite(nextRuleWeights['content-download-risk'])
+          ? Math.max(0, Math.floor(nextRuleWeights['content-download-risk']))
+          : DEFAULT_CONTENT_DOWNLOAD_RISK_SCORE_DELTA,
+      'content-threat-link-catalog':
+        typeof nextRuleWeights['content-threat-link-catalog'] === 'number' &&
+        Number.isFinite(nextRuleWeights['content-threat-link-catalog'])
+          ? Math.max(0, Math.floor(nextRuleWeights['content-threat-link-catalog']))
+          : DEFAULT_CONTENT_THREAT_LINK_CATALOG_SCORE_DELTA
     },
     youngDomainMaxAgeDays:
       typeof nextValue.youngDomainMaxAgeDays === 'number' &&
@@ -824,6 +1011,111 @@ function normalizeDomainBlocklistSources(value: unknown): DomainBlocklistSource[
   return normalizedEntries
 }
 
+function normalizeSsoProviderHostname(value: string): string | null {
+  const trimmed = value.trim()
+
+  if (trimmed.length === 0) {
+    return null
+  }
+
+  try {
+    const parsedUrl = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`)
+    const normalizedHostname = normalizeHostname(parsedUrl.hostname)
+
+    if (!normalizedHostname || isIP(normalizedHostname) !== 0) {
+      return null
+    }
+
+    return normalizedHostname
+  } catch {
+    return null
+  }
+}
+
+function normalizeSsoProvider(value: unknown, fallback: SsoProvider): SsoProvider {
+  if (!value || typeof value !== 'object') {
+    return fallback
+  }
+
+  const nextValue = value as Partial<SsoProvider>
+  const normalizedHostname =
+    typeof nextValue.hostname === 'string'
+      ? normalizeSsoProviderHostname(nextValue.hostname)
+      : normalizeSsoProviderHostname(fallback.hostname)
+
+  return {
+    id:
+      typeof nextValue.id === 'string' && nextValue.id.trim().length > 0
+        ? nextValue.id.trim()
+        : fallback.id,
+    name:
+      typeof nextValue.name === 'string' && nextValue.name.trim().length > 0
+        ? nextValue.name.trim()
+        : fallback.name,
+    hostname: normalizedHostname ?? fallback.hostname,
+    enabled: typeof nextValue.enabled === 'boolean' ? nextValue.enabled : fallback.enabled,
+    isDefault: typeof nextValue.isDefault === 'boolean' ? nextValue.isDefault : fallback.isDefault,
+    createdAt:
+      typeof nextValue.createdAt === 'string' && nextValue.createdAt.length > 0
+        ? nextValue.createdAt
+        : fallback.createdAt,
+    updatedAt:
+      typeof nextValue.updatedAt === 'string' && nextValue.updatedAt.length > 0
+        ? nextValue.updatedAt
+        : fallback.updatedAt
+  }
+}
+
+function normalizeSsoProviders(value: unknown): SsoProvider[] {
+  const normalizedEntries: SsoProvider[] = []
+  const hostnameToIndex = new Map<string, number>()
+
+  for (const defaultProvider of DEFAULT_SSO_PROVIDERS) {
+    hostnameToIndex.set(defaultProvider.hostname, normalizedEntries.length)
+    normalizedEntries.push({ ...defaultProvider })
+  }
+
+  if (Array.isArray(value)) {
+    for (const rawEntry of value) {
+      const fallbackProvider: SsoProvider = {
+        id: `sso-provider-${randomUUID()}`,
+        name: 'Własny SSO provider',
+        hostname: 'example.com',
+        enabled: true,
+        isDefault: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+      const nextProvider = normalizeSsoProvider(rawEntry, fallbackProvider)
+      const normalizedHostname = normalizeSsoProviderHostname(nextProvider.hostname)
+
+      if (!normalizedHostname) {
+        continue
+      }
+
+      const existingIndex = hostnameToIndex.get(normalizedHostname)
+
+      if (typeof existingIndex === 'number') {
+        const existingProvider = normalizedEntries[existingIndex]
+        normalizedEntries[existingIndex] = {
+          ...existingProvider,
+          enabled: nextProvider.enabled,
+          updatedAt: nextProvider.updatedAt
+        }
+        continue
+      }
+
+      hostnameToIndex.set(normalizedHostname, normalizedEntries.length)
+      normalizedEntries.push({
+        ...nextProvider,
+        hostname: normalizedHostname
+      })
+    }
+  }
+
+  return normalizedEntries
+}
+
 function normalizeBrowserSettings(value: unknown): BrowserSettings {
   if (!value || typeof value !== 'object') {
     return {
@@ -831,7 +1123,8 @@ function normalizeBrowserSettings(value: unknown): BrowserSettings {
       adminSecurity: normalizeAdminSecurityStore(null),
       domainBlocklistSources: normalizeDomainBlocklistSources(null),
       googleSafeBrowsingApiKey: null,
-      reputation: normalizeReputationSettings(null)
+      reputation: normalizeReputationSettings(null),
+      ssoProviders: normalizeSsoProviders(null)
     }
   }
 
@@ -841,6 +1134,7 @@ function normalizeBrowserSettings(value: unknown): BrowserSettings {
     domainBlocklistSources?: unknown
     googleSafeBrowsingApiKey?: unknown
     reputation?: unknown
+    ssoProviders?: unknown
   }
 
   return {
@@ -852,7 +1146,8 @@ function normalizeBrowserSettings(value: unknown): BrowserSettings {
       nextValue.googleSafeBrowsingApiKey.trim().length > 0
         ? nextValue.googleSafeBrowsingApiKey.trim()
         : null,
-    reputation: normalizeReputationSettings(nextValue.reputation)
+    reputation: normalizeReputationSettings(nextValue.reputation),
+    ssoProviders: normalizeSsoProviders(nextValue.ssoProviders)
   }
 }
 
@@ -934,7 +1229,8 @@ function loadBrowserSettings(): BrowserSettings {
       youngDomainMaxAgeDays:
         Number(reputationRow[3]) || DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS,
       googleSafeBrowsingApiKeyConfigured: typeof reputationRow[4] === 'string'
-    }
+    },
+    ssoProviders: getAppSetting(database, 'ssoProviders', normalizeSsoProviders(null))
   })
 }
 
@@ -1004,6 +1300,7 @@ function saveBrowserSettings(value: BrowserSettings): BrowserSettings {
   }
 
   saveDomainBlocklistSourcesToDatabase(database, normalizedValue.domainBlocklistSources)
+  setAppSetting(database, 'ssoProviders', normalizedValue.ssoProviders)
   saveTrustedDomainsDatabase(database)
   return loadBrowserSettings()
 }
@@ -1033,6 +1330,77 @@ function saveDomainBlocklistSources(value: DomainBlocklistSource[]): DomainBlock
   saveDomainBlocklistSourcesToDatabase(database, normalizedSources)
   saveTrustedDomainsDatabase(database)
   return getDomainBlocklistSourceRows(database)
+}
+
+function loadSsoProviders(): SsoProvider[] {
+  return loadBrowserSettings().ssoProviders
+}
+
+function saveSsoProviders(value: SsoProvider[]): SsoProvider[] {
+  const nextBrowserSettings = saveBrowserSettings({
+    ...loadBrowserSettings(),
+    ssoProviders: normalizeSsoProviders(value)
+  })
+
+  return nextBrowserSettings.ssoProviders
+}
+
+function addSsoProvider(value: string): SsoProvider[] {
+  const normalizedHostname = normalizeSsoProviderHostname(value)
+
+  if (!normalizedHostname) {
+    throw new Error('Podaj poprawną domenę providera SSO.')
+  }
+
+  const currentProviders = loadSsoProviders()
+  const existingProvider = currentProviders.find(
+    (provider) => provider.hostname === normalizedHostname
+  )
+
+  if (existingProvider) {
+    return saveSsoProviders(
+      currentProviders.map((provider) =>
+        provider.hostname === normalizedHostname
+          ? { ...provider, enabled: true, updatedAt: new Date().toISOString() }
+          : provider
+      )
+    )
+  }
+
+  const now = new Date().toISOString()
+
+  return saveSsoProviders([
+    ...currentProviders,
+    {
+      id: `sso-provider-${randomUUID()}`,
+      name: normalizedHostname,
+      hostname: normalizedHostname,
+      enabled: true,
+      isDefault: false,
+      createdAt: now,
+      updatedAt: now
+    }
+  ])
+}
+
+function setSsoProviderEnabled(id: string, enabled: boolean): SsoProvider[] {
+  const currentProviders = loadSsoProviders()
+  return saveSsoProviders(
+    currentProviders.map((provider) =>
+      provider.id === id ? { ...provider, enabled, updatedAt: new Date().toISOString() } : provider
+    )
+  )
+}
+
+function removeSsoProvider(id: string): SsoProvider[] {
+  const currentProviders = loadSsoProviders()
+  const provider = currentProviders.find((entry) => entry.id === id)
+
+  if (provider?.isDefault) {
+    throw new Error('Domyślnego providera SSO można wyłączyć, ale nie usunąć.')
+  }
+
+  return saveSsoProviders(currentProviders.filter((entry) => entry.id !== id))
 }
 
 function getDomainBlocklistSourceRows(database: SqlJsDatabase): DomainBlocklistSource[] {
@@ -1235,6 +1603,7 @@ function ensureTrustedDomainLookalikeColumns(database: SqlJsDatabase): void {
   database.run(
     'CREATE INDEX IF NOT EXISTS idx_trusted_domains_label_length ON trusted_domains(label_length)'
   )
+  database.run('CREATE INDEX IF NOT EXISTS idx_trusted_domains_label ON trusted_domains(label)')
 }
 
 function backfillTrustedDomainLookalikeMetadata(database: SqlJsDatabase): void {
@@ -1282,6 +1651,7 @@ function backfillTrustedDomainLookalikeMetadata(database: SqlJsDatabase): void {
 }
 
 function saveTrustedDomainsDatabase(database: SqlJsDatabase): void {
+  genericTrustedLabelCache = null
   const encryptedPayload = encryptTrustedDomainsDatabasePayload(database.export())
   fs.writeFileSync(getTrustedDomainsDatabasePath(), encryptedPayload, 'utf8')
 }
@@ -1422,6 +1792,54 @@ function ensureAppDatabaseDefaults(database: SqlJsDatabase): void {
       enabled: true,
       scoreDelta: DEFAULT_YOUNG_DOMAIN_SCORE_DELTA,
       severity: 'warning'
+    },
+    {
+      ruleId: 'url-risk-pattern',
+      enabled: true,
+      scoreDelta: DEFAULT_URL_RISK_PATTERN_SCORE_DELTA,
+      severity: 'blocking'
+    },
+    {
+      ruleId: 'content-sensitive-form',
+      enabled: true,
+      scoreDelta: DEFAULT_CONTENT_SENSITIVE_FORM_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
+      ruleId: 'content-cross-origin-form',
+      enabled: true,
+      scoreDelta: DEFAULT_CONTENT_CROSS_ORIGIN_FORM_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
+      ruleId: 'content-brand-impersonation',
+      enabled: true,
+      scoreDelta: DEFAULT_CONTENT_BRAND_IMPERSONATION_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
+      ruleId: 'content-urgent-language',
+      enabled: true,
+      scoreDelta: DEFAULT_CONTENT_URGENT_LANGUAGE_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
+      ruleId: 'content-suspicious-iframe',
+      enabled: true,
+      scoreDelta: DEFAULT_CONTENT_SUSPICIOUS_IFRAME_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
+      ruleId: 'content-download-risk',
+      enabled: true,
+      scoreDelta: DEFAULT_CONTENT_DOWNLOAD_RISK_SCORE_DELTA,
+      severity: 'warning'
+    },
+    {
+      ruleId: 'content-threat-link-catalog',
+      enabled: true,
+      scoreDelta: DEFAULT_CONTENT_THREAT_LINK_CATALOG_SCORE_DELTA,
+      severity: 'blocking'
     }
   ]
 
@@ -1748,7 +2166,7 @@ async function loadCustomTrustedDomains(): Promise<CustomTrustedDomain[]> {
 }
 
 async function addCustomTrustedDomain(value: string): Promise<CustomTrustedDomain[]> {
-  const normalizedDomain = normalizeTrustedDomain(value)
+  const normalizedDomain = normalizeCustomTrustedDomain(value)
 
   if (!normalizedDomain) {
     throw new Error('Wpisz poprawną domenę, na przykład example.com.')
@@ -1798,7 +2216,7 @@ async function addCustomTrustedDomain(value: string): Promise<CustomTrustedDomai
 }
 
 async function removeCustomTrustedDomain(domain: string): Promise<CustomTrustedDomain[]> {
-  const normalizedDomain = normalizeTrustedDomain(domain)
+  const normalizedDomain = normalizeCustomTrustedDomain(domain)
 
   if (!normalizedDomain) {
     throw new Error('Nie znaleziono wskazanej domeny.')
@@ -2000,9 +2418,9 @@ async function ensureTrustedDomainSourcesReady(): Promise<void> {
 }
 
 async function isTrustedDomain(hostname: string): Promise<boolean> {
-  const normalizedHostname = normalizeTrustedDomain(hostname)
+  const normalizedHostname = normalizeHostname(hostname)
 
-  if (!normalizedHostname) {
+  if (!normalizedHostname || isIP(normalizedHostname) !== 0) {
     return false
   }
 
@@ -2013,16 +2431,61 @@ async function isTrustedDomain(hostname: string): Promise<boolean> {
       FROM trusted_domains td
       INNER JOIN trusted_sources ts ON ts.id = td.source_id
       WHERE ts.enabled = 1 AND (td.domain = $hostname OR $hostname LIKE '%.' || td.domain)
-      LIMIT 1
+      ORDER BY td.domain = $hostname DESC, length(td.domain) DESC
     `,
     {
       $hostname: normalizedHostname
     }
   )
 
-  const matched = statement.step()
-  statement.free()
-  return matched
+  try {
+    while (statement.step()) {
+      const row = statement.getAsObject() as Record<string, unknown>
+
+      if (isTrustedDomainMatchAllowed(normalizedHostname, String(row.domain))) {
+        return true
+      }
+    }
+
+    return false
+  } finally {
+    statement.free()
+  }
+}
+
+function isTrustedDomainSync(hostname: string): boolean {
+  const normalizedHostname = normalizeHostname(hostname)
+
+  if (!normalizedHostname || isIP(normalizedHostname) !== 0 || !appDatabase) {
+    return false
+  }
+
+  const statement = appDatabase.prepare(
+    `
+      SELECT td.domain
+      FROM trusted_domains td
+      INNER JOIN trusted_sources ts ON ts.id = td.source_id
+      WHERE ts.enabled = 1 AND (td.domain = $hostname OR $hostname LIKE '%.' || td.domain)
+      ORDER BY td.domain = $hostname DESC, length(td.domain) DESC
+    `,
+    {
+      $hostname: normalizedHostname
+    }
+  )
+
+  try {
+    while (statement.step()) {
+      const row = statement.getAsObject() as Record<string, unknown>
+
+      if (isTrustedDomainMatchAllowed(normalizedHostname, String(row.domain))) {
+        return true
+      }
+    }
+
+    return false
+  } finally {
+    statement.free()
+  }
 }
 
 function validateDomainBlocklistSourceUrl(value: string): string {
@@ -2389,6 +2852,164 @@ function isSafeBrowserUrl(rawUrl: string): boolean {
   }
 }
 
+function getBlobNavigationOrigin(rawUrl: string): string | null {
+  if (!rawUrl.startsWith('blob:')) {
+    return null
+  }
+
+  const embeddedUrl = rawUrl.slice('blob:'.length)
+
+  try {
+    const parsedUrl = new URL(embeddedUrl)
+
+    if (!ALLOWED_BROWSER_PROTOCOLS.has(parsedUrl.protocol)) {
+      return null
+    }
+
+    return parsedUrl.origin
+  } catch {
+    return null
+  }
+}
+
+function isSameOriginBlobNavigation(navigationUrl: string, currentUrl: string): boolean {
+  const blobOrigin = getBlobNavigationOrigin(navigationUrl)
+
+  if (!blobOrigin || !isSafeBrowserUrl(currentUrl)) {
+    return false
+  }
+
+  try {
+    return new URL(currentUrl).origin === blobOrigin
+  } catch {
+    return false
+  }
+}
+
+function isSafeNavigationFromSameOriginBlob(navigationUrl: string, currentUrl: string): boolean {
+  const currentBlobOrigin = getBlobNavigationOrigin(currentUrl)
+
+  if (!currentBlobOrigin || !isSafeBrowserUrl(navigationUrl)) {
+    return false
+  }
+
+  try {
+    return new URL(navigationUrl).origin === currentBlobOrigin
+  } catch {
+    return false
+  }
+}
+
+function getSsoProviderForHostname(hostname: string): SsoProvider | null {
+  const normalizedHostname = normalizeHostname(hostname)
+
+  if (!normalizedHostname) {
+    return null
+  }
+
+  return (
+    loadSsoProviders().find((provider) => {
+      if (!provider.enabled) {
+        return false
+      }
+
+      return (
+        normalizedHostname === provider.hostname ||
+        normalizedHostname.endsWith(`.${provider.hostname}`)
+      )
+    }) ?? null
+  )
+}
+
+function getSsoProviderForUrl(rawUrl: string): SsoProvider | null {
+  if (!isSafeBrowserUrl(rawUrl)) {
+    return null
+  }
+
+  try {
+    const parsedUrl = new URL(rawUrl)
+    return getSsoProviderForHostname(parsedUrl.hostname)
+  } catch {
+    return null
+  }
+}
+
+function getSsoProviderForBlobNavigation(rawUrl: string): SsoProvider | null {
+  const blobOrigin = getBlobNavigationOrigin(rawUrl)
+
+  if (!blobOrigin) {
+    return null
+  }
+
+  return getSsoProviderForUrl(blobOrigin)
+}
+
+function getActiveSsoNavigationFlow(): typeof activeSsoNavigationFlow {
+  if (!activeSsoNavigationFlow) {
+    return null
+  }
+
+  if (Date.now() - activeSsoNavigationFlow.updatedAt > SSO_NAVIGATION_FLOW_TTL_MS) {
+    activeSsoNavigationFlow = null
+    return null
+  }
+
+  return activeSsoNavigationFlow
+}
+
+function rememberSsoNavigation(providerHostname: string): void {
+  const now = Date.now()
+  const currentFlow = getActiveSsoNavigationFlow()
+  const shouldReuseFlow = currentFlow?.providerHostname === providerHostname
+
+  activeSsoNavigationFlow = {
+    providerHostname,
+    startedAt: shouldReuseFlow ? currentFlow.startedAt : now,
+    updatedAt: now
+  }
+}
+
+function shouldAllowNativeSsoNavigation(
+  navigationUrl: string,
+  currentUrl: string
+): boolean {
+  if (!isSafeBrowserUrl(navigationUrl)) {
+    return false
+  }
+
+  const nextProvider = getSsoProviderForUrl(navigationUrl)
+
+  if (nextProvider) {
+    rememberSsoNavigation(nextProvider.hostname)
+    return true
+  }
+
+  const currentProvider = getSsoProviderForUrl(currentUrl)
+
+  if (currentProvider) {
+    rememberSsoNavigation(currentProvider.hostname)
+    return true
+  }
+
+  const currentBlobProvider = getSsoProviderForBlobNavigation(currentUrl)
+
+  if (currentBlobProvider && getActiveSsoNavigationFlow()) {
+    rememberSsoNavigation(currentBlobProvider.hostname)
+    return true
+  }
+
+  return false
+}
+
+function isTrustedNativeNavigationUrl(rawUrl: string): boolean {
+  if (!isSafeBrowserUrl(rawUrl)) {
+    return false
+  }
+
+  const candidate = normalizeSiteCandidate(rawUrl)
+  return isGovernmentDomainCandidate(candidate) || isTrustedDomainSync(candidate.asciiHostname)
+}
+
 function loadReputationSettings(): ReputationSettings {
   const browserSettings = loadBrowserSettings()
   const hasApiKey = hasGoogleSafeBrowsingApiKey(browserSettings)
@@ -2503,12 +3124,418 @@ function getDomainBlocklistEventCode(sourceUrl: string): string {
 
 function setReputationIntervention(value: ReputationInterventionState | null): void {
   reputationInterventionState = value
+  if (value) {
+    hideSecurityTooltip()
+  }
   updateBrowserBounds()
 }
 
 function setDnsFailure(value: DnsFailureState | null): void {
   dnsFailureState = value
+  if (value) {
+    hideSecurityTooltip()
+  }
   updateBrowserBounds()
+}
+
+function setLastReputationStatus(assessment: ReputationAssessment | null): void {
+  lastReputationStatus = assessment
+    ? {
+        url: assessment.candidate.normalizedUrl,
+        score: assessment.score,
+        decision: assessment.decision,
+        warningThreshold: loadReputationSettings().warningThreshold,
+        blockedThreshold: loadReputationSettings().blockedThreshold,
+        matchedRuleCount: assessment.matchedRules.length
+      }
+    : null
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function hideSecurityTooltip(): void {
+  if (!securityTooltipWindow) {
+    return
+  }
+
+  securityTooltipWindow.close()
+  securityTooltipWindow = null
+}
+
+function showSecurityTooltip(payload: SecurityTooltipPayload): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  const tooltipWidth = 500
+  const tooltipHeight = 274
+  const margin = 10
+  const mainBounds = mainWindow.getBounds()
+  const rawRiskScore = payload.score ?? 0
+  const riskScore = Math.max(0, Math.min(100, Math.round(rawRiskScore)))
+  const securityScore = Math.max(0, Math.min(100, 100 - riskScore))
+  const warningThreshold = payload.warningThreshold ?? 50
+  const blockedThreshold = payload.blockedThreshold ?? 70
+  const markerLeft = Math.max(0, Math.min(100, riskScore))
+  const warningLeft = Math.max(0, Math.min(100, warningThreshold))
+  const blockedLeft = Math.max(0, Math.min(100, blockedThreshold))
+  const safeWidth = warningLeft
+  const warningWidth = Math.max(0, blockedLeft - warningLeft)
+  const blockedWidth = Math.max(0, 100 - blockedLeft)
+  const statusColor = payload.color
+  const statusSoftColor =
+    payload.decision === 'blocked'
+      ? '#fee2e2'
+      : payload.decision === 'warning'
+        ? '#fef3c7'
+        : payload.decision === 'allow'
+          ? '#dcfce7'
+          : '#e2e8f0'
+  const heroIconHtml =
+    payload.decision === 'warning'
+      ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+          <path d="M12 9v4"></path>
+          <path d="M12 17h.01"></path>
+        </svg>`
+      : payload.decision === 'blocked'
+        ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            <path d="m9.5 9.5 5 5"></path>
+            <path d="m14.5 9.5-5 5"></path>
+          </svg>`
+        : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            <path d="m9 12 2 2 4-5"></path>
+          </svg>`
+  const x = Math.max(
+    mainBounds.x + margin,
+    Math.min(
+      mainBounds.x + Math.round(payload.anchor.right - tooltipWidth + 26),
+      mainBounds.x + mainBounds.width - tooltipWidth - margin
+    )
+  )
+  const y = Math.max(
+    mainBounds.y + margin,
+    Math.min(
+      mainBounds.y + Math.round(payload.anchor.bottom + 8),
+      mainBounds.y + mainBounds.height - tooltipHeight - margin
+    )
+  )
+
+  if (!securityTooltipWindow || securityTooltipWindow.isDestroyed()) {
+    securityTooltipWindow = new BrowserWindow({
+      parent: mainWindow,
+      width: tooltipWidth,
+      height: tooltipHeight,
+      x,
+      y,
+      frame: false,
+      transparent: true,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      focusable: false,
+      skipTaskbar: true,
+      show: false,
+      backgroundColor: '#00000000',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true
+      }
+    })
+
+    securityTooltipWindow.on('closed', () => {
+      securityTooltipWindow = null
+    })
+  } else {
+    securityTooltipWindow.setBounds({ x, y, width: tooltipWidth, height: tooltipHeight })
+  }
+
+  const html = `
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <style>
+          * { box-sizing: border-box; }
+          body {
+            margin: 0;
+            padding: 12px;
+            background: transparent;
+            font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: #111827;
+            overflow: hidden;
+          }
+          .card {
+            position: relative;
+            width: 100%;
+            min-height: ${tooltipHeight - 24}px;
+            border: 1px solid #e2e8f0;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.98);
+            box-shadow: 0 16px 38px rgba(15, 23, 42, 0.12);
+            padding: 22px 26px 18px;
+          }
+          .card::before {
+            position: absolute;
+            top: -12px;
+            right: 96px;
+            width: 22px;
+            height: 22px;
+            border-top: 1px solid #e2e8f0;
+            border-left: 1px solid #e2e8f0;
+            background: rgba(255, 255, 255, 0.98);
+            content: "";
+            transform: rotate(45deg);
+          }
+          .top {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 16px;
+          }
+          .left {
+            display: flex;
+            align-items: flex-start;
+            gap: 14px;
+            min-width: 0;
+          }
+          .icon {
+            display: flex;
+            width: 44px;
+            height: 44px;
+            flex: 0 0 auto;
+            align-items: center;
+            justify-content: center;
+            border-radius: 9999px;
+            background: ${statusSoftColor};
+            color: ${statusColor};
+          }
+          .icon svg {
+            width: 24px;
+            height: 24px;
+          }
+          .title {
+            margin: 0;
+            color: #111827;
+            font-size: 18px;
+            font-weight: 700;
+            line-height: 1.2;
+          }
+          .description {
+            margin: 8px 0 0;
+            color: #6b7280;
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 1.35;
+          }
+          .score {
+            text-align: right;
+            white-space: nowrap;
+          }
+          .score strong {
+            color: ${statusColor};
+            font-size: 22px;
+            font-weight: 700;
+            letter-spacing: -0.04em;
+          }
+          .score span {
+            color: #64748b;
+            font-size: 14px;
+            font-weight: 600;
+          }
+          .score p {
+            margin: 4px 0 0;
+            color: #6b7280;
+            font-size: 12px;
+            font-weight: 600;
+          }
+          .scale {
+            position: relative;
+            margin-top: 32px;
+            height: 38px;
+          }
+          .bar {
+            display: flex;
+            height: 9px;
+            overflow: hidden;
+            border-radius: 9999px;
+            background: #e5e7eb;
+          }
+          .safe { width: ${safeWidth}%; background: #22c55e; }
+          .warn { width: ${warningWidth}%; background: #f59e0b; }
+          .block { width: ${blockedWidth}%; background: #ef4444; }
+          .marker {
+            position: absolute;
+            top: -6px;
+            left: ${markerLeft}%;
+            width: 18px;
+            height: 18px;
+            border: 4px solid #ffffff;
+            border-radius: 9999px;
+            background: ${statusColor};
+            box-shadow: 0 6px 16px rgba(15, 23, 42, 0.22);
+            transform: translateX(-50%);
+          }
+          .tick {
+            position: absolute;
+            top: 19px;
+            color: #6b7280;
+            font-size: 13px;
+            font-weight: 500;
+            transform: translateX(-50%);
+          }
+          .tick-start { left: 0; transform: none; }
+          .tick-warning { left: ${warningLeft}%; }
+          .tick-blocked { left: ${blockedLeft}%; }
+          .tick-end { right: 0; transform: none; }
+          .legend {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 12px;
+            margin-top: 12px;
+            border-top: 1px solid #f1f5f9;
+            padding-top: 14px;
+          }
+          .legend-item {
+            display: flex;
+            gap: 9px;
+            align-items: flex-start;
+          }
+          .legend-item + .legend-item {
+            border-left: 1px solid #edf2f7;
+            padding-left: 12px;
+          }
+          .legend-icon {
+            display: flex;
+            width: 30px;
+            height: 30px;
+            flex: 0 0 auto;
+            align-items: center;
+            justify-content: center;
+            border-radius: 9999px;
+          }
+          .legend-title {
+            margin: 0;
+            font-size: 13px;
+            font-weight: 650;
+          }
+          .legend-copy {
+            margin: 6px 0 0;
+            color: #6b7280;
+            font-size: 11px;
+            font-weight: 500;
+          }
+          .safe-text { color: #15803d; }
+          .warn-text { color: #d97706; }
+          .block-text { color: #ef4444; }
+          .safe-bg { background: #dcfce7; }
+          .warn-bg { background: #fef3c7; }
+          .block-bg { background: #fee2e2; }
+        </style>
+      </head>
+      <body>
+        <section class="card">
+          <div class="top">
+            <div class="left">
+              <div class="icon">
+                ${heroIconHtml}
+              </div>
+              <div>
+                <p class="title">${escapeHtml(payload.label)}</p>
+                <p class="description">${escapeHtml(payload.description)}</p>
+              </div>
+            </div>
+            <div class="score">
+              <strong>${securityScore}</strong><span>/100</span>
+              <p>Security Score</p>
+            </div>
+          </div>
+          <div class="scale">
+            <div class="bar">
+              <div class="safe"></div>
+              <div class="warn"></div>
+              <div class="block"></div>
+            </div>
+            <div class="marker"></div>
+            <span class="tick tick-start">0</span>
+            <span class="tick tick-warning">${warningThreshold}</span>
+            <span class="tick tick-blocked">${blockedThreshold}</span>
+            <span class="tick tick-end">100</span>
+          </div>
+          <div class="legend">
+            <div class="legend-item">
+              <div class="legend-icon safe-bg safe-text">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                  <path d="m9 12 2 2 4-5"></path>
+                </svg>
+              </div>
+              <div><p class="legend-title safe-text">0 - ${warningThreshold}</p><p class="legend-copy">Bezpieczna</p></div>
+            </div>
+            <div class="legend-item">
+              <div class="legend-icon warn-bg warn-text">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                  <path d="M12 9v4"></path>
+                  <path d="M12 17h.01"></path>
+                </svg>
+              </div>
+              <div><p class="legend-title warn-text">${warningThreshold} - ${blockedThreshold}</p><p class="legend-copy">Ostrzeżenie</p></div>
+            </div>
+            <div class="legend-item">
+              <div class="legend-icon block-bg block-text">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                  <path d="m9.5 9.5 5 5"></path>
+                  <path d="m14.5 9.5-5 5"></path>
+                </svg>
+              </div>
+              <div><p class="legend-title block-text">${blockedThreshold} - 100</p><p class="legend-copy">Zablokowana</p></div>
+            </div>
+          </div>
+        </section>
+      </body>
+    </html>
+  `
+
+  securityTooltipWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+  securityTooltipWindow.showInactive()
+}
+
+async function refreshReputationStatusForLoadedUrl(
+  rawUrl: string,
+  view: WebContentsView
+): Promise<void> {
+  if (!rawUrl || !isSafeBrowserUrl(rawUrl) || dnsFailureState) {
+    setLastReputationStatus(null)
+    sendBrowserState()
+    return
+  }
+
+  try {
+    const assessment = await assessNavigationReputation(rawUrl)
+
+    if (view.webContents.getURL() !== assessment.candidate.normalizedUrl) {
+      return
+    }
+
+    setLastReputationStatus(assessment)
+    sendBrowserState()
+  } catch {
+    setLastReputationStatus(null)
+    sendBrowserState()
+  }
 }
 
 function isDnsResolutionFailure(errorCode: number, errorDescription: string): boolean {
@@ -2556,6 +3583,11 @@ function getRuleScoreDelta(
 async function findLookalikeTrustedDomain(candidateDomain: string): Promise<string | null> {
   const database = await getTrustedDomainsDatabase()
   const metadata = getTrustedDomainLookalikeMetadata(candidateDomain)
+
+  if (metadata.labelLength < 4) {
+    return null
+  }
+
   const exactSkeletonStatement = database.prepare(
     `
       SELECT td.domain
@@ -2564,6 +3596,7 @@ async function findLookalikeTrustedDomain(candidateDomain: string): Promise<stri
       WHERE ts.enabled = 1
         AND td.domain != $domain
         AND td.skeleton = $skeleton
+        AND td.label_length >= 4
       ORDER BY ts.kind = 'manual' DESC, td.rank IS NULL ASC, td.rank ASC
       LIMIT 1
     `,
@@ -2648,6 +3681,46 @@ async function findLookalikeTrustedDomain(candidateDomain: string): Promise<stri
   return null
 }
 
+async function loadGenericTrustedLabels(): Promise<Set<string>> {
+  if (genericTrustedLabelCache) {
+    return genericTrustedLabelCache
+  }
+
+  const database = await getTrustedDomainsDatabase()
+  const statement = database.prepare(
+    `
+      SELECT td.label
+      FROM trusted_domains td
+      INNER JOIN trusted_sources ts ON ts.id = td.source_id
+      WHERE ts.enabled = 1
+        AND td.label IS NOT NULL
+        AND td.label_length >= 5
+      GROUP BY td.label
+      HAVING COUNT(DISTINCT td.domain) >= $threshold
+    `,
+    {
+      $threshold: GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD
+    }
+  )
+  const labels = new Set<string>()
+
+  try {
+    while (statement.step()) {
+      const row = statement.getAsObject() as Record<string, unknown>
+      const label = typeof row.label === 'string' ? row.label : ''
+
+      if (label) {
+        labels.add(label)
+      }
+    }
+  } finally {
+    statement.free()
+  }
+
+  genericTrustedLabelCache = labels
+  return labels
+}
+
 async function findTrustedDomainMentionedInSubdomain(
   candidate: NormalizedSiteCandidate
 ): Promise<string | null> {
@@ -2657,9 +3730,10 @@ async function findTrustedDomainMentionedInSubdomain(
 
   const subdomain = candidate.subdomain.toLowerCase()
   const database = await getTrustedDomainsDatabase()
+  const genericTrustedLabels = await loadGenericTrustedLabels()
   const statement = database.prepare(
     `
-      SELECT td.domain
+      SELECT td.domain, td.label
       FROM trusted_domains td
       INNER JOIN trusted_sources ts ON ts.id = td.source_id
       WHERE ts.enabled = 1
@@ -2683,7 +3757,7 @@ async function findTrustedDomainMentionedInSubdomain(
           )
         )
       ORDER BY ts.kind = 'manual' DESC, td.rank IS NULL ASC, td.rank ASC
-      LIMIT 1
+      LIMIT 50
     `,
     {
       $registrableDomain: candidate.registrableDomain,
@@ -2692,12 +3766,22 @@ async function findTrustedDomainMentionedInSubdomain(
   )
 
   try {
-    if (statement.step()) {
+    while (statement.step()) {
       const row = statement.getAsObject() as Record<string, unknown>
       const trustedDomain = String(row.domain)
       const trustedLabel = typeof row.label === 'string' ? row.label : null
+      const isGenericTrustedLabel =
+        isGovernmentTrustedDomain(trustedDomain) ||
+        (typeof trustedLabel === 'string' && genericTrustedLabels.has(trustedLabel))
 
-      if (isTrustedDomainEntryMentionedInSubdomain(candidate, trustedDomain, trustedLabel)) {
+      if (
+        isTrustedDomainEntryMentionedInSubdomain(
+          candidate,
+          trustedDomain,
+          trustedLabel,
+          isGenericTrustedLabel
+        )
+      ) {
         return trustedDomain
       }
     }
@@ -2706,6 +3790,72 @@ async function findTrustedDomainMentionedInSubdomain(
   }
 
   return null
+}
+
+async function loadContentTrustedBrands(): Promise<ContentTrustedBrand[]> {
+  const database = await getTrustedDomainsDatabase()
+  const genericTrustedLabels = await loadGenericTrustedLabels()
+  const statement = database.prepare(`
+    SELECT td.domain, td.label
+    FROM trusted_domains td
+    INNER JOIN trusted_sources ts ON ts.id = td.source_id
+    WHERE ts.enabled = 1
+      AND td.label IS NOT NULL
+      AND td.label_length >= 5
+    ORDER BY ts.kind = 'manual' DESC, td.rank IS NULL ASC, td.rank ASC
+    LIMIT 2000
+  `)
+  const brands: ContentTrustedBrand[] = []
+
+  try {
+    while (statement.step()) {
+      const row = statement.getAsObject() as Record<string, unknown>
+      const domain = typeof row.domain === 'string' ? row.domain : ''
+      const label = typeof row.label === 'string' ? row.label : ''
+
+      if (domain && label) {
+        brands.push({
+          domain,
+          label,
+          isGenericLabel: isGovernmentTrustedDomain(domain) || genericTrustedLabels.has(label)
+        })
+      }
+    }
+  } finally {
+    statement.free()
+  }
+
+  return brands
+}
+
+async function fetchPageHtmlForContentAnalysis(
+  candidate: NormalizedSiteCandidate
+): Promise<string | null> {
+  try {
+    const response = await fetch(candidate.normalizedUrl, {
+      cache: 'no-store',
+      redirect: 'follow',
+      signal: AbortSignal.timeout(CONTENT_ANALYSIS_FETCH_TIMEOUT_MS),
+      headers: {
+        accept: 'text/html,application/xhtml+xml'
+      }
+    })
+
+    if (!response.ok) {
+      return null
+    }
+
+    const contentType = response.headers.get('content-type') ?? ''
+
+    if (!contentType.toLowerCase().includes('text/html')) {
+      return null
+    }
+
+    const html = await response.text()
+    return html.slice(0, CONTENT_ANALYSIS_MAX_HTML_CHARS)
+  } catch {
+    return null
+  }
 }
 
 async function loadRdapBootstrap(): Promise<RdapBootstrap> {
@@ -3098,6 +4248,55 @@ async function evaluateGoogleSafeBrowsingRule(
   }
 }
 
+function getUrlRiskPatternMatch(candidate: NormalizedSiteCandidate): string | null {
+  const urlSignal = `${candidate.path}${candidate.query}`.toLowerCase()
+  const patterns: Array<[RegExp, string]> = [
+    [/\bphishing\b/i, 'phishing'],
+    [/\bmalware\b/i, 'malware'],
+    [/\bunwanted\b/i, 'unwanted'],
+    [/\bpua\b/i, 'pua'],
+    [/\bsuspicious\b/i, 'suspicious'],
+    [/\bbad[_-]login\b/i, 'bad-login'],
+    [/\blow[_-]rep[_-]login\b/i, 'low-reputation-login'],
+    [/\btrick[_-]to[_-]bill\b/i, 'billing-trick'],
+    [/\bcookie[_-]theft\b/i, 'cookie-theft'],
+    [/\bbadrep\b/i, 'bad-reputation-download'],
+    [/\bbad[_-]app\b/i, 'bad-application-download'],
+    [/\bforce[_-]csd\b/i, 'forced-download-scan'],
+    [/\blocal[_-]trigger[_-]csd\b/i, 'local-download-scan'],
+    [/\brestricted[_-]content\b/i, 'restricted-content'],
+    [/\.(?:exe|apk|msi|scr|bat|cmd|vbs|ps1|jar)(?:$|[?#])/i, 'dangerous-file-extension'],
+    [/\.(?:zip|rar|7z)(?:$|[?#])/i, 'archive-download']
+  ]
+
+  return patterns.find(([pattern]) => pattern.test(urlSignal))?.[1] ?? null
+}
+
+async function evaluateUrlRiskPatternRule(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult | null> {
+  const matchedPattern = getUrlRiskPatternMatch(candidate)
+
+  if (!matchedPattern) {
+    return null
+  }
+
+  return {
+    ruleId: 'url-risk-pattern',
+    matched: true,
+    scoreDelta: getRuleScoreDelta(
+      'url-risk-pattern',
+      DEFAULT_URL_RISK_PATTERN_SCORE_DELTA,
+      settings
+    ),
+    severity: 'blocking',
+    code: `url-risk-pattern:${matchedPattern}`,
+    message:
+      'Adres zawiera wzorzec często spotykany przy stronach phishingowych, malware albo ryzykownych pobraniach.'
+  }
+}
+
 async function evaluateYoungDomainAgeRule(
   candidate: NormalizedSiteCandidate,
   settings: ReputationSettings
@@ -3130,6 +4329,72 @@ async function evaluateYoungDomainAgeRule(
   }
 }
 
+function getContentRuleFallbackScore(ruleId: ContentAnalysisFindingId): number {
+  switch (ruleId) {
+    case 'content-sensitive-form':
+      return DEFAULT_CONTENT_SENSITIVE_FORM_SCORE_DELTA
+    case 'content-cross-origin-form':
+      return DEFAULT_CONTENT_CROSS_ORIGIN_FORM_SCORE_DELTA
+    case 'content-brand-impersonation':
+      return DEFAULT_CONTENT_BRAND_IMPERSONATION_SCORE_DELTA
+    case 'content-urgent-language':
+      return DEFAULT_CONTENT_URGENT_LANGUAGE_SCORE_DELTA
+    case 'content-suspicious-iframe':
+      return DEFAULT_CONTENT_SUSPICIOUS_IFRAME_SCORE_DELTA
+    case 'content-download-risk':
+      return DEFAULT_CONTENT_DOWNLOAD_RISK_SCORE_DELTA
+    case 'content-threat-link-catalog':
+      return DEFAULT_CONTENT_THREAT_LINK_CATALOG_SCORE_DELTA
+  }
+}
+
+async function evaluatePageContentRules(
+  candidate: NormalizedSiteCandidate,
+  settings: ReputationSettings
+): Promise<ReputationRuleResult[]> {
+  const contentRuleIds: ContentAnalysisFindingId[] = [
+    'content-sensitive-form',
+    'content-cross-origin-form',
+    'content-brand-impersonation',
+    'content-urgent-language',
+    'content-suspicious-iframe',
+    'content-download-risk',
+    'content-threat-link-catalog'
+  ]
+
+  if (contentRuleIds.every((ruleId) => settings.disabledRuleIds.includes(ruleId))) {
+    return []
+  }
+
+  if (await isTrustedDomain(candidate.asciiHostname)) {
+    return []
+  }
+
+  const html = await fetchPageHtmlForContentAnalysis(candidate)
+
+  if (!html) {
+    return []
+  }
+
+  const trustedBrands = await loadContentTrustedBrands()
+  const findings = analyzePageContent(html, candidate, trustedBrands)
+
+  return findings
+    .filter((finding) => !settings.disabledRuleIds.includes(finding.id))
+    .map((finding) => ({
+      ruleId: finding.id,
+      matched: true,
+      scoreDelta: getRuleScoreDelta(
+        finding.id,
+        getContentRuleFallbackScore(finding.id),
+        settings
+      ),
+      severity: 'warning',
+      code: finding.code,
+      message: finding.message
+    }))
+}
+
 async function assessNavigationReputation(rawUrl: string): Promise<ReputationAssessment> {
   if (!isSafeBrowserUrl(rawUrl)) {
     throw new Error(`Zablokowano niebezpieczny adres: ${rawUrl}`)
@@ -3147,7 +4412,16 @@ async function assessNavigationReputation(rawUrl: string): Promise<ReputationAss
     }
   }
 
-  if (await isTrustedDomain(candidate.asciiHostname)) {
+  if (isGovernmentDomainCandidate(candidate) || (await isTrustedDomain(candidate.asciiHostname))) {
+    return {
+      candidate,
+      score: 0,
+      decision: 'allow',
+      matchedRules: []
+    }
+  }
+
+  if (getSsoProviderForUrl(rawUrl)) {
     return {
       candidate,
       score: 0,
@@ -3182,6 +4456,10 @@ async function assessNavigationReputation(rawUrl: string): Promise<ReputationAss
       evaluate: evaluateIpAddressRule
     },
     {
+      id: 'url-risk-pattern' as const,
+      evaluate: evaluateUrlRiskPatternRule
+    },
+    {
       id: 'google-safe-browsing' as const,
       evaluate: evaluateGoogleSafeBrowsingRule
     },
@@ -3204,7 +4482,13 @@ async function assessNavigationReputation(rawUrl: string): Promise<ReputationAss
     }
   }
 
-  const score = matchedRules.reduce((sum, result) => sum + result.scoreDelta, 0)
+  const preliminaryScore = matchedRules.reduce((sum, result) => sum + result.scoreDelta, 0)
+
+  if (preliminaryScore < settings.blockedThreshold) {
+    matchedRules.push(...(await evaluatePageContentRules(candidate, settings)))
+  }
+
+  const score = Math.min(100, matchedRules.reduce((sum, result) => sum + result.scoreDelta, 0))
   const decision: ReputationDecision =
     score >= settings.blockedThreshold
       ? 'blocked'
@@ -3267,6 +4551,7 @@ function createReputationInterventionState(
 
 async function shouldAllowNavigation(rawUrl: string): Promise<boolean> {
   const assessment = await assessNavigationReputation(rawUrl)
+  setLastReputationStatus(assessment)
 
   if (continuedWarningNavigationUrl === assessment.candidate.normalizedUrl) {
     continuedWarningNavigationUrl = null
@@ -3709,8 +4994,10 @@ function leaveCurrentPage(): void {
   }
 
   browserMode = 'home'
+  hideSecurityTooltip()
   setReputationIntervention(null)
   setDnsFailure(null)
+  setLastReputationStatus(null)
   continuedWarningNavigationUrl = null
   lastError = null
   updateBrowserBounds()
@@ -4086,11 +5373,11 @@ function normalizeAddress(value: string): string {
   const trimmed = value.trim()
 
   if (trimmed.length === 0) {
-    return GOOGLE_HOME_URL
+    return DEFAULT_SEARCH_HOME_URL
   }
 
   if (/^https?:\/\//i.test(trimmed)) {
-    return isSafeBrowserUrl(trimmed) ? trimmed : GOOGLE_HOME_URL
+    return isSafeBrowserUrl(trimmed) ? trimmed : DEFAULT_SEARCH_HOME_URL
   }
 
   if (/^[^\s]+\.[^\s]+$/.test(trimmed)) {
@@ -4145,6 +5432,7 @@ function sendBrowserState(): void {
     browserFaviconUrl: reputationInterventionState || dnsFailureState ? null : effectiveBrowserFaviconUrl,
     reputationIntervention: reputationInterventionState,
     dnsFailure: dnsFailureState,
+    reputationStatus: dnsFailureState ? null : lastReputationStatus,
   })
 }
 
@@ -4169,9 +5457,36 @@ function wireBrowserView(view: WebContentsView): void {
     }
   }
 
-  view.webContents.setWindowOpenHandler(({ url }: { url: string }) => {
+  view.webContents.setWindowOpenHandler((details) => {
+    const { url, postBody, referrer } = details
+
+    if (isSameOriginBlobNavigation(url, view.webContents.getURL())) {
+      setReputationIntervention(null)
+      setDnsFailure(null)
+      lastError = null
+      allowedBrowserNavigationUrl = url
+      void view.webContents
+        .loadURL(url)
+        .catch((error) => {
+          allowedBrowserNavigationUrl = null
+          lastError =
+            error instanceof Error ? error.message : 'Nie udało się otworzyć strony logowania.'
+          sendBrowserState()
+        })
+        .finally(() => {
+          if (allowedBrowserNavigationUrl === url) {
+            allowedBrowserNavigationUrl = null
+          }
+        })
+      return { action: 'deny' }
+    }
+
     if (isSafeBrowserUrl(url)) {
-      void openExternalUrlIfAllowed(url)
+      void navigateBrowser(url, {
+        httpReferrer: referrer,
+        postData: postBody?.data,
+        extraHeaders: postBody?.contentType ? `content-type: ${postBody.contentType}` : undefined
+      })
     }
 
     return { action: 'deny' }
@@ -4180,6 +5495,20 @@ function wireBrowserView(view: WebContentsView): void {
   view.webContents.on('will-navigate', (event, navigationUrl) => {
     if (allowedBrowserNavigationUrl === navigationUrl) {
       allowedBrowserNavigationUrl = null
+      return
+    }
+
+    const currentUrl = view.webContents.getURL()
+
+    if (
+      isSameOriginBlobNavigation(navigationUrl, currentUrl) ||
+      isSafeNavigationFromSameOriginBlob(navigationUrl, currentUrl) ||
+      shouldAllowNativeSsoNavigation(navigationUrl, currentUrl) ||
+      isTrustedNativeNavigationUrl(navigationUrl)
+    ) {
+      setReputationIntervention(null)
+      setDnsFailure(null)
+      lastError = null
       return
     }
 
@@ -4212,18 +5541,23 @@ function wireBrowserView(view: WebContentsView): void {
   view.webContents.on('did-start-loading', () => {
     syncBrowserState()
   })
-  view.webContents.on('did-stop-loading', syncBrowserState)
+  view.webContents.on('did-stop-loading', () => {
+    syncBrowserState()
+    void refreshReputationStatusForLoadedUrl(view.webContents.getURL(), view)
+  })
   view.webContents.on('did-navigate', (_event, navigationUrl) => {
     setDnsFailure(null)
     setReputationIntervention(null)
     applyCachedPageFavicon(navigationUrl, true)
     void updateBrowserFavicon(view)
+    void refreshReputationStatusForLoadedUrl(navigationUrl, view)
   })
   view.webContents.on('did-navigate-in-page', (_event, navigationUrl) => {
     setDnsFailure(null)
     setReputationIntervention(null)
     applyCachedPageFavicon(navigationUrl)
     void updateBrowserFavicon(view)
+    void refreshReputationStatusForLoadedUrl(navigationUrl, view)
   })
   view.webContents.on('page-title-updated', syncBrowserState)
   view.webContents.on('page-favicon-updated', (_event, favicons) => {
@@ -4301,7 +5635,7 @@ function ensureBrowserView(): WebContentsView {
   return nextBrowserView
 }
 
-async function navigateBrowser(rawValue: string): Promise<void> {
+async function navigateBrowser(rawValue: string, options?: Electron.LoadURLOptions): Promise<void> {
   const view = ensureBrowserView()
   const destination = normalizeAddress(rawValue)
   browserMode = 'browser'
@@ -4318,7 +5652,7 @@ async function navigateBrowser(rawValue: string): Promise<void> {
     setReputationIntervention(null)
     setDnsFailure(null)
     allowedBrowserNavigationUrl = destination
-    await view.webContents.loadURL(destination)
+    await view.webContents.loadURL(destination, options)
     if (allowedBrowserNavigationUrl === destination) {
       allowedBrowserNavigationUrl = null
     }
@@ -4371,7 +5705,9 @@ function createMainWindow(): void {
   })
 
   mainWindow.on('resize', updateBrowserBounds)
+  mainWindow.on('resize', hideSecurityTooltip)
   mainWindow.on('resize', updatePermissionPromptBounds)
+  mainWindow.on('move', hideSecurityTooltip)
   mainWindow.on('move', updatePermissionPromptBounds)
   mainWindow.on('maximize', sendBrowserState)
   mainWindow.on('maximize', updatePermissionPromptBounds)
@@ -4406,6 +5742,7 @@ ipcMain.handle('users:select', (_event, userId: string) => {
   store.activeUserId = userId
   saveUserStore(store)
   browserMode = 'home'
+  hideSecurityTooltip()
   setReputationIntervention(null)
   setDnsFailure(null)
   continuedWarningNavigationUrl = null
@@ -4425,6 +5762,7 @@ ipcMain.handle('users:clear-active', () => {
   store.activeUserId = null
   saveUserStore(store)
   browserMode = 'home'
+  hideSecurityTooltip()
   setReputationIntervention(null)
   setDnsFailure(null)
   continuedWarningNavigationUrl = null
@@ -4506,6 +5844,7 @@ ipcMain.handle('browser:navigate', async (_event, value: string) => {
 
 ipcMain.handle('browser:home', () => {
   browserMode = 'home'
+  hideSecurityTooltip()
   setReputationIntervention(null)
   setDnsFailure(null)
   continuedWarningNavigationUrl = null
@@ -4649,6 +5988,22 @@ ipcMain.handle('trusted-domains:remove-custom-domain', (_event, domain: string) 
   return removeCustomTrustedDomain(domain)
 })
 
+ipcMain.handle('sso-providers:get', () => {
+  return loadSsoProviders()
+})
+
+ipcMain.handle('sso-providers:add', (_event, value: string) => {
+  return addSsoProvider(value)
+})
+
+ipcMain.handle('sso-providers:set-enabled', (_event, id: string, enabled: boolean) => {
+  return setSsoProviderEnabled(id, enabled)
+})
+
+ipcMain.handle('sso-providers:remove', (_event, id: string) => {
+  return removeSsoProvider(id)
+})
+
 ipcMain.handle('browser:toggle-maximize', () => {
   if (!mainWindow) {
     return
@@ -4673,6 +6028,14 @@ ipcMain.handle('window:close', () => {
 
 ipcMain.handle('clipboard:copy-text', (_event, value: string) => {
   clipboard.writeText(value ?? '')
+})
+
+ipcMain.handle('security-tooltip:show', (_event, payload: SecurityTooltipPayload) => {
+  showSecurityTooltip(payload)
+})
+
+ipcMain.handle('security-tooltip:hide', () => {
+  hideSecurityTooltip()
 })
 
 ipcMain.handle('browser:set-chrome-height', (_event, height: number) => {

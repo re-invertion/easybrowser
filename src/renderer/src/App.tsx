@@ -23,7 +23,11 @@ type BrowserAccessIndicatorState = {
   hasCameraAccess: boolean
 }
 
-const GOOGLE_HOME_URL = 'https://www.google.pl/?hl=pl&gl=PL&pws=0'
+type SecurityLevelIndicatorProps = {
+  status: BrowserState['reputationStatus']
+}
+
+const DEFAULT_SEARCH_HOME_URL = 'https://www.google.pl/?hl=pl&gl=PL&pws=0'
 
 function getAdminLockMessage(lockedUntil: string | null): string | null {
   if (!lockedUntil) {
@@ -49,17 +53,71 @@ function getFavoriteFaviconUrl(rawUrl: string): string | null {
   }
 }
 
-function getPageFallbackFaviconUrl(rawUrl: string): string | null {
-  try {
-    const parsedUrl = new URL(rawUrl)
+function getSecurityRuleDetail(rule: { ruleId: string; code: string }): string | null {
+  if (rule.ruleId === 'content-brand-impersonation') {
+    const matchedBrand = rule.code.startsWith('content-brand-impersonation:')
+      ? rule.code.slice('content-brand-impersonation:'.length)
+      : ''
 
-    if (!/^https?:$/.test(parsedUrl.protocol)) {
-      return null
+    return matchedBrand ? `Marka: ${matchedBrand}` : null
+  }
+
+  return null
+}
+
+function getSecurityLevelIndicatorState(status: BrowserState['reputationStatus']) {
+  if (!status) {
+    return {
+      label: 'Brak oceny',
+      description: 'Ta strona nie ma jeszcze aktualnej oceny filtrów.',
+      color: '#94a3b8',
+      softColor: '#e2e8f0',
+      textClassName: 'text-slate-500',
+      ringClassName: 'shadow-[0_0_18px_rgba(148,163,184,0.28)]',
+      progress: 0
     }
+  }
 
-    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(parsedUrl.hostname)}&sz=64`
-  } catch {
-    return null
+  const progress = Math.max(
+    0,
+    Math.min(100, Math.round((status.score / Math.max(1, status.blockedThreshold)) * 100))
+  )
+
+  if (status.decision === 'blocked') {
+    return {
+      label: 'Zablokowana',
+      description: 'Filtry oznaczyły stronę jako niebezpieczną.',
+      color: '#dc2626',
+      softColor: '#fee2e2',
+      textClassName: 'text-red-700',
+      ringClassName: 'shadow-[0_0_22px_rgba(220,38,38,0.36)]',
+      progress
+    }
+  }
+
+  if (status.decision === 'warning') {
+    return {
+      label: 'Ostrzeżenie',
+      description: 'Strona wymaga ostrożności podczas przeglądania.',
+      color: '#d97706',
+      softColor: '#fef3c7',
+      textClassName: 'text-amber-700',
+      ringClassName: 'shadow-[0_0_22px_rgba(217,119,6,0.32)]',
+      progress
+    }
+  }
+
+  return {
+    label: status.score > 0 ? 'Niskie ryzyko' : 'Bezpieczna',
+    description:
+      status.score > 0
+        ? 'Filtry wykryły łagodne sygnały, ale strona mieści się w bezpiecznym zakresie.'
+        : 'Filtry nie wykryły ryzyka dla tej strony.',
+    color: '#16a34a',
+    softColor: '#dcfce7',
+    textClassName: 'text-emerald-700',
+    ringClassName: 'shadow-[0_0_22px_rgba(22,163,74,0.28)]',
+    progress
   }
 }
 
@@ -76,8 +134,7 @@ function getSecurityEventDecisionClass(decision: SecurityEventLog['decision']): 
 function getFaviconCandidates(rawUrl: string, faviconUrl: string | null): string[] {
   const candidates = [
     faviconUrl,
-    getFavoriteFaviconUrl(rawUrl),
-    getPageFallbackFaviconUrl(rawUrl)
+    getFavoriteFaviconUrl(rawUrl)
   ]
 
   return candidates.filter((candidate, index): candidate is string => {
@@ -99,7 +156,7 @@ function normalizeAddress(value: string): string {
   const trimmed = value.trim()
 
   if (trimmed.length === 0) {
-    return GOOGLE_HOME_URL
+    return DEFAULT_SEARCH_HOME_URL
   }
 
   if (/^https?:\/\//i.test(trimmed)) {
@@ -132,6 +189,16 @@ function normalizeReputationTestUrl(value: string): string {
 }
 
 function getFilterDraftFromSettings(settings: ReputationSettings) {
+  const contentRuleIds: ReputationRuleId[] = [
+    'content-sensitive-form',
+    'content-cross-origin-form',
+    'content-brand-impersonation',
+    'content-urgent-language',
+    'content-suspicious-iframe',
+    'content-download-risk',
+    'content-threat-link-catalog'
+  ]
+
   return {
     httpEnabled: !settings.disabledRuleIds.includes('insecure-http'),
     httpScore: settings.ruleWeights['insecure-http'] ?? 50,
@@ -152,6 +219,16 @@ function getFilterDraftFromSettings(settings: ReputationSettings) {
     youngDomainEnabled: !settings.disabledRuleIds.includes('young-domain-age'),
     youngDomainScore: settings.ruleWeights['young-domain-age'] ?? 35,
     youngDomainMaxAgeDays: settings.youngDomainMaxAgeDays,
+    urlRiskPatternEnabled: !settings.disabledRuleIds.includes('url-risk-pattern'),
+    urlRiskPatternScore: settings.ruleWeights['url-risk-pattern'] ?? 70,
+    contentAnalysisEnabled: contentRuleIds.some((ruleId) => !settings.disabledRuleIds.includes(ruleId)),
+    contentSensitiveFormScore: settings.ruleWeights['content-sensitive-form'] ?? 30,
+    contentCrossOriginFormScore: settings.ruleWeights['content-cross-origin-form'] ?? 45,
+    contentBrandImpersonationScore: settings.ruleWeights['content-brand-impersonation'] ?? 55,
+    contentUrgentLanguageScore: settings.ruleWeights['content-urgent-language'] ?? 15,
+    contentSuspiciousIframeScore: settings.ruleWeights['content-suspicious-iframe'] ?? 25,
+    contentDownloadRiskScore: settings.ruleWeights['content-download-risk'] ?? 30,
+    contentThreatLinkCatalogScore: settings.ruleWeights['content-threat-link-catalog'] ?? 70,
     blocklistsEnabled: !settings.disabledRuleIds.includes('domain-blocklist')
   }
 }
@@ -265,6 +342,78 @@ function BrowserAccessIndicator({
     <div className="flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-bold text-emerald-800">
       <FiMic aria-hidden="true" className="h-4 w-4 text-emerald-700" />
       <span>Ta strona korzysta z mikrofonu</span>
+    </div>
+  )
+}
+
+function SecurityLevelIndicator({ status }: SecurityLevelIndicatorProps) {
+  const indicator = getSecurityLevelIndicatorState(status)
+  const icon =
+    status?.decision === 'warning' ? (
+      <FiAlertTriangle aria-hidden="true" className="h-4 w-4" style={{ color: indicator.color }} />
+    ) : status?.decision === 'blocked' ? (
+      <div className="relative h-4 w-4" aria-hidden="true">
+        <FiShield className="absolute inset-0 h-4 w-4" style={{ color: indicator.color }} />
+        <FiX className="absolute top-[4px] left-[4px] h-2 w-2 stroke-[4]" style={{ color: indicator.color }} />
+      </div>
+    ) : (
+      <FiShield aria-hidden="true" className="h-4 w-4" style={{ color: indicator.color }} />
+    )
+  const showTooltip = (element: HTMLElement) => {
+    const rect = element.getBoundingClientRect()
+
+    void window.easybrowser.showSecurityTooltip({
+      anchor: {
+        left: rect.left,
+        right: rect.right,
+        bottom: rect.bottom
+      },
+      label: indicator.label,
+      description: indicator.description,
+      detail: status
+        ? `Reguły: ${status.matchedRuleCount} / próg blokady: ${status.blockedThreshold}`
+        : null,
+      color: indicator.color,
+      score: status?.score ?? null,
+      decision: status?.decision ?? null,
+      warningThreshold: status?.warningThreshold ?? null,
+      blockedThreshold: status?.blockedThreshold ?? null,
+      matchedRuleCount: status?.matchedRuleCount ?? null
+    })
+  }
+
+  return (
+    <div
+      className="relative flex shrink-0 cursor-pointer items-center gap-2 rounded-full border bg-white/80 px-3 py-1 text-xs font-bold shadow-[0_8px_22px_rgba(15,23,42,0.06)] backdrop-blur transition hover:scale-[1.01] hover:bg-white"
+      style={{
+        borderColor: `${indicator.color}55`,
+        color: indicator.color
+      }}
+      aria-label={`${indicator.label}. ${indicator.description}`}
+      role="status"
+      tabIndex={0}
+      onMouseEnter={(event) => showTooltip(event.currentTarget)}
+      onMouseLeave={() => {
+        void window.easybrowser.hideSecurityTooltip()
+      }}
+      onFocus={(event) => showTooltip(event.currentTarget)}
+      onBlur={() => {
+        void window.easybrowser.hideSecurityTooltip()
+      }}
+    >
+      <div
+        className={`security-level-orb relative flex h-6 w-6 items-center justify-center rounded-full ${indicator.ringClassName}`}
+        style={{ backgroundColor: indicator.softColor }}
+      >
+        <div
+          className="flex h-5 w-5 items-center justify-center rounded-full bg-white/80"
+        >
+          {icon}
+        </div>
+      </div>
+      <span className="hidden whitespace-nowrap sm:inline">
+        {indicator.label}
+      </span>
     </div>
   )
 }
@@ -386,6 +535,7 @@ function AppBrandMenu({
 function App() {
   const browserChromeRef = useRef<HTMLElement | null>(null)
   const isEditingAddressRef = useRef(false)
+  const previousModeRef = useRef<ViewMode>('home')
   const [mode, setMode] = useState<ViewMode>('home')
   const [users, setUsers] = useState<UserProfile[]>([])
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([])
@@ -393,7 +543,7 @@ function App() {
   const [isLoadingUsers, setIsLoadingUsers] = useState(true)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [inputValue, setInputValue] = useState('')
-  const [currentUrl, setCurrentUrl] = useState(GOOGLE_HOME_URL)
+  const [currentUrl, setCurrentUrl] = useState(DEFAULT_SEARCH_HOME_URL)
   const [pageTitle, setPageTitle] = useState('Easybrowser')
   const [isLoading, setIsLoading] = useState(false)
   const [canGoBack, setCanGoBack] = useState(false)
@@ -403,6 +553,8 @@ function App() {
   const [hasCameraAccess, setHasCameraAccess] = useState(false)
   const [isFavorite, setIsFavorite] = useState(false)
   const [browserFaviconUrl, setBrowserFaviconUrl] = useState<string | null>(null)
+  const [reputationStatus, setReputationStatus] =
+    useState<BrowserState['reputationStatus']>(null)
   const [reputationIntervention, setReputationIntervention] =
     useState<BrowserState['reputationIntervention']>(null)
   const [dnsFailure, setDnsFailure] = useState<BrowserState['dnsFailure']>(null)
@@ -434,6 +586,7 @@ function App() {
   const [domainBlocklistSources, setDomainBlocklistSources] = useState<DomainBlocklistSource[]>([])
   const [trustedDomainSources, setTrustedDomainSources] = useState<TrustedDomainSource[]>([])
   const [customTrustedDomains, setCustomTrustedDomains] = useState<CustomTrustedDomain[]>([])
+  const [ssoProviders, setSsoProviders] = useState<SsoProvider[]>([])
   const [securityEventLogs, setSecurityEventLogs] = useState<SecurityEventLog[]>([])
   const [isLoadingSecurityEventLogs, setIsLoadingSecurityEventLogs] = useState(false)
   const [isSecurityEventsPanelOpen, setIsSecurityEventsPanelOpen] = useState(false)
@@ -451,6 +604,7 @@ function App() {
   const [domainBlocklistSourcesDraft, setDomainBlocklistSourcesDraft] = useState<DomainBlocklistSource[]>([])
   const [newDomainBlocklistUrl, setNewDomainBlocklistUrl] = useState('')
   const [newCustomTrustedDomain, setNewCustomTrustedDomain] = useState('')
+  const [newSsoProviderHostname, setNewSsoProviderHostname] = useState('')
   const [googleSafeBrowsingApiKeyInput, setGoogleSafeBrowsingApiKeyInput] = useState('')
   const [shouldClearGoogleSafeBrowsingApiKey, setShouldClearGoogleSafeBrowsingApiKey] =
     useState(false)
@@ -470,6 +624,8 @@ function App() {
   const [isGoogleSafeBrowsingRuleExpanded, setIsGoogleSafeBrowsingRuleExpanded] =
     useState(false)
   const [isYoungDomainRuleExpanded, setIsYoungDomainRuleExpanded] = useState(false)
+  const [isUrlRiskPatternRuleExpanded, setIsUrlRiskPatternRuleExpanded] = useState(false)
+  const [isContentAnalysisRuleExpanded, setIsContentAnalysisRuleExpanded] = useState(false)
   const [areBlocklistsExpanded, setAreBlocklistsExpanded] = useState(false)
   const [userPendingDeletion, setUserPendingDeletion] = useState<UserProfile | null>(null)
 
@@ -507,6 +663,34 @@ function App() {
     filterSettingsDraft.youngDomainScore !==
       (reputationSettings.ruleWeights['young-domain-age'] ?? 35) ||
     filterSettingsDraft.youngDomainMaxAgeDays !== reputationSettings.youngDomainMaxAgeDays ||
+    filterSettingsDraft.urlRiskPatternEnabled !==
+      !reputationSettings.disabledRuleIds.includes('url-risk-pattern') ||
+    filterSettingsDraft.urlRiskPatternScore !==
+      (reputationSettings.ruleWeights['url-risk-pattern'] ?? 70) ||
+    filterSettingsDraft.contentAnalysisEnabled !==
+      [
+        'content-sensitive-form',
+        'content-cross-origin-form',
+        'content-brand-impersonation',
+        'content-urgent-language',
+        'content-suspicious-iframe',
+        'content-download-risk',
+        'content-threat-link-catalog'
+      ].some((ruleId) => !reputationSettings.disabledRuleIds.includes(ruleId as ReputationRuleId)) ||
+    filterSettingsDraft.contentSensitiveFormScore !==
+      (reputationSettings.ruleWeights['content-sensitive-form'] ?? 30) ||
+    filterSettingsDraft.contentCrossOriginFormScore !==
+      (reputationSettings.ruleWeights['content-cross-origin-form'] ?? 45) ||
+    filterSettingsDraft.contentBrandImpersonationScore !==
+      (reputationSettings.ruleWeights['content-brand-impersonation'] ?? 55) ||
+    filterSettingsDraft.contentUrgentLanguageScore !==
+      (reputationSettings.ruleWeights['content-urgent-language'] ?? 15) ||
+    filterSettingsDraft.contentSuspiciousIframeScore !==
+      (reputationSettings.ruleWeights['content-suspicious-iframe'] ?? 25) ||
+    filterSettingsDraft.contentDownloadRiskScore !==
+      (reputationSettings.ruleWeights['content-download-risk'] ?? 30) ||
+    filterSettingsDraft.contentThreatLinkCatalogScore !==
+      (reputationSettings.ruleWeights['content-threat-link-catalog'] ?? 70) ||
     filterSettingsDraft.blocklistsEnabled !==
       !reputationSettings.disabledRuleIds.includes('domain-blocklist') ||
     googleSafeBrowsingApiKeyInput.trim().length > 0 ||
@@ -536,6 +720,7 @@ function App() {
           nextDomainBlocklistSources,
           nextTrustedDomainSources,
           nextCustomTrustedDomains,
+          nextSsoProviders,
           nextSecurityEventLogs
         ] =
           await Promise.all([
@@ -546,6 +731,7 @@ function App() {
           window.easybrowser.getDomainBlocklistSources(),
           window.easybrowser.getTrustedDomainSources(),
           window.easybrowser.getCustomTrustedDomains(),
+          window.easybrowser.getSsoProviders(),
           window.easybrowser.getSecurityEventLogs()
         ])
         setUsers(state.users)
@@ -557,6 +743,7 @@ function App() {
         setDomainBlocklistSources(nextDomainBlocklistSources)
         setTrustedDomainSources(nextTrustedDomainSources)
         setCustomTrustedDomains(nextCustomTrustedDomains)
+        setSsoProviders(nextSsoProviders)
         setSecurityEventLogs(nextSecurityEventLogs)
       } catch (error) {
         setErrorMessage(
@@ -568,10 +755,14 @@ function App() {
     }
 
     const unsubscribe = window.easybrowser.onBrowserStateChange((state: BrowserState) => {
+      const previousMode = previousModeRef.current
+      previousModeRef.current = state.mode
       setMode(state.mode)
-      setCurrentUrl(state.url || GOOGLE_HOME_URL)
+      setCurrentUrl(state.url || DEFAULT_SEARCH_HOME_URL)
       if (state.mode !== 'browser') {
-        setInputValue('')
+        if (previousMode === 'browser') {
+          setInputValue('')
+        }
       } else if (!isEditingAddressRef.current) {
         setInputValue(state.url || '')
       }
@@ -584,6 +775,7 @@ function App() {
       setHasCameraAccess(state.hasCameraAccess)
       setIsFavorite(state.isFavorite)
       setBrowserFaviconUrl(state.browserFaviconUrl)
+      setReputationStatus(state.reputationStatus)
       setReputationIntervention(state.reputationIntervention)
       setDnsFailure(state.dnsFailure)
       setErrorMessage(state.error)
@@ -763,7 +955,7 @@ function App() {
       setOpenAppMenu('closed')
       setNewUserName('')
       setInputValue('')
-      setCurrentUrl(GOOGLE_HOME_URL)
+      setCurrentUrl(DEFAULT_SEARCH_HOME_URL)
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : 'Nie udało się zmienić użytkownika.'
@@ -806,7 +998,7 @@ function App() {
     setAdminGateMode('closed')
     setOpenAppMenu('closed')
     setInputValue('')
-    setCurrentUrl(GOOGLE_HOME_URL)
+    setCurrentUrl(DEFAULT_SEARCH_HOME_URL)
     setPageTitle('Easybrowser')
     setIsLoading(false)
     setCanGoBack(false)
@@ -1064,6 +1256,22 @@ function App() {
         nextDisabledRuleIds.push('young-domain-age')
       }
 
+      if (!filterSettingsDraft.urlRiskPatternEnabled) {
+        nextDisabledRuleIds.push('url-risk-pattern')
+      }
+
+      if (!filterSettingsDraft.contentAnalysisEnabled) {
+        nextDisabledRuleIds.push(
+          'content-sensitive-form',
+          'content-cross-origin-form',
+          'content-brand-impersonation',
+          'content-urgent-language',
+          'content-suspicious-iframe',
+          'content-download-risk',
+          'content-threat-link-catalog'
+        )
+      }
+
       if (!filterSettingsDraft.blocklistsEnabled) {
         nextDisabledRuleIds.push('domain-blocklist')
       }
@@ -1083,7 +1291,15 @@ function App() {
           'trusted-domain-in-subdomain': filterSettingsDraft.trustedDomainInSubdomainScore,
           'is-ip': filterSettingsDraft.ipScore,
           'google-safe-browsing': filterSettingsDraft.googleSafeBrowsingScore,
-          'young-domain-age': filterSettingsDraft.youngDomainScore
+          'young-domain-age': filterSettingsDraft.youngDomainScore,
+          'url-risk-pattern': filterSettingsDraft.urlRiskPatternScore,
+          'content-sensitive-form': filterSettingsDraft.contentSensitiveFormScore,
+          'content-cross-origin-form': filterSettingsDraft.contentCrossOriginFormScore,
+          'content-brand-impersonation': filterSettingsDraft.contentBrandImpersonationScore,
+          'content-urgent-language': filterSettingsDraft.contentUrgentLanguageScore,
+          'content-suspicious-iframe': filterSettingsDraft.contentSuspiciousIframeScore,
+          'content-download-risk': filterSettingsDraft.contentDownloadRiskScore,
+          'content-threat-link-catalog': filterSettingsDraft.contentThreatLinkCatalogScore
         },
         youngDomainMaxAgeDays: filterSettingsDraft.youngDomainMaxAgeDays
       })
@@ -1179,6 +1395,45 @@ function App() {
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : 'Nie udało się dodać domeny do allowlisty.'
+      )
+    }
+  }
+
+  const handleAddSsoProvider = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    try {
+      const nextProviders = await window.easybrowser.addSsoProvider(newSsoProviderHostname)
+      setSsoProviders(nextProviders)
+      setNewSsoProviderHostname('')
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się dodać providera SSO.'
+      )
+    }
+  }
+
+  const handleToggleSsoProvider = async (id: string, enabled: boolean) => {
+    try {
+      const nextProviders = await window.easybrowser.setSsoProviderEnabled(id, enabled)
+      setSsoProviders(nextProviders)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zmienić providera SSO.'
+      )
+    }
+  }
+
+  const handleRemoveSsoProvider = async (id: string) => {
+    try {
+      const nextProviders = await window.easybrowser.removeSsoProvider(id)
+      setSsoProviders(nextProviders)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się usunąć providera SSO.'
       )
     }
   }
@@ -1488,7 +1743,9 @@ function App() {
                       placeholder="Wpisz adres strony lub wyszukaj"
                     />
 
-                    <div className="relative flex shrink-0 items-center">
+                    <div className="relative flex shrink-0 items-center gap-1">
+                      <SecurityLevelIndicator status={reputationStatus} />
+
                       <button
                         aria-label={
                           isFavorite
@@ -2189,6 +2446,86 @@ function App() {
 
                     <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
                       <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div className="max-w-3xl">
+                          <p className="text-lg font-bold text-app-text">
+                            Ryzykowne wzorce w adresie URL
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Filtr wykrywa podejrzane słowa i rozszerzenia w ścieżce adresu, np.
+                            phishing, malware, suspicious, bad login, cookie theft albo pliki
+                            wykonywalne.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.urlRiskPatternEnabled}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  urlRiskPatternEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>
+                              {filterSettingsDraft.urlRiskPatternEnabled ? 'Włączona' : 'Wyłączona'}
+                            </span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setIsUrlRiskPatternRuleExpanded((current) => !current)
+                            }}
+                            aria-expanded={isUrlRiskPatternRuleExpanded}
+                            aria-label="Rozwiń regułę ryzykownych wzorców URL"
+                          >
+                          {isUrlRiskPatternRuleExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {isUrlRiskPatternRuleExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <label className="mt-5 block max-w-sm">
+                            <span className="text-sm font-bold text-app-text">
+                              Punkty za ryzykowny wzorzec URL
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              value={filterSettingsDraft.urlRiskPatternScore}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  urlRiskPatternScore: Math.max(0, Number(event.target.value) || 0)
+                                }))
+                              }}
+                              className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                            />
+                          </label>
+
+                          <div className="mt-5">
+                            <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                              Efekt
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">
+                              Reguła działa ogólnie na adresach URL i nie jest przypisana do jednej
+                              konkretnej domeny testowej.
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
                         <div>
                           <p className="text-lg font-bold text-app-text">
                             Zaufane domeny w poddomenach
@@ -2729,6 +3066,220 @@ function App() {
                       <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
                         <div className="max-w-3xl">
                           <p className="text-lg font-bold text-app-text">
+                            Analiza treści strony
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-slate-500">
+                            Filtr pobiera HTML strony w izolacji i szuka sygnałów phishingu:
+                            formularzy z danymi wrażliwymi, podszywania się pod marki, presji w
+                            treści, podejrzanych ramek i ryzykownych pobrań.
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <label className="app-no-drag flex items-center gap-2 rounded-full border border-app-tile-border bg-white px-3 py-2 text-sm font-bold text-app-text">
+                            <input
+                              type="checkbox"
+                              className="focus-ring h-4 w-4 rounded border border-app-tile-border accent-[#1e3a8a]"
+                              checked={filterSettingsDraft.contentAnalysisEnabled}
+                              onChange={(event) => {
+                                setFilterSettingsDraft((current) => ({
+                                  ...current,
+                                  contentAnalysisEnabled: event.target.checked
+                                }))
+                              }}
+                            />
+                            <span>
+                              {filterSettingsDraft.contentAnalysisEnabled
+                                ? 'Włączona'
+                                : 'Wyłączona'}
+                            </span>
+                          </label>
+                          <button
+                            type="button"
+                            className="focus-ring mt-1 flex h-10 w-10 items-center justify-center rounded-full border border-app-tile-border bg-white text-slate-500"
+                            onClick={() => {
+                              setIsContentAnalysisRuleExpanded((current) => !current)
+                            }}
+                            aria-expanded={isContentAnalysisRuleExpanded}
+                            aria-label="Rozwiń analizę treści strony"
+                          >
+                          {isContentAnalysisRuleExpanded ? (
+                            <FiChevronUp aria-hidden="true" className="h-5 w-5" />
+                          ) : (
+                            <FiChevronDown aria-hidden="true" className="h-5 w-5" />
+                          )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {isContentAnalysisRuleExpanded ? (
+                        <div className="border-t border-app-tile-border px-5 pb-5">
+                          <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Punkty za formularz z danymi wrażliwymi
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={filterSettingsDraft.contentSensitiveFormScore}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    contentSensitiveFormScore: Math.max(
+                                      0,
+                                      Number(event.target.value) || 0
+                                    )
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Punkty za formularz do innej domeny
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={filterSettingsDraft.contentCrossOriginFormScore}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    contentCrossOriginFormScore: Math.max(
+                                      0,
+                                      Number(event.target.value) || 0
+                                    )
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Punkty za podszywanie się pod markę
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={filterSettingsDraft.contentBrandImpersonationScore}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    contentBrandImpersonationScore: Math.max(
+                                      0,
+                                      Number(event.target.value) || 0
+                                    )
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Punkty za presję w treści
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={filterSettingsDraft.contentUrgentLanguageScore}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    contentUrgentLanguageScore: Math.max(
+                                      0,
+                                      Number(event.target.value) || 0
+                                    )
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Punkty za podejrzane ramki
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={filterSettingsDraft.contentSuspiciousIframeScore}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    contentSuspiciousIframeScore: Math.max(
+                                      0,
+                                      Number(event.target.value) || 0
+                                    )
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Punkty za ryzykowne pobrania
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={filterSettingsDraft.contentDownloadRiskScore}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    contentDownloadRiskScore: Math.max(
+                                      0,
+                                      Number(event.target.value) || 0
+                                    )
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="text-sm font-bold text-app-text">
+                                Punkty za katalog linków do zagrożeń
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={filterSettingsDraft.contentThreatLinkCatalogScore}
+                                onChange={(event) => {
+                                  setFilterSettingsDraft((current) => ({
+                                    ...current,
+                                    contentThreatLinkCatalogScore: Math.max(
+                                      0,
+                                      Number(event.target.value) || 0
+                                    )
+                                  }))
+                                }}
+                                className="focus-ring mt-3 w-full rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text focus:outline-none"
+                              />
+                            </label>
+                          </div>
+
+                          <div className="mt-5">
+                            <p className="text-xs font-bold tracking-[0.14em] text-slate-500 uppercase">
+                              Efekt
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">
+                              Analiza treści nie zapisuje HTML strony. Dodaje punkty dopiero po
+                              pobraniu dokumentu HTML i jest pomijana, jeśli wcześniejsze reguły
+                              już blokują stronę.
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-[24px] border border-app-tile-border bg-slate-50/70">
+                      <div className="flex items-start justify-between gap-4 rounded-[24px] px-5 py-5">
+                        <div className="max-w-3xl">
+                          <p className="text-lg font-bold text-app-text">
                             Listy ostrzeżeń
                           </p>
                           <p className="mt-2 text-sm leading-6 text-slate-500">
@@ -2879,6 +3430,97 @@ function App() {
                       >
                         {isSavingFilterSettings ? 'Zapisywanie...' : 'Zapisz'}
                       </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="max-w-3xl">
+                        <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          SSO
+                        </p>
+                        <h2 className="mt-2 text-2xl font-bold text-app-text">
+                          Znani providerzy logowania
+                        </h2>
+                        <p className="mt-3 text-sm leading-6 text-slate-500">
+                          Te domeny są traktowane jako kontrolowane punkty logowania SSO. Podczas
+                          takiego flow przeglądarka przepuszcza nawigację natywnie, żeby nie zgubić
+                          formularzy POST, tokenów `state` ani artefaktów SAML.
+                        </p>
+                      </div>
+                    </div>
+
+                    <form
+                      className="mt-5 flex flex-col gap-3 lg:flex-row"
+                      onSubmit={(event) => {
+                        void handleAddSsoProvider(event)
+                      }}
+                    >
+                      <input
+                        type="text"
+                        inputMode="url"
+                        value={newSsoProviderHostname}
+                        onChange={(event) => setNewSsoProviderHostname(event.target.value)}
+                        placeholder="login.example.com"
+                        className="focus-ring min-w-0 flex-1 rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
+                      />
+                      <button
+                        type="submit"
+                        disabled={newSsoProviderHostname.trim().length === 0}
+                        className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        Dodaj providera
+                      </button>
+                    </form>
+
+                    <div className="mt-5 space-y-3">
+                      {ssoProviders.map((provider) => (
+                        <div
+                          key={provider.id}
+                          className="flex flex-col gap-4 rounded-[24px] border border-app-tile-border bg-slate-50/70 p-5 lg:flex-row lg:items-center lg:justify-between"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="text-sm font-bold text-app-text">{provider.name}</p>
+                              {provider.isDefault ? (
+                                <span className="rounded-full bg-slate-200 px-3 py-1 text-[11px] font-bold tracking-[0.12em] text-slate-600 uppercase">
+                                  Domyślny
+                                </span>
+                              ) : null}
+                            </div>
+                            <p className="mt-2 break-all text-sm text-slate-500">
+                              {provider.hostname}
+                            </p>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-3 lg:justify-end">
+                            <label className="app-no-drag flex items-center gap-3 rounded-full border border-app-tile-border bg-white px-4 py-3 text-sm font-bold text-app-text">
+                              <input
+                                type="checkbox"
+                                className="focus-ring h-5 w-5 rounded border border-app-tile-border accent-[#1e3a8a]"
+                                checked={provider.enabled}
+                                onChange={(event) => {
+                                  void handleToggleSsoProvider(provider.id, event.target.checked)
+                                }}
+                              />
+                              <span>{provider.enabled ? 'Włączony' : 'Wyłączony'}</span>
+                            </label>
+
+                            {!provider.isDefault ? (
+                              <button
+                                type="button"
+                                className="focus-ring flex h-11 w-11 items-center justify-center rounded-full border border-red-200 bg-red-50 text-red-600 transition hover:bg-red-100"
+                                aria-label={`Usuń providera SSO ${provider.hostname}`}
+                                onClick={() => {
+                                  void handleRemoveSsoProvider(provider.id)
+                                }}
+                              >
+                                <FiTrash2 aria-hidden="true" className="h-4 w-4" />
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   </div>
 
@@ -3163,14 +3805,25 @@ function App() {
                             </p>
                             {entry.matchedRules.length > 0 ? (
                               <div className="mt-2 flex flex-wrap gap-2">
-                                {entry.matchedRules.map((rule) => (
-                                  <span
-                                    key={`${entry.id}-${rule.ruleId}-${rule.code}`}
-                                    className="rounded-full border border-app-tile-border bg-white px-3 py-1 text-xs font-bold text-slate-600"
-                                  >
-                                    {rule.ruleId} +{rule.scoreDelta}
-                                  </span>
-                                ))}
+                                {entry.matchedRules.map((rule) => {
+                                  const ruleDetail = getSecurityRuleDetail(rule)
+
+                                  return (
+                                    <span
+                                      key={`${entry.id}-${rule.ruleId}-${rule.code}`}
+                                      className="rounded-2xl border border-app-tile-border bg-white px-3 py-1.5 text-xs font-bold text-slate-600"
+                                    >
+                                      <span>
+                                        {rule.ruleId} +{rule.scoreDelta}
+                                      </span>
+                                      {ruleDetail ? (
+                                        <span className="mt-0.5 block font-medium text-slate-500">
+                                          {ruleDetail}
+                                        </span>
+                                      ) : null}
+                                    </span>
+                                  )
+                                })}
                               </div>
                             ) : (
                               <p className="mt-2 text-sm text-slate-500">

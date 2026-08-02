@@ -73,6 +73,8 @@ Easybrowser is a very simple and security-focused browser based on Electron.
 - After selecting a user, the user sees a simplified home screen with a large search field.
 - The home search field is always clean when returning from browsing mode.
 - Browser URLs are not written back into the home search field.
+- Plain search terms use Google Search by default.
+- The app avoids unrelated background Google requests such as favicon fallback services or remote Google Fonts.
 - Favorites are stored per user in the `favorites` table.
 - Each favorite contains:
   - `url`,
@@ -110,6 +112,7 @@ Easybrowser is a very simple and security-focused browser based on Electron.
   - `/apple-touch-icon.png`.
 - Successful favicon responses are cached per origin as data URLs.
 - The cache prevents favicons from disappearing during later navigation/loading events.
+- The renderer does not call Google favicon fallback services.
 - The renderer has a fallback display path when no favicon is available.
 - The favicon is shown both:
   - in the browser address bar,
@@ -158,9 +161,15 @@ Easybrowser is a very simple and security-focused browser based on Electron.
 - Current default behavior:
   - score `50+` shows a warning screen,
   - score `70+` blocks the page.
+- The public reputation score is capped at `100`; if multiple rules add more than `100` points, the engine still exposes `100` as the final score.
 - Blocking rules can force a high score by adding enough points to cross the block threshold.
+- Content analysis runs after domain/URL rules for every navigation whose preliminary score is still below the block threshold.
+- If a page is already blocked by domain/URL rules, the engine does not fetch its HTML for content analysis.
 - Filter settings are edited as draft state in the renderer.
 - Filter settings are persisted only after the admin clicks `Zapisz`.
+- The browser chrome receives a lightweight reputation-status snapshot for the current page and renders it as a compact animated security-level indicator next to the favorites action.
+- The status indicator shows the score, decision, block threshold, and matched-rule count without exposing full page HTML or re-running content analysis in the renderer.
+- The security-level tooltip is rendered by the main process as a small frameless child `BrowserWindow`, not as a normal DOM tooltip, so it can appear above the `WebContentsView` layer.
 
 ## Reputation Rules
 - `insecure-http`
@@ -201,6 +210,52 @@ Easybrowser is a very simple and security-focused browser based on Electron.
   - Checks domain age through RDAP.
   - Very young domains can add warning score.
   - Missing RDAP data does not block navigation by itself.
+- `url-risk-pattern`
+  - Detects generic suspicious URL path/query patterns such as `phishing`, `malware`, `bad_login`, `low_rep_login`, `trick_to_bill`, `cookie_theft`, `pua`, `suspicious`, and risky executable/archive file extensions.
+  - This rule is generic and is not tied to a specific test domain.
+  - It is configured as a blocking-score rule by default.
+- `content-sensitive-form`
+  - Fetches the HTML document and detects forms or inputs that ask for sensitive data such as passwords, email, card data, OTP/SMS codes, BLIK, or similar fields.
+  - This is intentionally a warning-score signal because legitimate login pages also contain password fields.
+- `content-cross-origin-form`
+  - Detects sensitive forms that submit to a different hostname than the page being visited.
+  - This is a stronger content signal because phishing pages often collect credentials on a different endpoint.
+- `content-brand-impersonation`
+  - Compares visible page text and raw HTML against trusted-domain labels.
+  - If a trusted brand appears on an unofficial domain, the rule adds warning score.
+- Trusted domains themselves are still allowed before content analysis runs.
+- Trusted-domain matching keeps the full hostname during evaluation.
+- Exact trusted-domain matches are allowed.
+- Normal first-party subdomains can inherit trust from the trusted parent domain.
+- Private/shared hosting tenant domains, for example domains under private suffixes like `appspot.com` or `github.io`, do not inherit trust from the hosting platform entry. This prevents a popular hosting provider from disabling filters for every tenant page hosted below it.
+- Manually added trusted domains preserve the exact hostname entered by the administrator after normalization. For example, adding `testsafebrowsing.appspot.com` stores `testsafebrowsing.appspot.com`, not `appspot.com`.
+- Imported trusted-domain sources such as Tranco are normalized to registrable domains because they represent broad popularity lists rather than explicit administrator allowlist entries.
+- `content-urgent-language`
+  - Detects pressure language such as urgent verification, blocked account, account confirmation, or similar Polish/English phrases.
+  - This rule is low-score by default to reduce false positives.
+- `content-suspicious-iframe`
+  - Detects hidden iframes or iframes loaded from another hostname.
+- `content-download-risk`
+  - Detects links to risky executable/archive/script file extensions.
+- `content-threat-link-catalog`
+  - Detects pages that look like catalogs of links to multiple threat types, for example phishing, malware, unwanted software, billing traps, cookie theft, low-reputation pages, dangerous downloads, or restricted-content warnings.
+  - The rule requires several distinct threat categories and repeated warning/trigger language, so ordinary educational articles mentioning one threat should not be blocked by this rule alone.
+  - This is a generic content rule and is not tied to a specific testing hostname.
+
+## Page Content Analysis
+- Page content analysis is part of the same reputation engine and uses the same thresholds.
+- The main process fetches only HTML-like responses for analysis.
+- Content fetches use:
+  - no-store cache mode,
+  - a 6 second timeout,
+  - an HTML size cap before local analysis.
+- Content analysis is skipped for pages already blocked by earlier reputation rules.
+- The HTML is analyzed in memory and is not persisted.
+- Security events store only the matched rule metadata, score, event code, URL, hostname, and timestamp.
+- Full page content is never written to SQLite logs or browser settings.
+- Content analysis is skipped for trusted domains because trusted-domain navigation is allowed before reputation rules run.
+- The content-analysis rule group also performs its own trusted-domain guard before fetching HTML, so trusted domains are never fetched by this layer even if the group is called independently.
+- Content rules are configurable from the admin Security panel under `Analiza treści strony`.
 
 ## Remote Blocklists
 - The default remote blocklist sources are:

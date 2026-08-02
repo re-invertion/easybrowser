@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { getPublicSuffix } from 'tldts'
 import {
   getDomainLabelForLookalike,
   getLevenshteinDistance,
@@ -7,11 +8,15 @@ import {
   isLookalikeDomain
 } from '../src/main/lookalike'
 import {
+  analyzePageContent,
   extractDomainBlocklistHostnames,
   getHostnameFromUrl,
   hasNonLatinLetters,
+  isGovernmentDomainCandidate,
   isHostnameBlocked,
+  isTrustedDomainMatchAllowed,
   isTrustedDomainEntryMentionedInSubdomain,
+  normalizeCustomTrustedDomain,
   normalizeHostname,
   normalizeSiteCandidate
 } from '../src/main/reputationCore'
@@ -31,6 +36,37 @@ function assertSameMembers<T>(actual: Iterable<T>, expected: Iterable<T>): void 
   assert.deepEqual(Array.from(actual).sort(), Array.from(expected).sort())
 }
 
+const GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD = 3
+
+function isGovernmentTrustedDomain(domain: string): boolean {
+  const publicSuffix = getPublicSuffix(domain)
+
+  return publicSuffix === 'gov' || publicSuffix?.startsWith('gov.') === true
+}
+
+function getGenericTrustedLabels(trustedDomains: string[]): Set<string> {
+  const counts = new Map<string, number>()
+
+  for (const domain of trustedDomains) {
+    const label = getTrustedDomainLookalikeMetadata(domain).label
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+
+  return new Set(
+    Array.from(counts.entries())
+      .filter(
+        ([label, count]) =>
+          count >= GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD ||
+          trustedDomains.some(
+            (domain) =>
+              getTrustedDomainLookalikeMetadata(domain).label === label &&
+              isGovernmentTrustedDomain(domain)
+          )
+      )
+      .map(([label]) => label)
+  )
+}
+
 function getRuleIdsForScenario(input: {
   url: string
   trustedDomains?: string[]
@@ -40,9 +76,22 @@ function getRuleIdsForScenario(input: {
   ipScore?: number
   lookalikeScore?: number
   trustedDomainInSubdomainScore?: number
+  urlRiskPatternScore?: number
+  html?: string
+  contentScores?: Partial<Record<string, number>>
 }): { score: number; ruleIds: string[]; decision: 'allow' | 'warning' | 'blocked' } {
   const candidate = normalizeSiteCandidate(input.url)
+
+  if (isGovernmentDomainCandidate(candidate)) {
+    return {
+      score: 0,
+      ruleIds: [],
+      decision: 'allow'
+    }
+  }
+
   const trustedDomains = input.trustedDomains ?? []
+  const genericTrustedLabels = getGenericTrustedLabels(trustedDomains)
   const blocklistedDomains = new Set(input.blocklistedDomains ?? [])
   const ruleIds: string[] = []
   let score = 0
@@ -76,7 +125,8 @@ function getRuleIdsForScenario(input: {
       isTrustedDomainEntryMentionedInSubdomain(
         candidate,
         domain,
-        getTrustedDomainLookalikeMetadata(domain).label
+        getTrustedDomainLookalikeMetadata(domain).label,
+        genericTrustedLabels.has(getTrustedDomainLookalikeMetadata(domain).label)
       )
     )
   ) {
@@ -89,10 +139,61 @@ function getRuleIdsForScenario(input: {
     score += input.ipScore ?? 40
   }
 
+  const urlRiskPatternMatch = [
+    /\bphishing\b/i,
+    /\bmalware\b/i,
+    /\bunwanted\b/i,
+    /\bpua\b/i,
+    /\bsuspicious\b/i,
+    /\bbad[_-]login\b/i,
+    /\blow[_-]rep[_-]login\b/i,
+    /\btrick[_-]to[_-]bill\b/i,
+    /\bcookie[_-]theft\b/i,
+    /\bbadrep\b/i,
+    /\bbad[_-]app\b/i,
+    /\bforce[_-]csd\b/i,
+    /\blocal[_-]trigger[_-]csd\b/i,
+    /\brestricted[_-]content\b/i,
+    /\.(?:exe|apk|msi|scr|bat|cmd|vbs|ps1|jar)(?:$|[?#])/i,
+    /\.(?:zip|rar|7z)(?:$|[?#])/i
+  ].some((pattern) => pattern.test(`${candidate.path}${candidate.query}`))
+
+  if (urlRiskPatternMatch) {
+    ruleIds.push('url-risk-pattern')
+    score += input.urlRiskPatternScore ?? 70
+  }
+
+  if (input.html && score < 70) {
+    const findings = analyzePageContent(
+      input.html,
+      candidate,
+      trustedDomains.map((domain) => ({
+        domain,
+        label: getTrustedDomainLookalikeMetadata(domain).label,
+        isGenericLabel: genericTrustedLabels.has(getTrustedDomainLookalikeMetadata(domain).label)
+      }))
+    )
+
+    for (const finding of findings) {
+      ruleIds.push(finding.id)
+      score += input.contentScores?.[finding.id] ?? {
+        'content-sensitive-form': 30,
+        'content-cross-origin-form': 45,
+        'content-brand-impersonation': 55,
+        'content-urgent-language': 15,
+        'content-suspicious-iframe': 25,
+        'content-download-risk': 30,
+        'content-threat-link-catalog': 70
+      }[finding.id]
+    }
+  }
+
+  const cappedScore = Math.min(100, score)
+
   return {
-    score,
+    score: cappedScore,
     ruleIds,
-    decision: score >= 70 ? 'blocked' : score >= 50 ? 'warning' : 'allow'
+    decision: cappedScore >= 70 ? 'blocked' : cappedScore >= 50 ? 'warning' : 'allow'
   }
 }
 
@@ -152,6 +253,23 @@ test('normalizeSiteCandidate keeps percent-safe normalized URL shape', () => {
   assert.equal(candidate.normalizedUrl, 'https://example.com/a%20b?q=hello%20world')
   assert.equal(candidate.path, '/a%20b')
   assert.equal(candidate.query, '?q=hello%20world')
+})
+
+test('normalizeCustomTrustedDomain preserves manually entered subdomains', () => {
+  assert.equal(
+    normalizeCustomTrustedDomain('testsafebrowsing.appspot.com'),
+    'testsafebrowsing.appspot.com'
+  )
+  assert.equal(
+    normalizeCustomTrustedDomain('https://TestsafeBrowsing.appspot.com/path?q=1'),
+    'testsafebrowsing.appspot.com'
+  )
+})
+
+test('normalizeCustomTrustedDomain rejects IP and unsafe manual entries', () => {
+  assert.equal(normalizeCustomTrustedDomain('127.0.0.1'), null)
+  assert.equal(normalizeCustomTrustedDomain('bad host.example'), null)
+  assert.equal(normalizeCustomTrustedDomain('https://'), null)
 })
 
 test('extractDomainBlocklistHostnames reads domains, URLs, comments and hosts-like rows', () => {
@@ -215,6 +333,25 @@ test('hasNonLatinLetters detects Unicode hostnames after candidate normalization
 test('hasNonLatinLetters does not treat accented Latin letters as non-latin script', () => {
   assert.equal(hasNonLatinLetters('zażółć.pl'), false)
   assert.equal(hasNonLatinLetters('mañana.example'), false)
+})
+
+test('government domain detection trusts public gov suffixes only', () => {
+  assert.equal(isGovernmentDomainCandidate(normalizeSiteCandidate('https://agency.gov')), true)
+  assert.equal(isGovernmentDomainCandidate(normalizeSiteCandidate('https://www.gov.pl')), true)
+  assert.equal(
+    isGovernmentDomainCandidate(
+      normalizeSiteCandidate('https://login.gov.pl/login/SingleSignOnService')
+    ),
+    true
+  )
+  assert.equal(
+    isGovernmentDomainCandidate(
+      normalizeSiteCandidate('https://find-and-update.company-information.service.gov.uk')
+    ),
+    true
+  )
+  assert.equal(isGovernmentDomainCandidate(normalizeSiteCandidate('https://gov-example.com')), false)
+  assert.equal(isGovernmentDomainCandidate(normalizeSiteCandidate('https://gov.pl.fake.xyz')), false)
 })
 
 test('lookalike label extraction uses the first domain label', () => {
@@ -326,6 +463,34 @@ test('trusted domain in subdomain catches brand label surrounded by dot labels',
   assert.equal(isTrustedDomainEntryMentionedInSubdomain(candidate, 'paypal.com', 'paypal'), true)
 })
 
+test('trusted domain in subdomain ignores generic trusted labels', () => {
+  const candidate = normalizeSiteCandidate('https://portalpacjenta.cmp.med.pl')
+
+  assert.equal(
+    isTrustedDomainEntryMentionedInSubdomain(
+      candidate,
+      'portalpacjenta.gov.pl',
+      'portalpacjenta',
+      true
+    ),
+    false
+  )
+})
+
+test('trusted domain in subdomain still catches full generic trusted domain mentions', () => {
+  const candidate = normalizeSiteCandidate('https://portalpacjenta.gov.pl.fake.xyz')
+
+  assert.equal(
+    isTrustedDomainEntryMentionedInSubdomain(
+      candidate,
+      'portalpacjenta.gov.pl',
+      'portalpacjenta',
+      true
+    ),
+    true
+  )
+})
+
 test('trusted domain in subdomain ignores official domain and direct subdomains', () => {
   const direct = normalizeSiteCandidate('https://paypal.com')
   const officialSubdomain = normalizeSiteCandidate('https://login.paypal.com')
@@ -333,6 +498,21 @@ test('trusted domain in subdomain ignores official domain and direct subdomains'
   assert.equal(isTrustedDomainEntryMentionedInSubdomain(direct, 'paypal.com', 'paypal'), false)
   assert.equal(
     isTrustedDomainEntryMentionedInSubdomain(officialSubdomain, 'paypal.com', 'paypal'),
+    false
+  )
+})
+
+test('trusted domain in subdomain ignores allowed trusted service subdomains', () => {
+  const candidate = normalizeSiteCandidate(
+    'https://find-and-update.company-information.service.gov.uk/company/11545706'
+  )
+
+  assert.equal(
+    isTrustedDomainEntryMentionedInSubdomain(
+      candidate,
+      'company-information.service.gov.uk',
+      'company-information'
+    ),
     false
   )
 })
@@ -361,10 +541,494 @@ test('trusted domain in subdomain works when label is derived from trusted domai
   assert.equal(isTrustedDomainEntryMentionedInSubdomain(candidate, 'microsoft.com'), true)
 })
 
+test('trusted domain matching allows normal first-party subdomains', () => {
+  assert.equal(isTrustedDomainMatchAllowed('www.google.com', 'google.com'), true)
+  assert.equal(isTrustedDomainMatchAllowed('accounts.google.com', 'google.com'), true)
+})
+
+test('trusted domain matching does not trust private hosting tenant subdomains', () => {
+  assert.equal(isTrustedDomainMatchAllowed('testsafebrowsing.appspot.com', 'appspot.com'), false)
+  assert.equal(isTrustedDomainMatchAllowed('example.github.io', 'github.io'), false)
+})
+
+test('trusted domain matching allows government public suffix subdomains', () => {
+  assert.equal(isTrustedDomainMatchAllowed('login.gov.pl', 'gov.pl'), true)
+  assert.equal(isTrustedDomainMatchAllowed('find-and-update.company-information.service.gov.uk', 'gov.uk'), true)
+})
+
+test('trusted domain matching still allows exact private hosting domains', () => {
+  assert.equal(isTrustedDomainMatchAllowed('appspot.com', 'appspot.com'), true)
+  assert.equal(
+    isTrustedDomainMatchAllowed('testsafebrowsing.appspot.com', 'testsafebrowsing.appspot.com'),
+    true
+  )
+})
+
+test('analyzePageContent detects sensitive login form', () => {
+  const findings = analyzePageContent(
+    '<html><form><input type="email"><input type="password"></form></html>',
+    normalizeSiteCandidate('https://example.com/login'),
+    []
+  )
+
+  assertSameMembers(findings.map((finding) => finding.id), ['content-sensitive-form'])
+})
+
+test('analyzePageContent detects cross-origin sensitive form', () => {
+  const findings = analyzePageContent(
+    '<form action="https://collector.example/submit"><input name="password"></form>',
+    normalizeSiteCandidate('https://bank-login.example/login'),
+    []
+  )
+
+  assertSameMembers(findings.map((finding) => finding.id), [
+    'content-sensitive-form',
+    'content-cross-origin-form'
+  ])
+})
+
+test('analyzePageContent ignores non-sensitive cross-origin form', () => {
+  const findings = analyzePageContent(
+    '<form action="https://newsletter.example/submit"><input name="query"></form>',
+    normalizeSiteCandidate('https://blog.example'),
+    []
+  )
+
+  assert.deepEqual(findings.map((finding) => finding.id), [])
+})
+
+test('analyzePageContent ignores cookie consent forms with technical anti-forgery tokens', () => {
+  const findings = analyzePageContent(
+    `
+      <form data-cookieman-form>
+        <input type="checkbox" name="mandatory" checked>
+        <input type="hidden" name="__RequestVerificationToken" value="abc">
+        <button>Akceptuj wszystkie pliki cookie</button>
+      </form>
+    `,
+    normalizeSiteCandidate('https://example.com'),
+    []
+  )
+
+  assert.deepEqual(findings.map((finding) => finding.id), [])
+})
+
+test('analyzePageContent ignores newsletter email-only forms', () => {
+  const findings = analyzePageContent(
+    `
+      <form>
+        <label for="email">Twój adres email</label>
+        <input type="email" id="email" name="email" placeholder="Twój adres email...">
+        <input id="honeypot" type="text" class="hidden" name="honeypot">
+        <button type="submit">Zapisz</button>
+      </form>
+    `,
+    normalizeSiteCandidate('https://basketball.example'),
+    []
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-sensitive-form'))
+})
+
+test('analyzePageContent ignores news article brand mentions with newsletter forms', () => {
+  const findings = analyzePageContent(
+    `
+      <article>
+        <h1>Tunel na Hetmańskiej i wiadukt na Malowniczej. Podpisano porozumienia</h1>
+        <p>Łódź i PLK wybudują tunel oraz wiadukt. Sprawdź harmonogram prac.</p>
+      </article>
+      <form class="space-y-3.5">
+        <input type="email" required placeholder="twoj@email.pl" aria-label="Twój e-mail" value="">
+        <button type="submit" disabled><span>Zapisz się</span></button>
+      </form>
+      <form class="space-y-3">
+        <label for="footer-newsletter-email" class="sr-only">Twój e-mail</label>
+        <input id="footer-newsletter-email" type="email" required placeholder="twoj@email.pl" value="">
+        <button type="submit" disabled><span>Zapisz</span></button>
+      </form>
+    `,
+    normalizeSiteCandidate('https://lodzplus.pl/artykul/tunel-na-hetmanskiej-i-wiadukt-na-malowniczej-lodz-plk'),
+    [{ domain: 'plk.pl', label: 'plk' }]
+  )
+
+  assert.deepEqual(findings.map((finding) => finding.id), [])
+})
+
+test('analyzePageContent detects trusted brand mentioned on unofficial domain', () => {
+  const findings = analyzePageContent(
+    '<title>PayPal Login</title><main>Verify your PayPal account</main><form><input type="password"></form>',
+    normalizeSiteCandidate('https://secure-login.example'),
+    [{ domain: 'paypal.com', label: 'paypal' }]
+  )
+
+  assert(findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores trusted brands mentioned only in resource URLs', () => {
+  const findings = analyzePageContent(
+    `
+      <main>Zaloguj się do sklepu.</main>
+      <script src="https://www.paypal.com/sdk/js?client-id=abc"></script>
+      <form><input type="password"></form>
+    `,
+    normalizeSiteCandidate('https://shop.example'),
+    [{ domain: 'paypal.com', label: 'paypal' }]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores pages mentioning many different trusted brands', () => {
+  const findings = analyzePageContent(
+    `
+      <main>
+        Zaloguj się, aby sprawdzić integracje: PayPal, Stripe, Amazon, Microsoft i Netflix.
+      </main>
+      <form><input type="password"></form>
+    `,
+    normalizeSiteCandidate('https://marketplace.example'),
+    [
+      { domain: 'paypal.com', label: 'paypal' },
+      { domain: 'stripe.com', label: 'stripe' },
+      { domain: 'amazon.com', label: 'amazon' },
+      { domain: 'microsoft.com', label: 'microsoft' },
+      { domain: 'netflix.com', label: 'netflix' }
+    ]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores generic trusted service label mentions', () => {
+  const findings = analyzePageContent(
+    '<title>Portal pacjenta</title><main>Zaloguj się do portalu pacjenta.</main><form><input type="password"></form>',
+    normalizeSiteCandidate('https://portalpacjenta.cmp.med.pl'),
+    [{ domain: 'portalpacjenta.gov.pl', label: 'portalpacjenta', isGenericLabel: true }]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores government service labels on healthcare portals', () => {
+  const findings = analyzePageContent(
+    `
+      <header><button>Zaloguj</button></header>
+      <main>
+        <h1>Usługi dla pacjenta</h1>
+        <p>Portal Pacjenta LUX MED umożliwia sprawdzenie wizyt i badań.</p>
+      </main>
+    `,
+    normalizeSiteCandidate('https://www.luxmed.pl/dla-pacjenta/uslugi'),
+    [{ domain: 'portalpacjenta.gov.pl', label: 'portalpacjenta', isGenericLabel: true }]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores generic social and app-store platform brands', () => {
+  const findings = analyzePageContent(
+    `
+      <header><button>Zaloguj</button></header>
+      <main>Portal Pacjenta</main>
+      <a href="https://play.google.com/store/apps/details?id=example">Google Play</a>
+      <a href="https://www.facebook.com/example">Facebook</a>
+      <a href="https://www.linkedin.com/company/example">LinkedIn</a>
+      <a href="https://www.youtube.com/@example">YouTube</a>
+    `,
+    normalizeSiteCandidate('https://cmp.med.pl/portal-pacjenta/'),
+    [
+      { domain: 'google.com', label: 'google' },
+      { domain: 'facebook.com', label: 'facebook' },
+      { domain: 'linkedin.com', label: 'linkedin' },
+      { domain: 'youtube.com', label: 'youtube' }
+    ]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores generic CDN and infrastructure brands', () => {
+  const findings = analyzePageContent(
+    `
+      <header><button>Zaloguj</button></header>
+      <script src="https://www.gstatic.com/recaptcha/releases/app.js"></script>
+      <link href="https://fonts.googleapis.com/css2?family=Inter" rel="stylesheet">
+      <script src="https://cdn.jsdelivr.net/npm/example/index.js"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/example.js"></script>
+      <img src="https://d111111abcdef8.cloudfront.net/logo.png" alt="">
+      <img src="https://stats.g.doubleclick.net/activityi" alt="">
+      <script src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+      <img src="https://www.googleadservices.com/pagead/conversion/123" alt="">
+    `,
+    normalizeSiteCandidate('https://cmp.med.pl/portal-pacjenta/'),
+    [
+      { domain: 'gstatic.com', label: 'gstatic' },
+      { domain: 'googleapis.com', label: 'googleapis' },
+      { domain: 'jsdelivr.net', label: 'jsdelivr' },
+      { domain: 'cloudflare.com', label: 'cloudflare' },
+      { domain: 'cloudfront.net', label: 'cloudfront' },
+      { domain: 'doubleclick.net', label: 'doubleclick' },
+      { domain: 'googlesyndication.com', label: 'googlesyndication' },
+      { domain: 'googleadservices.com', label: 'googleadservices' }
+    ]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores trusted brand on official domain', () => {
+  const findings = analyzePageContent(
+    '<title>PayPal Login</title><main>Verify your PayPal account</main><form><input type="password"></form>',
+    normalizeSiteCandidate('https://paypal.com/signin'),
+    [{ domain: 'paypal.com', label: 'paypal' }]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores trusted service brand on allowed subdomain', () => {
+  const findings = analyzePageContent(
+    `
+      <title>DSADSA LIMITED overview - Find and update company information - GOV.UK</title>
+      <main>Free company information from Companies House.</main>
+      <form id="search" action="/search" method="get" role="search">
+        <label for="site-search-text">Search for a company or officer</label>
+        <input type="search" id="site-search-text" name="q" autocomplete="off">
+      </form>
+    `,
+    normalizeSiteCandidate('https://find-and-update.company-information.service.gov.uk/company/11545706'),
+    [{ domain: 'company-information.service.gov.uk', label: 'company-information' }]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores social trusted brand links without phishing context', () => {
+  const findings = analyzePageContent(
+    `
+      <main>
+        <a href="https://www.facebook.com/example">Facebook</a>
+        <a href="https://www.linkedin.com/company/example">LinkedIn</a>
+      </main>
+      <form data-cookieman-form>
+        <input type="hidden" name="__RequestVerificationToken" value="abc">
+        <p>Token zabezpieczający przed fałszerstwem, który identyfikuje i weryfikuje informacje.</p>
+      </form>
+    `,
+    normalizeSiteCandidate('https://public-institution.example'),
+    [
+      { domain: 'facebook.com', label: 'facebook' },
+      { domain: 'linkedin.com', label: 'linkedin' }
+    ]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent detects urgent phishing language', () => {
+  const findings = analyzePageContent(
+    '<main>Pilne: konto zablokowane. Potwierdź dane, aby przywrócić dostęp.</main>',
+    normalizeSiteCandidate('https://example.com'),
+    []
+  )
+
+  assert(findings.some((finding) => finding.id === 'content-urgent-language'))
+})
+
+test('analyzePageContent ignores generic security wording without pressure', () => {
+  const findings = analyzePageContent(
+    '<main>Bezpieczeństwa aplikacji, infrastruktura, dobre praktyki i audyty.</main>',
+    normalizeSiteCandidate('https://portfolio.example'),
+    []
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-urgent-language'))
+})
+
+test('analyzePageContent detects hidden iframe and cross-domain iframe', () => {
+  const hidden = analyzePageContent(
+    '<iframe src="https://example.com/a" width="0" height="0"></iframe>',
+    normalizeSiteCandidate('https://example.com'),
+    []
+  )
+  const crossDomain = analyzePageContent(
+    '<iframe src="https://other.example/a"></iframe>',
+    normalizeSiteCandidate('https://example.com'),
+    []
+  )
+
+  assert(hidden.some((finding) => finding.id === 'content-suspicious-iframe'))
+  assert(crossDomain.some((finding) => finding.id === 'content-suspicious-iframe'))
+})
+
+test('analyzePageContent ignores visible iframes from the same registrable domain', () => {
+  const findings = analyzePageContent(
+    '<iframe src="https://widget.example.com/search" title="Wyszukiwarka"></iframe>',
+    normalizeSiteCandidate('https://www.example.com'),
+    []
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-suspicious-iframe'))
+})
+
+test('analyzePageContent ignores hidden Google Tag Manager telemetry iframe', () => {
+  const findings = analyzePageContent(
+    '<iframe src="https://www.googletagmanager.com/ns.html?id=GTM-123" height="0" width="0" style="display:none;visibility:hidden"></iframe>',
+    normalizeSiteCandidate('https://basketball.example'),
+    []
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-suspicious-iframe'))
+})
+
+test('analyzePageContent detects risky download links', () => {
+  const findings = analyzePageContent(
+    '<a href="/download/security-update.exe">Pobierz aktualizację</a>',
+    normalizeSiteCandidate('https://example.com'),
+    []
+  )
+
+  assert(findings.some((finding) => finding.id === 'content-download-risk'))
+})
+
+test('analyzePageContent ignores normal application JavaScript bundles', () => {
+  const findings = analyzePageContent(
+    '<script src="/_next/static/chunks/app.js" async></script>',
+    normalizeSiteCandidate('https://portfolio.example'),
+    []
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-download-risk'))
+})
+
+test('analyzePageContent ignores JavaScript command queue properties', () => {
+  const findings = analyzePageContent(
+    '<script>window.googletag = window.googletag || {}; window.googletag.cmd = window.googletag.cmd || []; window.Yieldbird.cmd = window.Yieldbird.cmd || [];</script>',
+    normalizeSiteCandidate('https://tekstowo.example'),
+    []
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-download-risk'))
+})
+
+test('analyzePageContent ignores portfolio technology brand mentions without phishing context', () => {
+  const findings = analyzePageContent(
+    '<main>Pracuję z GitHub, React, Next, LinkedIn, TypeScript i Node. Bezpieczeństwa aplikacji.</main><script src="/_next/static/chunks/app.js"></script>',
+    normalizeSiteCandidate('https://p4tkry.pl'),
+    [
+      { domain: 'github.com', label: 'github' },
+      { domain: 'react.dev', label: 'react' },
+      { domain: 'linkedin.com', label: 'linkedin' },
+      { domain: 'typescriptlang.org', label: 'typescript' }
+    ]
+  )
+
+  assert.deepEqual(findings.map((finding) => finding.id), [])
+})
+
+test('analyzePageContent detects generic threat link catalogs', () => {
+  const findings = analyzePageContent(
+    `
+      <h1>Security Testing Links</h1>
+      <p>Should show a phishing warning: <a href="/s/phishing.html">link</a></p>
+      <p>Should show a malware warning: <a href="/s/malware.html">link</a></p>
+      <p>Should show an unwanted software warning: <a href="/s/unwanted.html">link</a></p>
+      <p>Should show a billing warning: <a href="/s/trick_to_bill.html">link</a></p>
+      <p>Should show a cookie theft warning: <a href="/s/cookie_theft.exe">link</a></p>
+    `,
+    normalizeSiteCandidate('https://security-tests.example'),
+    []
+  )
+
+  assert(findings.some((finding) => finding.id === 'content-threat-link-catalog'))
+})
+
+test('analyzePageContent ignores ordinary security articles mentioning phishing once', () => {
+  const findings = analyzePageContent(
+    `
+      <article>
+        <h1>Jak rozpoznać phishing</h1>
+        <p>Ten poradnik opisuje dobre praktyki bezpieczeństwa i pokazuje,
+        dlaczego warto sprawdzać adres strony przed logowaniem.</p>
+        <a href="/blog/security">Czytaj dalej</a>
+      </article>
+    `,
+    normalizeSiteCandidate('https://blog.example/security'),
+    []
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-threat-link-catalog'))
+})
+
+test('analyzePageContent combines multiple phishing content signals', () => {
+  const findings = analyzePageContent(
+    `
+      <title>PayPal security alert</title>
+      <form action="https://collector.example/submit">
+        <input name="email">
+        <input type="password">
+      </form>
+      <iframe src="https://tracker.example" style="display:none"></iframe>
+      <a href="/verify.zip">Download verification package</a>
+    `,
+    normalizeSiteCandidate('https://secure-paypal-login.example'),
+    [{ domain: 'paypal.com', label: 'paypal' }]
+  )
+
+  assertSameMembers(findings.map((finding) => finding.id), [
+    'content-sensitive-form',
+    'content-cross-origin-form',
+    'content-brand-impersonation',
+    'content-urgent-language',
+    'content-suspicious-iframe',
+    'content-download-risk'
+  ])
+})
+
+test('scenario scoring blocks generic threat link catalogs from content analysis', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://security-tests.example',
+    html: `
+      <p>Should show a phishing warning: <a href="/s/phishing.html">link</a></p>
+      <p>Should show a malware warning: <a href="/s/malware.html">link</a></p>
+      <p>Should show an unwanted software warning: <a href="/s/unwanted.html">link</a></p>
+      <p>Should show a billing warning: <a href="/s/trick_to_bill.html">link</a></p>
+    `
+  })
+
+  assert.equal(result.score, 70)
+  assert.equal(result.decision, 'blocked')
+  assert.deepEqual(result.ruleIds, ['content-threat-link-catalog'])
+})
+
 test('scenario scoring returns allow for normal HTTPS domain', () => {
   const result = getRuleIdsForScenario({
     url: 'https://example.com',
     trustedDomains: ['paypal.com']
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
+test('scenario scoring always allows public gov suffix domains', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://find-and-update.company-information.service.gov.uk/s/phishing.html',
+    trustedDomains: ['company-information.service.gov.uk'],
+    html: '<title>Security alert</title><form><input type="password"></form>'
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
+test('scenario scoring allows login.gov.pl SSO under gov.pl', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://login.gov.pl/login/SingleSignOnService',
+    trustedDomains: ['gov.pl'],
+    html: '<title>Login.gov.pl</title><form><input type="password"></form>'
   })
 
   assert.equal(result.score, 0)
@@ -397,6 +1061,54 @@ test('scenario scoring combines HTTP and IP into blocked score', () => {
   assert.equal(result.score, 90)
   assert.equal(result.decision, 'blocked')
   assert.deepEqual(result.ruleIds, ['insecure-http', 'is-ip'])
+})
+
+test('scenario scoring blocks generic phishing URL patterns', () => {
+  const result = getRuleIdsForScenario({ url: 'https://example.test/s/phishing.html' })
+
+  assert.equal(result.score, 70)
+  assert.equal(result.decision, 'blocked')
+  assert.deepEqual(result.ruleIds, ['url-risk-pattern'])
+})
+
+test('scenario scoring blocks generic malware and unwanted URL patterns', () => {
+  const malware = getRuleIdsForScenario({ url: 'https://cdn.example/files/malware.html' })
+  const unwanted = getRuleIdsForScenario({ url: 'https://cdn.example/files/unwanted.html' })
+
+  assert.equal(malware.score, 70)
+  assert.equal(malware.decision, 'blocked')
+  assert.deepEqual(malware.ruleIds, ['url-risk-pattern'])
+  assert.equal(unwanted.score, 70)
+  assert.equal(unwanted.decision, 'blocked')
+  assert.deepEqual(unwanted.ruleIds, ['url-risk-pattern'])
+})
+
+test('scenario scoring blocks generic login and billing trap URL patterns', () => {
+  const badLogin = getRuleIdsForScenario({ url: 'https://example.test/s/bad_login.html' })
+  const billingTrap = getRuleIdsForScenario({ url: 'https://example.test/s/trick_to_bill.html' })
+
+  assert.equal(badLogin.score, 70)
+  assert.equal(badLogin.decision, 'blocked')
+  assert.deepEqual(badLogin.ruleIds, ['url-risk-pattern'])
+  assert.equal(billingTrap.score, 70)
+  assert.equal(billingTrap.decision, 'blocked')
+  assert.deepEqual(billingTrap.ruleIds, ['url-risk-pattern'])
+})
+
+test('scenario scoring blocks generic dangerous download URL patterns', () => {
+  const result = getRuleIdsForScenario({ url: 'https://downloads.example/security-update.exe' })
+
+  assert.equal(result.score, 70)
+  assert.equal(result.decision, 'blocked')
+  assert.deepEqual(result.ruleIds, ['url-risk-pattern'])
+})
+
+test('scenario scoring does not hardcode a Safe Browsing test host', () => {
+  const result = getRuleIdsForScenario({ url: 'https://testsafebrowsing.appspot.com/' })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
 })
 
 test('scenario scoring catches lookalike trusted domain as warning', () => {
@@ -432,6 +1144,89 @@ test('scenario scoring catches trusted brand in unofficial subdomain as warning'
   assert.deepEqual(result.ruleIds, ['trusted-domain-in-subdomain'])
 })
 
+test('scenario scoring ignores generic trusted service label in subdomain', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://portalpacjenta.cmp.med.pl',
+    trustedDomains: [
+      'portalpacjenta.gov.pl',
+      'portalpacjenta.example.pl',
+      'portalpacjenta.medical.example'
+    ]
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
+test('scenario scoring ignores government service labels on first-party healthcare sites', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://www.luxmed.pl/dla-pacjenta/uslugi?utm_source=google',
+    trustedDomains: ['portalpacjenta.gov.pl'],
+    html: `
+      <header><button>Zaloguj</button></header>
+      <main>
+        <h1>Usługi dla pacjenta</h1>
+        <p>Portal Pacjenta LUX MED umożliwia sprawdzenie wizyt i badań.</p>
+      </main>
+    `
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
+test('scenario scoring ignores platform brands on healthcare portal pages', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://cmp.med.pl/portal-pacjenta/',
+    trustedDomains: ['google.com', 'facebook.com', 'linkedin.com', 'youtube.com'],
+    html: `
+      <header><button>Zaloguj</button></header>
+      <main>Portal Pacjenta</main>
+      <a href="https://play.google.com/store/apps/details?id=example">Google Play</a>
+      <a href="https://www.facebook.com/example">Facebook</a>
+      <a href="https://www.linkedin.com/company/example">LinkedIn</a>
+      <a href="https://www.youtube.com/@example">YouTube</a>
+    `
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
+test('scenario scoring ignores CDN infrastructure brands on healthcare portal pages', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://cmp.med.pl/portal-pacjenta/',
+    trustedDomains: [
+      'gstatic.com',
+      'googleapis.com',
+      'jsdelivr.net',
+      'cloudflare.com',
+      'cloudfront.net',
+      'doubleclick.net',
+      'googlesyndication.com',
+      'googleadservices.com'
+    ],
+    html: `
+      <header><button>Zaloguj</button></header>
+      <script src="https://www.gstatic.com/recaptcha/releases/app.js"></script>
+      <link href="https://fonts.googleapis.com/css2?family=Inter" rel="stylesheet">
+      <script src="https://cdn.jsdelivr.net/npm/example/index.js"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/example.js"></script>
+      <img src="https://d111111abcdef8.cloudfront.net/logo.png" alt="">
+      <img src="https://stats.g.doubleclick.net/activityi" alt="">
+      <script src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+      <img src="https://www.googleadservices.com/pagead/conversion/123" alt="">
+    `
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
 test('scenario scoring does not flag official trusted subdomain as brand-in-subdomain', () => {
   const result = getRuleIdsForScenario({
     url: 'https://secure.paypal.com',
@@ -450,13 +1245,25 @@ test('scenario scoring combines multiple heuristics into blocked decision', () =
     blocklistedDomains: ['fake.xyz']
   })
 
-  assert.equal(result.score, 200)
+  assert.equal(result.score, 100)
   assert.equal(result.decision, 'blocked')
   assert.deepEqual(result.ruleIds, [
     'insecure-http',
     'domain-blocklist',
     'trusted-domain-in-subdomain'
   ])
+})
+
+test('scenario scoring caps reputation score at 100', () => {
+  const result = getRuleIdsForScenario({
+    url: 'http://secure-paypal-login.fake.xyz/s/phishing.exe',
+    trustedDomains: ['paypal.com'],
+    blocklistedDomains: ['fake.xyz']
+  })
+
+  assert.equal(result.score, 100)
+  assert.equal(result.decision, 'blocked')
+  assert(result.ruleIds.length > 2)
 })
 
 test('scenario scoring can use custom rule weights', () => {
@@ -478,7 +1285,7 @@ test('scenario scoring combines non-latin, HTTP and lookalike into blocked decis
     trustedDomains: ['paypal.com']
   })
 
-  assert.equal(result.score, 135)
+  assert.equal(result.score, 100)
   assert.equal(result.decision, 'blocked')
   assert.deepEqual(result.ruleIds, [
     'insecure-http',
@@ -504,6 +1311,41 @@ test('scenario scoring can raise non-latin to warning with custom score', () => 
   assert.equal(result.score, 50)
   assert.equal(result.decision, 'warning')
   assert.deepEqual(result.ruleIds, ['non-latin-script'])
+})
+
+test('scenario scoring analyzes content even when there is no earlier risk signal', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://example.com/login',
+    html: '<form><input type="password"></form>'
+  })
+
+  assert.equal(result.score, 30)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, ['content-sensitive-form'])
+})
+
+test('scenario scoring blocks strong content phishing combination', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://secure-paypal-login.fake.xyz',
+    trustedDomains: ['paypal.com'],
+    html: `
+      <title>PayPal security alert</title>
+      <form action="https://collector.example/submit">
+        <input name="email">
+        <input type="password">
+      </form>
+    `
+  })
+
+  assert.equal(result.score, 100)
+  assert.equal(result.decision, 'blocked')
+  assert.deepEqual(result.ruleIds, [
+    'trusted-domain-in-subdomain',
+    'content-sensitive-form',
+    'content-cross-origin-form',
+    'content-brand-impersonation',
+    'content-urgent-language'
+  ])
 })
 
 async function run(): Promise<void> {

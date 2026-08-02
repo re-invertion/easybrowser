@@ -1,6 +1,24 @@
 /// <reference types="vite/client" />
 
 declare global {
+  type ReputationRuleId =
+    | 'insecure-http'
+    | 'domain-blocklist'
+    | 'non-latin-script'
+    | 'lookalike-trusted-domain'
+    | 'trusted-domain-in-subdomain'
+    | 'is-ip'
+    | 'google-safe-browsing'
+    | 'young-domain-age'
+    | 'url-risk-pattern'
+    | 'content-sensitive-form'
+    | 'content-cross-origin-form'
+    | 'content-brand-impersonation'
+    | 'content-urgent-language'
+    | 'content-suspicious-iframe'
+    | 'content-download-risk'
+    | 'content-threat-link-catalog'
+
   type BrowserState = {
     mode: 'home' | 'browser'
     url: string
@@ -14,6 +32,14 @@ declare global {
     hasCameraAccess: boolean
     isFavorite: boolean
     browserFaviconUrl: string | null
+    reputationStatus: {
+      url: string
+      score: number
+      decision: 'allow' | 'warning' | 'blocked'
+      warningThreshold: number
+      blockedThreshold: number
+      matchedRuleCount: number
+    } | null
     reputationIntervention: {
       url: string
       decision: 'warning' | 'blocked'
@@ -22,15 +48,7 @@ declare global {
       message: string
       canContinue: boolean
       matchedRules: Array<{
-        ruleId:
-          | 'insecure-http'
-          | 'domain-blocklist'
-        | 'non-latin-script'
-        | 'lookalike-trusted-domain'
-        | 'trusted-domain-in-subdomain'
-          | 'is-ip'
-          | 'google-safe-browsing'
-          | 'young-domain-age'
+        ruleId: ReputationRuleId
         matched: boolean
         scoreDelta: number
         severity: 'warning' | 'blocking'
@@ -82,29 +100,8 @@ declare global {
     enabled: boolean
     warningThreshold: number
     blockedThreshold: number
-    disabledRuleIds: Array<
-      | 'insecure-http'
-      | 'domain-blocklist'
-        | 'non-latin-script'
-        | 'lookalike-trusted-domain'
-        | 'trusted-domain-in-subdomain'
-      | 'is-ip'
-      | 'google-safe-browsing'
-      | 'young-domain-age'
-    >
-    ruleWeights: Partial<
-      Record<
-        | 'insecure-http'
-        | 'domain-blocklist'
-        | 'non-latin-script'
-        | 'lookalike-trusted-domain'
-        | 'trusted-domain-in-subdomain'
-        | 'is-ip'
-        | 'google-safe-browsing'
-        | 'young-domain-age',
-        number
-      >
-    >
+    disabledRuleIds: ReputationRuleId[]
+    ruleWeights: Partial<Record<ReputationRuleId, number>>
     youngDomainMaxAgeDays: number
     googleSafeBrowsingApiKeyConfigured: boolean
   }
@@ -114,15 +111,7 @@ declare global {
     score: number
     decision: 'allow' | 'warning' | 'blocked'
     matchedRules: Array<{
-      ruleId:
-        | 'insecure-http'
-        | 'domain-blocklist'
-        | 'non-latin-script'
-        | 'lookalike-trusted-domain'
-        | 'trusted-domain-in-subdomain'
-        | 'is-ip'
-        | 'google-safe-browsing'
-        | 'young-domain-age'
+      ruleId: ReputationRuleId
       matched: boolean
       scoreDelta: number
       severity: 'warning' | 'blocking'
@@ -176,6 +165,33 @@ declare global {
   type CustomTrustedDomain = {
     domain: string
     createdAt: string
+  }
+
+  type SsoProvider = {
+    id: string
+    name: string
+    hostname: string
+    enabled: boolean
+    isDefault: boolean
+    createdAt: string
+    updatedAt: string
+  }
+
+  type SecurityTooltipPayload = {
+    anchor: {
+      left: number
+      right: number
+      bottom: number
+    }
+    label: string
+    description: string
+    detail: string | null
+    color: string
+    score: number | null
+    decision: 'allow' | 'warning' | 'blocked' | null
+    warningThreshold: number | null
+    blockedThreshold: number | null
+    matchedRuleCount: number | null
   }
 
   interface Window {
@@ -237,10 +253,16 @@ declare global {
       getCustomTrustedDomains: () => Promise<CustomTrustedDomain[]>
       addCustomTrustedDomain: (value: string) => Promise<CustomTrustedDomain[]>
       removeCustomTrustedDomain: (domain: string) => Promise<CustomTrustedDomain[]>
+      getSsoProviders: () => Promise<SsoProvider[]>
+      addSsoProvider: (value: string) => Promise<SsoProvider[]>
+      setSsoProviderEnabled: (id: string, enabled: boolean) => Promise<SsoProvider[]>
+      removeSsoProvider: (id: string) => Promise<SsoProvider[]>
       toggleMaximize: () => Promise<void>
       minimizeWindow: () => Promise<void>
       closeWindow: () => Promise<void>
       copyText: (value: string) => Promise<void>
+      showSecurityTooltip: (payload: SecurityTooltipPayload) => Promise<void>
+      hideSecurityTooltip: () => Promise<void>
       setBrowserChromeHeight: (height: number) => Promise<void>
       onBrowserStateChange: (
         callback: (state: BrowserState) => void
