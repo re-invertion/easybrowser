@@ -371,9 +371,7 @@ const DEFAULT_DOWNLOAD_ALLOWED_EXTENSIONS = [
   'webp',
   'svg',
   'pdf',
-  'txt',
-  'doc',
-  'docx'
+  'txt'
 ]
 const GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD = 3
 const SECURITY_EVENT_RETENTION_DAYS = 30
@@ -1493,6 +1491,12 @@ function removeSsoProvider(id: string): SsoProvider[] {
   return saveSsoProviders(currentProviders.filter((entry) => entry.id !== id))
 }
 
+function requireAdminSession(): void {
+  if (!isAdminSessionUnlocked) {
+    throw new Error('Panel administracyjny musi być odblokowany.')
+  }
+}
+
 function loadDownloadAllowedExtensions(): string[] {
   return loadBrowserSettings().downloadAllowedExtensions
 }
@@ -1541,24 +1545,153 @@ function getDownloadFilenameFromItem(item: DownloadItem): string {
   return item.getFilename() || 'pobrany-plik'
 }
 
-function getUniqueDownloadPath(filename: string): string {
-  const downloadsDirectory = app.getPath('downloads')
+function getSafeDownloadFilenameParts(filename: string): { baseName: string; extension: string } {
   const parsedPath = path.parse(filename)
-  const safeBaseName = (parsedPath.name || 'pobrany-plik').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
-  const safeExtension = parsedPath.ext.replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
-  let candidatePath = path.join(downloadsDirectory, `${safeBaseName}${safeExtension}`)
+
+  return {
+    baseName: (parsedPath.name || 'pobrany-plik').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_'),
+    extension: parsedPath.ext.replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+  }
+}
+
+function getUniqueDownloadPathInDirectory(directory: string, filename: string): string {
+  const { baseName, extension } = getSafeDownloadFilenameParts(filename)
+  let candidatePath = path.join(directory, `${baseName}${extension}`)
   let index = 1
 
   while (fs.existsSync(candidatePath)) {
-    candidatePath = path.join(downloadsDirectory, `${safeBaseName} (${index})${safeExtension}`)
+    candidatePath = path.join(directory, `${baseName} (${index})${extension}`)
     index += 1
   }
 
   return candidatePath
 }
 
+function getUniqueDownloadPath(filename: string): string {
+  return getUniqueDownloadPathInDirectory(app.getPath('downloads'), filename)
+}
+
+function getStagedDownloadPath(downloadId: string, filename: string): string {
+  const stagingDirectory = path.join(app.getPath('userData'), 'download-staging')
+  const { baseName, extension } = getSafeDownloadFilenameParts(filename)
+
+  fs.mkdirSync(stagingDirectory, { recursive: true })
+
+  return path.join(stagingDirectory, `${downloadId}-${baseName}${extension}`)
+}
+
 function getDownloadExtension(filename: string): string | null {
   return normalizeDownloadExtension(path.extname(filename))
+}
+
+function bufferStartsWith(buffer: Buffer, signature: number[]): boolean {
+  if (buffer.length < signature.length) {
+    return false
+  }
+
+  return signature.every((value, index) => buffer[index] === value)
+}
+
+function readFileHeader(filePath: string, length = 8192): Buffer {
+  const handle = fs.openSync(filePath, 'r')
+
+  try {
+    const buffer = Buffer.alloc(length)
+    const bytesRead = fs.readSync(handle, buffer, 0, length, 0)
+
+    return buffer.subarray(0, bytesRead)
+  } finally {
+    fs.closeSync(handle)
+  }
+}
+
+function isLikelyTextFile(buffer: Buffer): boolean {
+  if (buffer.includes(0)) {
+    return false
+  }
+
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+  } catch {
+    return false
+  }
+
+  return true
+}
+
+function validateDownloadedFileContent(filePath: string, extension: string): string | null {
+  const header = readFileHeader(filePath)
+
+  switch (extension) {
+    case 'jpg':
+    case 'jpeg':
+      return bufferStartsWith(header, [0xff, 0xd8, 0xff])
+        ? null
+        : 'Zawartość pliku nie wygląda jak obraz JPEG.'
+    case 'png':
+      return bufferStartsWith(header, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+        ? null
+        : 'Zawartość pliku nie wygląda jak obraz PNG.'
+    case 'gif':
+      return header.subarray(0, 6).toString('ascii') === 'GIF87a' ||
+        header.subarray(0, 6).toString('ascii') === 'GIF89a'
+        ? null
+        : 'Zawartość pliku nie wygląda jak obraz GIF.'
+    case 'webp':
+      return header.subarray(0, 4).toString('ascii') === 'RIFF' &&
+        header.subarray(8, 12).toString('ascii') === 'WEBP'
+        ? null
+        : 'Zawartość pliku nie wygląda jak obraz WebP.'
+    case 'pdf':
+      return header.subarray(0, 5).toString('ascii') === '%PDF-'
+        ? null
+        : 'Zawartość pliku nie wygląda jak dokument PDF.'
+    case 'svg': {
+      if (!isLikelyTextFile(header)) {
+        return 'Zawartość pliku SVG nie jest poprawnym tekstem.'
+      }
+
+      const normalizedHeader = header
+        .toString('utf8')
+        .replace(/^\uFEFF/, '')
+        .trimStart()
+        .toLowerCase()
+
+      return normalizedHeader.startsWith('<svg') ||
+        (normalizedHeader.startsWith('<?xml') && normalizedHeader.includes('<svg'))
+        ? null
+        : 'Zawartość pliku nie wygląda jak obraz SVG.'
+    }
+    case 'txt':
+      return isLikelyTextFile(header) ? null : 'Zawartość pliku nie wygląda jak plik tekstowy.'
+    case 'doc':
+      return bufferStartsWith(header, [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+        ? null
+        : 'Zawartość pliku nie wygląda jak dokument Word.'
+    case 'docx':
+      try {
+        const zip = new AdmZip(filePath)
+        const hasWordDocument = zip
+          .getEntries()
+          .some((entry) => entry.entryName === 'word/document.xml')
+
+        return hasWordDocument ? null : 'Zawartość pliku nie wygląda jak dokument Word.'
+      } catch {
+        return 'Zawartość pliku nie wygląda jak dokument Word.'
+      }
+    default:
+      return null
+  }
+}
+
+function removeFileIfExists(filePath: string): void {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath)
+    }
+  } catch {
+    // Best effort cleanup only.
+  }
 }
 
 function upsertSessionDownload(entry: SessionDownloadEntry): void {
@@ -1642,17 +1775,19 @@ function handleSessionDownload(item: DownloadItem): void {
     return
   }
 
-  item.setSavePath(getUniqueDownloadPath(filename))
+  const stagedPath = getStagedDownloadPath(downloadId, filename)
+  let completedFilePath: string | null = null
+
+  item.setSavePath(stagedPath)
 
   const buildEntry = (status: DownloadEntryStatus, error: string | null = null): SessionDownloadEntry => {
     const now = new Date().toISOString()
-    const savePath = item.getSavePath()
 
     return {
       id: downloadId,
-      filename: getDownloadFilenameFromItem(item),
+      filename,
       url: item.getURL(),
-      filePath: savePath || null,
+      filePath: status === 'completed' ? completedFilePath : null,
       extension,
       status,
       receivedBytes: item.getReceivedBytes(),
@@ -1673,17 +1808,35 @@ function handleSessionDownload(item: DownloadItem): void {
   })
 
   item.once('done', (_event, state) => {
-    const nextStatus: DownloadEntryStatus =
-      state === 'completed' ? 'completed' : state === 'cancelled' ? 'cancelled' : 'interrupted'
-    const error =
-      nextStatus === 'completed'
-        ? null
-        : nextStatus === 'cancelled'
-          ? 'Pobieranie anulowane.'
-          : 'Pobieranie zostało przerwane.'
+    if (state !== 'completed') {
+      removeFileIfExists(stagedPath)
+      upsertSessionDownload(
+        buildEntry(
+          state === 'cancelled' ? 'cancelled' : 'interrupted',
+          state === 'cancelled' ? 'Pobieranie anulowane.' : 'Pobieranie zostało przerwane.'
+        )
+      )
+      return
+    }
 
-    const nextEntry = buildEntry(nextStatus, error)
-    upsertSessionDownload(nextEntry)
+    try {
+      const validationError = validateDownloadedFileContent(stagedPath, extension)
+
+      if (validationError) {
+        removeFileIfExists(stagedPath)
+        upsertSessionDownload(buildEntry('blocked', validationError))
+        return
+      }
+
+      completedFilePath = getUniqueDownloadPath(filename)
+      fs.renameSync(stagedPath, completedFilePath)
+      upsertSessionDownload(buildEntry('completed'))
+    } catch {
+      removeFileIfExists(stagedPath)
+      upsertSessionDownload(
+        buildEntry('interrupted', 'Nie udało się bezpiecznie zapisać pobranego pliku.')
+      )
+    }
   })
 }
 
@@ -6709,10 +6862,12 @@ ipcMain.handle('downloads:get-allowed-extensions', () => {
 })
 
 ipcMain.handle('downloads:add-allowed-extension', (_event, value: string) => {
+  requireAdminSession()
   return addDownloadAllowedExtension(value)
 })
 
 ipcMain.handle('downloads:remove-allowed-extension', (_event, value: string) => {
+  requireAdminSession()
   return removeDownloadAllowedExtension(value)
 })
 
