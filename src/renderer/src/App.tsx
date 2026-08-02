@@ -4,6 +4,7 @@ import {
   FiCamera,
   FiChevronDown,
   FiChevronUp,
+  FiDownload,
   FiMic,
   FiMoreVertical,
   FiRefreshCw,
@@ -536,6 +537,8 @@ function App() {
   const browserChromeRef = useRef<HTMLElement | null>(null)
   const isEditingAddressRef = useRef(false)
   const previousModeRef = useRef<ViewMode>('home')
+  const downloadsButtonRef = useRef<HTMLButtonElement | null>(null)
+  const previousDownloadsRef = useRef<SessionDownloadEntry[]>([])
   const [mode, setMode] = useState<ViewMode>('home')
   const [users, setUsers] = useState<UserProfile[]>([])
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([])
@@ -558,6 +561,7 @@ function App() {
   const [reputationIntervention, setReputationIntervention] =
     useState<BrowserState['reputationIntervention']>(null)
   const [dnsFailure, setDnsFailure] = useState<BrowserState['dnsFailure']>(null)
+  const [downloads, setDownloads] = useState<SessionDownloadEntry[]>([])
   const [copyNoticeVisible, setCopyNoticeVisible] = useState(false)
   const [isAddingUser, setIsAddingUser] = useState(false)
   const [newUserName, setNewUserName] = useState('')
@@ -587,6 +591,7 @@ function App() {
   const [trustedDomainSources, setTrustedDomainSources] = useState<TrustedDomainSource[]>([])
   const [customTrustedDomains, setCustomTrustedDomains] = useState<CustomTrustedDomain[]>([])
   const [ssoProviders, setSsoProviders] = useState<SsoProvider[]>([])
+  const [downloadAllowedExtensions, setDownloadAllowedExtensions] = useState<string[]>([])
   const [securityEventLogs, setSecurityEventLogs] = useState<SecurityEventLog[]>([])
   const [isLoadingSecurityEventLogs, setIsLoadingSecurityEventLogs] = useState(false)
   const [isSecurityEventsPanelOpen, setIsSecurityEventsPanelOpen] = useState(false)
@@ -605,6 +610,7 @@ function App() {
   const [newDomainBlocklistUrl, setNewDomainBlocklistUrl] = useState('')
   const [newCustomTrustedDomain, setNewCustomTrustedDomain] = useState('')
   const [newSsoProviderHostname, setNewSsoProviderHostname] = useState('')
+  const [newDownloadExtension, setNewDownloadExtension] = useState('')
   const [googleSafeBrowsingApiKeyInput, setGoogleSafeBrowsingApiKeyInput] = useState('')
   const [shouldClearGoogleSafeBrowsingApiKey, setShouldClearGoogleSafeBrowsingApiKey] =
     useState(false)
@@ -721,6 +727,7 @@ function App() {
           nextTrustedDomainSources,
           nextCustomTrustedDomains,
           nextSsoProviders,
+          nextDownloadAllowedExtensions,
           nextSecurityEventLogs
         ] =
           await Promise.all([
@@ -732,6 +739,7 @@ function App() {
           window.easybrowser.getTrustedDomainSources(),
           window.easybrowser.getCustomTrustedDomains(),
           window.easybrowser.getSsoProviders(),
+          window.easybrowser.getDownloadAllowedExtensions(),
           window.easybrowser.getSecurityEventLogs()
         ])
         setUsers(state.users)
@@ -744,6 +752,7 @@ function App() {
         setTrustedDomainSources(nextTrustedDomainSources)
         setCustomTrustedDomains(nextCustomTrustedDomains)
         setSsoProviders(nextSsoProviders)
+        setDownloadAllowedExtensions(nextDownloadAllowedExtensions)
         setSecurityEventLogs(nextSecurityEventLogs)
       } catch (error) {
         setErrorMessage(
@@ -778,6 +787,7 @@ function App() {
       setReputationStatus(state.reputationStatus)
       setReputationIntervention(state.reputationIntervention)
       setDnsFailure(state.dnsFailure)
+      setDownloads(state.downloads)
       setErrorMessage(state.error)
     })
 
@@ -1028,6 +1038,44 @@ function App() {
       setCopyNoticeVisible(false)
     }, 1600)
   }
+
+  const showDownloadsPanel = (element: HTMLElement) => {
+    const rect = element.getBoundingClientRect()
+
+    void window.easybrowser.showDownloadsPanel({
+      anchor: {
+        left: rect.left,
+        right: rect.right,
+        bottom: rect.bottom
+      },
+      downloads
+    })
+  }
+
+  useEffect(() => {
+    const previousDownloads = previousDownloadsRef.current
+    const previousDownloadsById = new Map(
+      previousDownloads.map((download) => [download.id, download])
+    )
+    const shouldOpenDownloadsPanel = downloads.some((download) => {
+      const previousDownload = previousDownloadsById.get(download.id)
+
+      if (!previousDownload) {
+        return true
+      }
+
+      return (
+        previousDownload.status !== download.status &&
+        ['blocked', 'cancelled', 'completed', 'interrupted'].includes(download.status)
+      )
+    })
+
+    previousDownloadsRef.current = downloads
+
+    if (shouldOpenDownloadsPanel && downloadsButtonRef.current) {
+      showDownloadsPanel(downloadsButtonRef.current)
+    }
+  }, [downloads])
 
   const toggleFavorite = async () => {
     try {
@@ -1438,6 +1486,35 @@ function App() {
     }
   }
 
+  const handleAddDownloadAllowedExtension = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    try {
+      const nextExtensions = await window.easybrowser.addDownloadAllowedExtension(
+        newDownloadExtension
+      )
+      setDownloadAllowedExtensions(nextExtensions)
+      setNewDownloadExtension('')
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się dodać rozszerzenia.'
+      )
+    }
+  }
+
+  const handleRemoveDownloadAllowedExtension = async (extension: string) => {
+    try {
+      const nextExtensions = await window.easybrowser.removeDownloadAllowedExtension(extension)
+      setDownloadAllowedExtensions(nextExtensions)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się usunąć rozszerzenia.'
+      )
+    }
+  }
+
   const handleRemoveCustomTrustedDomain = async (domain: string) => {
     try {
       const nextDomains = await window.easybrowser.removeCustomTrustedDomain(domain)
@@ -1745,6 +1822,23 @@ function App() {
 
                     <div className="relative flex shrink-0 items-center gap-1">
                       <SecurityLevelIndicator status={reputationStatus} />
+
+                      <button
+                        ref={downloadsButtonRef}
+                        aria-label="Pobrane pliki"
+                        className="focus-ring relative flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-app-text"
+                        type="button"
+                        onClick={(event) => {
+                          showDownloadsPanel(event.currentTarget)
+                        }}
+                      >
+                        <FiDownload aria-hidden="true" className="h-4 w-4" />
+                        {downloads.length > 0 ? (
+                          <span className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-app-primary px-1 text-[10px] font-bold text-app-primary-text">
+                            {downloads.length}
+                          </span>
+                        ) : null}
+                      </button>
 
                       <button
                         aria-label={
@@ -3430,6 +3524,66 @@ function App() {
                       >
                         {isSavingFilterSettings ? 'Zapisywanie...' : 'Zapisz'}
                       </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="max-w-3xl">
+                        <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          Pobieranie
+                        </p>
+                        <h2 className="mt-2 text-2xl font-bold text-app-text">
+                          Dozwolone rozszerzenia plików
+                        </h2>
+                        <p className="mt-3 text-sm leading-6 text-slate-500">
+                          Przeglądarka pobiera tylko pliki z rozszerzeniami z tej listy. Domyślnie
+                          dozwolone są obrazy, PDF, TXT oraz dokumenty Word.
+                        </p>
+                      </div>
+                    </div>
+
+                    <form
+                      className="mt-5 flex flex-col gap-3 lg:flex-row"
+                      onSubmit={(event) => {
+                        void handleAddDownloadAllowedExtension(event)
+                      }}
+                    >
+                      <input
+                        type="text"
+                        value={newDownloadExtension}
+                        onChange={(event) => setNewDownloadExtension(event.target.value)}
+                        placeholder="np. xlsx albo .xlsx"
+                        className="focus-ring min-w-0 flex-1 rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
+                      />
+                      <button
+                        type="submit"
+                        disabled={newDownloadExtension.trim().length === 0}
+                        className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        Dodaj rozszerzenie
+                      </button>
+                    </form>
+
+                    <div className="mt-5 flex flex-wrap gap-2">
+                      {downloadAllowedExtensions.map((extension) => (
+                        <span
+                          key={extension}
+                          className="inline-flex items-center gap-2 rounded-full border border-app-tile-border bg-slate-50 px-3 py-2 text-sm font-bold text-app-text"
+                        >
+                          .{extension}
+                          <button
+                            type="button"
+                            className="focus-ring flex h-6 w-6 items-center justify-center rounded-full text-slate-500 hover:bg-red-50 hover:text-red-600"
+                            aria-label={`Usuń rozszerzenie ${extension}`}
+                            onClick={() => {
+                              void handleRemoveDownloadAllowedExtension(extension)
+                            }}
+                          >
+                            <FiX aria-hidden="true" className="h-3.5 w-3.5" />
+                          </button>
+                        </span>
+                      ))}
                     </div>
                   </div>
 

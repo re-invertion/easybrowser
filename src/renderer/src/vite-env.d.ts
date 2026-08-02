@@ -60,6 +60,7 @@ declare global {
       url: string
       eventCode: 'no-dns-found'
     } | null
+    downloads: SessionDownloadEntry[]
   }
 
   type UserProfile = {
@@ -177,6 +178,21 @@ declare global {
     updatedAt: string
   }
 
+  type SessionDownloadEntry = {
+    id: string
+    filename: string
+    url: string
+    filePath: string | null
+    extension: string | null
+    status: 'progressing' | 'completed' | 'cancelled' | 'blocked' | 'interrupted'
+    receivedBytes: number
+    totalBytes: number | null
+    error: string | null
+    startedAt: string
+    updatedAt: string
+    completedAt: string | null
+  }
+
   type SecurityTooltipPayload = {
     anchor: {
       left: number
@@ -192,6 +208,15 @@ declare global {
     warningThreshold: number | null
     blockedThreshold: number | null
     matchedRuleCount: number | null
+  }
+
+  type DownloadsPanelPayload = {
+    anchor: {
+      left: number
+      right: number
+      bottom: number
+    }
+    downloads: SessionDownloadEntry[]
   }
 
   interface Window {
@@ -257,6 +282,14 @@ declare global {
       addSsoProvider: (value: string) => Promise<SsoProvider[]>
       setSsoProviderEnabled: (id: string, enabled: boolean) => Promise<SsoProvider[]>
       removeSsoProvider: (id: string) => Promise<SsoProvider[]>
+      getDownloadAllowedExtensions: () => Promise<string[]>
+      addDownloadAllowedExtension: (value: string) => Promise<string[]>
+      removeDownloadAllowedExtension: (value: string) => Promise<string[]>
+      openDownload: (id: string) => Promise<void>
+      showDownloadInFolder: (id: string) => Promise<void>
+      clearSessionDownloads: () => Promise<SessionDownloadEntry[]>
+      showDownloadsPanel: (payload: DownloadsPanelPayload) => Promise<void>
+      hideDownloadsPanel: () => Promise<void>
       toggleMaximize: () => Promise<void>
       minimizeWindow: () => Promise<void>
       closeWindow: () => Promise<void>

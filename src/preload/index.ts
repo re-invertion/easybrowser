@@ -41,6 +41,7 @@ type BrowserState = {
     url: string
     eventCode: 'no-dns-found'
   } | null
+  downloads: SessionDownloadEntry[]
 }
 
 type UserProfile = {
@@ -167,6 +168,20 @@ type SsoProvider = {
   createdAt: string
   updatedAt: string
 }
+type SessionDownloadEntry = {
+  id: string
+  filename: string
+  url: string
+  filePath: string | null
+  extension: string | null
+  status: 'progressing' | 'completed' | 'cancelled' | 'blocked' | 'interrupted'
+  receivedBytes: number
+  totalBytes: number | null
+  error: string | null
+  startedAt: string
+  updatedAt: string
+  completedAt: string | null
+}
 type SecurityTooltipPayload = {
   anchor: {
     left: number
@@ -182,6 +197,14 @@ type SecurityTooltipPayload = {
   warningThreshold: number | null
   blockedThreshold: number | null
   matchedRuleCount: number | null
+}
+type DownloadsPanelPayload = {
+  anchor: {
+    left: number
+    right: number
+    bottom: number
+  }
+  downloads: SessionDownloadEntry[]
 }
 
 contextBridge.exposeInMainWorld('easybrowser', {
@@ -264,6 +287,19 @@ contextBridge.exposeInMainWorld('easybrowser', {
     ipcRenderer.invoke('sso-providers:set-enabled', id, enabled) as Promise<SsoProvider[]>,
   removeSsoProvider: (id: string) =>
     ipcRenderer.invoke('sso-providers:remove', id) as Promise<SsoProvider[]>,
+  getDownloadAllowedExtensions: () =>
+    ipcRenderer.invoke('downloads:get-allowed-extensions') as Promise<string[]>,
+  addDownloadAllowedExtension: (value: string) =>
+    ipcRenderer.invoke('downloads:add-allowed-extension', value) as Promise<string[]>,
+  removeDownloadAllowedExtension: (value: string) =>
+    ipcRenderer.invoke('downloads:remove-allowed-extension', value) as Promise<string[]>,
+  openDownload: (id: string) => ipcRenderer.invoke('downloads:open', id),
+  showDownloadInFolder: (id: string) => ipcRenderer.invoke('downloads:show-in-folder', id),
+  clearSessionDownloads: () =>
+    ipcRenderer.invoke('downloads:clear-session') as Promise<SessionDownloadEntry[]>,
+  showDownloadsPanel: (payload: DownloadsPanelPayload) =>
+    ipcRenderer.invoke('downloads-panel:show', payload),
+  hideDownloadsPanel: () => ipcRenderer.invoke('downloads-panel:hide'),
   toggleMaximize: () => ipcRenderer.invoke('browser:toggle-maximize'),
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),

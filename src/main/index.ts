@@ -6,6 +6,7 @@ import {
   safeStorage,
   session,
   shell,
+  type DownloadItem,
   WebContentsView
 } from 'electron'
 import AdmZip from 'adm-zip'
@@ -151,6 +152,14 @@ type SecurityTooltipPayload = {
   blockedThreshold: number | null
   matchedRuleCount: number | null
 }
+type DownloadsPanelPayload = {
+  anchor: {
+    left: number
+    right: number
+    bottom: number
+  }
+  downloads: SessionDownloadEntry[]
+}
 type ReputationInterventionState = {
   url: string
   decision: Exclude<ReputationDecision, 'allow'>
@@ -242,10 +251,26 @@ type SsoProvider = {
   createdAt: string
   updatedAt: string
 }
+type DownloadEntryStatus = 'progressing' | 'completed' | 'cancelled' | 'blocked' | 'interrupted'
+type SessionDownloadEntry = {
+  id: string
+  filename: string
+  url: string
+  filePath: string | null
+  extension: string | null
+  status: DownloadEntryStatus
+  receivedBytes: number
+  totalBytes: number | null
+  error: string | null
+  startedAt: string
+  updatedAt: string
+  completedAt: string | null
+}
 type BrowserSettings = {
   accessibility: AccessibilitySettings
   adminSecurity: AdminSecurityStore
   domainBlocklistSources: DomainBlocklistSource[]
+  downloadAllowedExtensions: string[]
   googleSafeBrowsingApiKey: string | null
   reputation: ReputationSettings
   ssoProviders: SsoProvider[]
@@ -255,6 +280,8 @@ let mainWindow: BrowserWindow | null = null
 let browserView: WebContentsView | null = null
 let permissionPromptWindow: BrowserWindow | null = null
 let securityTooltipWindow: BrowserWindow | null = null
+let downloadsPanelWindow: BrowserWindow | null = null
+let lastDownloadsPanelPayload: DownloadsPanelPayload | null = null
 let browserMode: BrowserMode = 'home'
 let lastError: string | null = null
 let browserChromeHeight = 122
@@ -267,6 +294,7 @@ let lastReputationStatus: ReputationStatusSnapshot = null
 let continuedWarningNavigationUrl: string | null = null
 let activeSsoNavigationFlow: { providerHostname: string; startedAt: number; updatedAt: number } | null =
   null
+let sessionDownloads: SessionDownloadEntry[] = []
 let userStore: UserStore | null = null
 let userMediaPermissionStore: UserMediaPermissionStore | null = null
 let isAdminSessionUnlocked = false
@@ -279,6 +307,7 @@ let rdapBootstrapCache: RdapBootstrap | null = null
 let sqlJsModulePromise: Promise<SqlJsModule> | null = null
 let appDatabase: SqlJsDatabase | null = null
 let genericTrustedLabelCache: Set<string> | null = null
+const configuredDownloadSessions = new WeakSet<Electron.Session>()
 
 const DEFAULT_USERS: UserProfile[] = []
 
@@ -334,6 +363,18 @@ const GOOGLE_SAFE_BROWSING_NEGATIVE_CACHE_MS = 1000 * 60 * 5
 const TRUSTED_DOMAINS_FETCH_TIMEOUT_MS = 15_000
 const CONTENT_ANALYSIS_FETCH_TIMEOUT_MS = 6_000
 const CONTENT_ANALYSIS_MAX_HTML_CHARS = 500_000
+const DEFAULT_DOWNLOAD_ALLOWED_EXTENSIONS = [
+  'jpg',
+  'jpeg',
+  'png',
+  'gif',
+  'webp',
+  'svg',
+  'pdf',
+  'txt',
+  'doc',
+  'docx'
+]
 const GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD = 3
 const SECURITY_EVENT_RETENTION_DAYS = 30
 const SECURITY_EVENT_RETENTION_MS = SECURITY_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000
@@ -1116,12 +1157,51 @@ function normalizeSsoProviders(value: unknown): SsoProvider[] {
   return normalizedEntries
 }
 
+function normalizeDownloadExtension(value: string): string | null {
+  const normalizedValue = value.trim().toLowerCase().replace(/^\.+/, '')
+
+  if (!/^[a-z0-9]{1,12}$/.test(normalizedValue)) {
+    return null
+  }
+
+  return normalizedValue
+}
+
+function normalizeDownloadAllowedExtensions(value: unknown): string[] {
+  const normalizedExtensions = new Set<string>()
+
+  for (const extension of DEFAULT_DOWNLOAD_ALLOWED_EXTENSIONS) {
+    const normalizedExtension = normalizeDownloadExtension(extension)
+
+    if (normalizedExtension) {
+      normalizedExtensions.add(normalizedExtension)
+    }
+  }
+
+  if (Array.isArray(value)) {
+    for (const rawExtension of value) {
+      if (typeof rawExtension !== 'string') {
+        continue
+      }
+
+      const normalizedExtension = normalizeDownloadExtension(rawExtension)
+
+      if (normalizedExtension) {
+        normalizedExtensions.add(normalizedExtension)
+      }
+    }
+  }
+
+  return Array.from(normalizedExtensions).sort((left, right) => left.localeCompare(right))
+}
+
 function normalizeBrowserSettings(value: unknown): BrowserSettings {
   if (!value || typeof value !== 'object') {
     return {
       accessibility: normalizeAccessibilitySettings(null),
       adminSecurity: normalizeAdminSecurityStore(null),
       domainBlocklistSources: normalizeDomainBlocklistSources(null),
+      downloadAllowedExtensions: normalizeDownloadAllowedExtensions(null),
       googleSafeBrowsingApiKey: null,
       reputation: normalizeReputationSettings(null),
       ssoProviders: normalizeSsoProviders(null)
@@ -1132,6 +1212,7 @@ function normalizeBrowserSettings(value: unknown): BrowserSettings {
     accessibility?: unknown
     adminSecurity?: unknown
     domainBlocklistSources?: unknown
+    downloadAllowedExtensions?: unknown
     googleSafeBrowsingApiKey?: unknown
     reputation?: unknown
     ssoProviders?: unknown
@@ -1141,6 +1222,9 @@ function normalizeBrowserSettings(value: unknown): BrowserSettings {
     accessibility: normalizeAccessibilitySettings(nextValue.accessibility),
     adminSecurity: normalizeAdminSecurityStore(nextValue.adminSecurity),
     domainBlocklistSources: normalizeDomainBlocklistSources(nextValue.domainBlocklistSources),
+    downloadAllowedExtensions: normalizeDownloadAllowedExtensions(
+      nextValue.downloadAllowedExtensions
+    ),
     googleSafeBrowsingApiKey:
       typeof nextValue.googleSafeBrowsingApiKey === 'string' &&
       nextValue.googleSafeBrowsingApiKey.trim().length > 0
@@ -1230,7 +1314,12 @@ function loadBrowserSettings(): BrowserSettings {
         Number(reputationRow[3]) || DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS,
       googleSafeBrowsingApiKeyConfigured: typeof reputationRow[4] === 'string'
     },
-    ssoProviders: getAppSetting(database, 'ssoProviders', normalizeSsoProviders(null))
+    ssoProviders: getAppSetting(database, 'ssoProviders', normalizeSsoProviders(null)),
+    downloadAllowedExtensions: getAppSetting(
+      database,
+      'downloadAllowedExtensions',
+      normalizeDownloadAllowedExtensions(null)
+    )
   })
 }
 
@@ -1301,6 +1390,7 @@ function saveBrowserSettings(value: BrowserSettings): BrowserSettings {
 
   saveDomainBlocklistSourcesToDatabase(database, normalizedValue.domainBlocklistSources)
   setAppSetting(database, 'ssoProviders', normalizedValue.ssoProviders)
+  setAppSetting(database, 'downloadAllowedExtensions', normalizedValue.downloadAllowedExtensions)
   saveTrustedDomainsDatabase(database)
   return loadBrowserSettings()
 }
@@ -1401,6 +1491,200 @@ function removeSsoProvider(id: string): SsoProvider[] {
   }
 
   return saveSsoProviders(currentProviders.filter((entry) => entry.id !== id))
+}
+
+function loadDownloadAllowedExtensions(): string[] {
+  return loadBrowserSettings().downloadAllowedExtensions
+}
+
+function saveDownloadAllowedExtensions(value: string[]): string[] {
+  const nextBrowserSettings = saveBrowserSettings({
+    ...loadBrowserSettings(),
+    downloadAllowedExtensions: normalizeDownloadAllowedExtensions(value)
+  })
+
+  return nextBrowserSettings.downloadAllowedExtensions
+}
+
+function addDownloadAllowedExtension(value: string): string[] {
+  const normalizedExtension = normalizeDownloadExtension(value)
+
+  if (!normalizedExtension) {
+    throw new Error('Podaj poprawne rozszerzenie pliku.')
+  }
+
+  return saveDownloadAllowedExtensions([
+    ...loadDownloadAllowedExtensions(),
+    normalizedExtension
+  ])
+}
+
+function removeDownloadAllowedExtension(value: string): string[] {
+  const normalizedExtension = normalizeDownloadExtension(value)
+
+  if (!normalizedExtension) {
+    throw new Error('Podaj poprawne rozszerzenie pliku.')
+  }
+
+  return saveDownloadAllowedExtensions(
+    loadDownloadAllowedExtensions().filter((extension) => extension !== normalizedExtension)
+  )
+}
+
+function getDownloadFilenameFromItem(item: DownloadItem): string {
+  const savePath = item.getSavePath()
+
+  if (savePath) {
+    return path.basename(savePath)
+  }
+
+  return item.getFilename() || 'pobrany-plik'
+}
+
+function getUniqueDownloadPath(filename: string): string {
+  const downloadsDirectory = app.getPath('downloads')
+  const parsedPath = path.parse(filename)
+  const safeBaseName = (parsedPath.name || 'pobrany-plik').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+  const safeExtension = parsedPath.ext.replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+  let candidatePath = path.join(downloadsDirectory, `${safeBaseName}${safeExtension}`)
+  let index = 1
+
+  while (fs.existsSync(candidatePath)) {
+    candidatePath = path.join(downloadsDirectory, `${safeBaseName} (${index})${safeExtension}`)
+    index += 1
+  }
+
+  return candidatePath
+}
+
+function getDownloadExtension(filename: string): string | null {
+  return normalizeDownloadExtension(path.extname(filename))
+}
+
+function upsertSessionDownload(entry: SessionDownloadEntry): void {
+  const existingIndex = sessionDownloads.findIndex((download) => download.id === entry.id)
+
+  if (existingIndex >= 0) {
+    sessionDownloads = sessionDownloads.map((download) =>
+      download.id === entry.id ? entry : download
+    )
+  } else {
+    sessionDownloads = [entry, ...sessionDownloads].slice(0, 100)
+  }
+
+  if (downloadsPanelWindow && !downloadsPanelWindow.isDestroyed() && lastDownloadsPanelPayload) {
+    showDownloadsPanel({
+      ...lastDownloadsPanelPayload,
+      downloads: sessionDownloads
+    })
+  }
+
+  sendBrowserState()
+}
+
+function openSessionDownload(id: string): void {
+  const entry = sessionDownloads.find((download) => download.id === id)
+
+  if (!entry?.filePath || entry.status !== 'completed') {
+    throw new Error('Ten plik nie jest jeszcze gotowy do otwarcia.')
+  }
+
+  void shell.openPath(entry.filePath)
+}
+
+function showSessionDownloadInFolder(id: string): void {
+  const entry = sessionDownloads.find((download) => download.id === id)
+
+  if (!entry?.filePath) {
+    throw new Error('Nie znaleziono ścieżki pobranego pliku.')
+  }
+
+  shell.showItemInFolder(entry.filePath)
+}
+
+function clearSessionDownloads(): SessionDownloadEntry[] {
+  sessionDownloads = []
+  if (lastDownloadsPanelPayload) {
+    lastDownloadsPanelPayload = {
+      ...lastDownloadsPanelPayload,
+      downloads: sessionDownloads
+    }
+  }
+  sendBrowserState()
+  return sessionDownloads
+}
+
+function handleSessionDownload(item: DownloadItem): void {
+  const downloadId = `download-${randomUUID()}`
+  const startedAt = new Date().toISOString()
+  const filename = getDownloadFilenameFromItem(item)
+  const extension = getDownloadExtension(filename)
+  const allowedExtensions = new Set(loadDownloadAllowedExtensions())
+
+  if (!extension || !allowedExtensions.has(extension)) {
+    item.cancel()
+    upsertSessionDownload({
+      id: downloadId,
+      filename,
+      url: item.getURL(),
+      filePath: null,
+      extension,
+      status: 'blocked',
+      receivedBytes: 0,
+      totalBytes: item.getTotalBytes() > 0 ? item.getTotalBytes() : null,
+      error: extension
+        ? `Rozszerzenie .${extension} nie jest dozwolone.`
+        : 'Plik bez rozpoznanego rozszerzenia nie jest dozwolony.',
+      startedAt,
+      updatedAt: startedAt,
+      completedAt: null
+    })
+    return
+  }
+
+  item.setSavePath(getUniqueDownloadPath(filename))
+
+  const buildEntry = (status: DownloadEntryStatus, error: string | null = null): SessionDownloadEntry => {
+    const now = new Date().toISOString()
+    const savePath = item.getSavePath()
+
+    return {
+      id: downloadId,
+      filename: getDownloadFilenameFromItem(item),
+      url: item.getURL(),
+      filePath: savePath || null,
+      extension,
+      status,
+      receivedBytes: item.getReceivedBytes(),
+      totalBytes: item.getTotalBytes() > 0 ? item.getTotalBytes() : null,
+      error,
+      startedAt,
+      updatedAt: now,
+      completedAt: status === 'completed' ? now : null
+    }
+  }
+
+  upsertSessionDownload(buildEntry('progressing'))
+
+  item.on('updated', (_event, state) => {
+    upsertSessionDownload(
+      buildEntry(state === 'interrupted' ? 'interrupted' : 'progressing')
+    )
+  })
+
+  item.once('done', (_event, state) => {
+    const nextStatus: DownloadEntryStatus =
+      state === 'completed' ? 'completed' : state === 'cancelled' ? 'cancelled' : 'interrupted'
+    const error =
+      nextStatus === 'completed'
+        ? null
+        : nextStatus === 'cancelled'
+          ? 'Pobieranie anulowane.'
+          : 'Pobieranie zostało przerwane.'
+
+    const nextEntry = buildEntry(nextStatus, error)
+    upsertSessionDownload(nextEntry)
+  })
 }
 
 function getDomainBlocklistSourceRows(database: SqlJsDatabase): DomainBlocklistSource[] {
@@ -3167,6 +3451,412 @@ function hideSecurityTooltip(): void {
 
   securityTooltipWindow.close()
   securityTooltipWindow = null
+}
+
+function hideDownloadsPanel(): void {
+  if (!downloadsPanelWindow) {
+    return
+  }
+
+  downloadsPanelWindow.close()
+  downloadsPanelWindow = null
+  lastDownloadsPanelPayload = null
+}
+
+function formatDownloadBytesForPanel(value: number): string {
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`
+  }
+
+  if (value >= 1024) {
+    return `${Math.round(value / 1024)} KB`
+  }
+
+  return `${value} B`
+}
+
+function getDownloadStatusLabelForPanel(status: DownloadEntryStatus): string {
+  switch (status) {
+    case 'completed':
+      return 'Pobrano'
+    case 'blocked':
+      return 'Zablokowano'
+    case 'cancelled':
+      return 'Anulowano'
+    case 'interrupted':
+      return 'Przerwano'
+    default:
+      return 'Pobieranie'
+  }
+}
+
+function getDownloadStatusClassForPanel(status: DownloadEntryStatus): string {
+  switch (status) {
+    case 'completed':
+      return 'completed'
+    case 'blocked':
+    case 'interrupted':
+      return 'danger'
+    case 'cancelled':
+      return 'muted'
+    default:
+      return 'progressing'
+  }
+}
+
+const DOWNLOAD_PANEL_EMPTY_ICON_HTML = `
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+    <path d="M7 10l5 5 5-5"></path>
+    <path d="M12 15V3"></path>
+  </svg>
+`
+const DOWNLOAD_PANEL_FILE_ICON_HTML = `
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+    <path d="M14 2v6h6"></path>
+    <path d="M8 13h8"></path>
+    <path d="M8 17h5"></path>
+  </svg>
+`
+
+function buildDownloadsPanelItemsHtml(downloads: SessionDownloadEntry[]): string {
+  if (downloads.length === 0) {
+    return `
+      <div class="empty">
+        <div class="empty-icon">${DOWNLOAD_PANEL_EMPTY_ICON_HTML}</div>
+        <strong>Brak pobrań w tej sesji</strong>
+        <span>Gdy pobierzesz plik, pojawi się tutaj.</span>
+      </div>
+    `
+  }
+
+  return downloads
+    .map((download) => {
+      const progress =
+        download.totalBytes && download.totalBytes > 0
+          ? Math.min(100, Math.round((download.receivedBytes / download.totalBytes) * 100))
+          : null
+      const sizeText = download.totalBytes
+        ? `${formatDownloadBytesForPanel(download.receivedBytes)} / ${formatDownloadBytesForPanel(
+            download.totalBytes
+          )}`
+        : formatDownloadBytesForPanel(download.receivedBytes)
+      const progressHtml =
+        progress !== null && download.status === 'progressing'
+          ? `<div class="progress"><span style="width:${progress}%"></span></div>`
+          : ''
+      const errorHtml = download.error
+        ? `<p class="error">${escapeHtml(download.error)}</p>`
+        : ''
+      const actionsHtml =
+        download.status === 'completed'
+        ? `
+            <div class="actions">
+              <a href="easybrowser-download://open/${encodeURIComponent(download.id)}" title="Otwórz">Otwórz</a>
+              <a href="easybrowser-download://folder/${encodeURIComponent(download.id)}" title="Pokaż w folderze">Folder</a>
+            </div>
+          `
+          : ''
+
+      return `
+        <section class="item">
+          <div class="icon">${DOWNLOAD_PANEL_FILE_ICON_HTML}</div>
+          <div class="content">
+            <div class="row">
+              <strong title="${escapeHtml(download.filename)}">${escapeHtml(download.filename)}</strong>
+              ${actionsHtml}
+            </div>
+            <div class="meta ${getDownloadStatusClassForPanel(download.status)}">
+              <span>${escapeHtml(getDownloadStatusLabelForPanel(download.status))}</span>
+              <span>•</span>
+              <span>${escapeHtml(sizeText)}</span>
+            </div>
+            ${progressHtml}
+            ${errorHtml}
+          </div>
+        </section>
+      `
+    })
+    .join('')
+}
+
+function showDownloadsPanel(payload: DownloadsPanelPayload): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  lastDownloadsPanelPayload = payload
+
+  const panelWidth = 336
+  const panelHeight = 306
+  const margin = 10
+  const mainBounds = mainWindow.getBounds()
+  const anchorCenter = (payload.anchor.left + payload.anchor.right) / 2
+  const x = Math.max(
+    mainBounds.x + margin,
+    Math.min(
+      mainBounds.x + Math.round(anchorCenter - panelWidth / 2),
+      mainBounds.x + mainBounds.width - panelWidth - margin
+    )
+  )
+  const y = Math.max(
+    mainBounds.y + margin,
+    Math.min(
+      mainBounds.y + Math.round(payload.anchor.bottom + 8),
+      mainBounds.y + mainBounds.height - panelHeight - margin
+    )
+  )
+
+  if (!downloadsPanelWindow || downloadsPanelWindow.isDestroyed()) {
+    downloadsPanelWindow = new BrowserWindow({
+      parent: mainWindow,
+      width: panelWidth,
+      height: panelHeight,
+      x,
+      y,
+      frame: false,
+      transparent: true,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      focusable: true,
+      skipTaskbar: true,
+      show: false,
+      backgroundColor: '#00000000',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true
+      }
+    })
+
+    downloadsPanelWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    downloadsPanelWindow.webContents.on('will-navigate', (event, navigationUrl) => {
+      event.preventDefault()
+
+      try {
+        const parsedUrl = new URL(navigationUrl)
+
+        if (parsedUrl.protocol !== 'easybrowser-download:') {
+          return
+        }
+
+        const id = decodeURIComponent(parsedUrl.pathname.replace(/^\//, ''))
+
+        if (parsedUrl.hostname === 'open') {
+          openSessionDownload(id)
+          return
+        }
+
+        if (parsedUrl.hostname === 'folder') {
+          showSessionDownloadInFolder(id)
+          return
+        }
+
+        if (parsedUrl.hostname === 'clear') {
+          clearSessionDownloads()
+          hideDownloadsPanel()
+        }
+      } catch {
+        // Ignore malformed overlay action URLs.
+      }
+    })
+    downloadsPanelWindow.on('blur', hideDownloadsPanel)
+    downloadsPanelWindow.on('closed', () => {
+      downloadsPanelWindow = null
+    })
+  } else {
+    downloadsPanelWindow.setBounds({ x, y, width: panelWidth, height: panelHeight })
+  }
+
+  const html = `
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <style>
+          * { box-sizing: border-box; }
+          body {
+            margin: 0;
+            padding: 8px;
+            background: transparent;
+            font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: #111827;
+            overflow: hidden;
+          }
+          .card {
+            width: 100%;
+            height: ${panelHeight - 16}px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border: 1px solid #e2e8f0;
+            border-radius: 22px;
+            background: rgba(255, 255, 255, 0.98);
+            box-shadow: 0 18px 48px rgba(15, 23, 42, 0.16);
+          }
+          .head {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 14px;
+            border-bottom: 1px solid #e2e8f0;
+          }
+          .head strong { display: block; font-size: 13px; }
+          .head span { display: block; margin-top: 2px; color: #64748b; font-size: 11px; }
+          .head a {
+            align-self: center;
+            border: 1px solid #e2e8f0;
+            border-radius: 999px;
+            padding: 6px 10px;
+            color: #475569;
+            font-size: 11px;
+            font-weight: 700;
+            text-decoration: none;
+          }
+          .list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+          }
+          .item {
+            display: flex;
+            gap: 9px;
+            border: 1px solid #e2e8f0;
+            border-radius: 14px;
+            background: #f8fafc;
+            padding: 8px 9px;
+          }
+          .item + .item { margin-top: 7px; }
+          .icon {
+            flex: 0 0 auto;
+            width: 28px;
+            height: 28px;
+            display: grid;
+            place-items: center;
+            border-radius: 10px;
+            background: white;
+            color: #475569;
+            font-weight: 800;
+          }
+          .icon svg,
+          .empty-icon svg {
+            width: 14px;
+            height: 14px;
+          }
+          .content { min-width: 0; flex: 1; }
+          .row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+          }
+          .content strong {
+            display: block;
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            font-size: 12px;
+          }
+          .meta {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin-top: 3px;
+            font-size: 10.5px;
+            line-height: 1.35;
+          }
+          .completed { color: #047857; }
+          .danger { color: #b91c1c; }
+          .muted { color: #64748b; }
+          .progressing { color: #0369a1; }
+          .progress {
+            height: 4px;
+            margin-top: 6px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: #e2e8f0;
+          }
+          .progress span {
+            display: block;
+            height: 100%;
+            border-radius: inherit;
+            background: #1e3a8a;
+          }
+          .error {
+            margin: 5px 0 0;
+            color: #dc2626;
+            font-size: 10.5px;
+            line-height: 1.45;
+          }
+          .actions {
+            display: flex;
+            flex: 0 0 auto;
+            gap: 5px;
+          }
+          .actions a {
+            border: 1px solid #e2e8f0;
+            border-radius: 999px;
+            background: white;
+            padding: 4px 7px;
+            color: #334155;
+            font-size: 10.5px;
+            font-weight: 800;
+            text-decoration: none;
+          }
+          .empty {
+            display: grid;
+            min-height: 190px;
+            place-items: center;
+            align-content: center;
+            border: 1px dashed #e2e8f0;
+            border-radius: 16px;
+            background: #f8fafc;
+            padding: 18px;
+            text-align: center;
+          }
+          .empty-icon {
+            width: 32px;
+            height: 32px;
+            display: grid;
+            place-items: center;
+            border-radius: 999px;
+            background: white;
+            color: #94a3b8;
+            font-weight: 900;
+          }
+          .empty strong { margin-top: 10px; font-size: 13px; }
+          .empty span { margin-top: 4px; color: #64748b; font-size: 11px; }
+        </style>
+      </head>
+      <body>
+        <main class="card">
+          <header class="head">
+            <div>
+              <strong>Pobrane</strong>
+              <span>Pliki z tej sesji</span>
+            </div>
+            ${
+              payload.downloads.length > 0
+                ? '<a href="easybrowser-download://clear/session">Wyczyść</a>'
+                : ''
+            }
+          </header>
+          <section class="list">
+            ${buildDownloadsPanelItemsHtml(payload.downloads)}
+          </section>
+        </main>
+      </body>
+    </html>
+  `
+
+  downloadsPanelWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+  downloadsPanelWindow.show()
 }
 
 function showSecurityTooltip(payload: SecurityTooltipPayload): void {
@@ -5154,6 +5844,13 @@ async function requestMediaPermission(
 function configureUserSessionSecurity(partition: string) {
   const targetSession = session.fromPartition(partition)
 
+  if (!configuredDownloadSessions.has(targetSession)) {
+    configuredDownloadSessions.add(targetSession)
+    targetSession.on('will-download', (_event, item) => {
+      handleSessionDownload(item)
+    })
+  }
+
   targetSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
     const requestingUrl = details.requestingUrl || webContents.getURL()
 
@@ -5433,6 +6130,7 @@ function sendBrowserState(): void {
     reputationIntervention: reputationInterventionState,
     dnsFailure: dnsFailureState,
     reputationStatus: dnsFailureState ? null : lastReputationStatus,
+    downloads: sessionDownloads,
   })
 }
 
@@ -5706,8 +6404,10 @@ function createMainWindow(): void {
 
   mainWindow.on('resize', updateBrowserBounds)
   mainWindow.on('resize', hideSecurityTooltip)
+  mainWindow.on('resize', hideDownloadsPanel)
   mainWindow.on('resize', updatePermissionPromptBounds)
   mainWindow.on('move', hideSecurityTooltip)
+  mainWindow.on('move', hideDownloadsPanel)
   mainWindow.on('move', updatePermissionPromptBounds)
   mainWindow.on('maximize', sendBrowserState)
   mainWindow.on('maximize', updatePermissionPromptBounds)
@@ -6002,6 +6702,41 @@ ipcMain.handle('sso-providers:set-enabled', (_event, id: string, enabled: boolea
 
 ipcMain.handle('sso-providers:remove', (_event, id: string) => {
   return removeSsoProvider(id)
+})
+
+ipcMain.handle('downloads:get-allowed-extensions', () => {
+  return loadDownloadAllowedExtensions()
+})
+
+ipcMain.handle('downloads:add-allowed-extension', (_event, value: string) => {
+  return addDownloadAllowedExtension(value)
+})
+
+ipcMain.handle('downloads:remove-allowed-extension', (_event, value: string) => {
+  return removeDownloadAllowedExtension(value)
+})
+
+ipcMain.handle('downloads:open', (_event, id: string) => {
+  openSessionDownload(id)
+})
+
+ipcMain.handle('downloads:show-in-folder', (_event, id: string) => {
+  showSessionDownloadInFolder(id)
+})
+
+ipcMain.handle('downloads:clear-session', () => {
+  return clearSessionDownloads()
+})
+
+ipcMain.handle('downloads-panel:show', (_event, payload: DownloadsPanelPayload) => {
+  showDownloadsPanel({
+    anchor: payload.anchor,
+    downloads: sessionDownloads
+  })
+})
+
+ipcMain.handle('downloads-panel:hide', () => {
+  hideDownloadsPanel()
 })
 
 ipcMain.handle('browser:toggle-maximize', () => {
