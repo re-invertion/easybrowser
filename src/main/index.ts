@@ -233,12 +233,22 @@ type CustomTrustedDomain = {
   domain: string
   createdAt: string
 }
+type SsoProvider = {
+  id: string
+  name: string
+  hostname: string
+  enabled: boolean
+  isDefault: boolean
+  createdAt: string
+  updatedAt: string
+}
 type BrowserSettings = {
   accessibility: AccessibilitySettings
   adminSecurity: AdminSecurityStore
   domainBlocklistSources: DomainBlocklistSource[]
   googleSafeBrowsingApiKey: string | null
   reputation: ReputationSettings
+  ssoProviders: SsoProvider[]
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -255,6 +265,8 @@ let reputationInterventionState: ReputationInterventionState | null = null
 let dnsFailureState: DnsFailureState | null = null
 let lastReputationStatus: ReputationStatusSnapshot = null
 let continuedWarningNavigationUrl: string | null = null
+let activeSsoNavigationFlow: { providerHostname: string; startedAt: number; updatedAt: number } | null =
+  null
 let userStore: UserStore | null = null
 let userMediaPermissionStore: UserMediaPermissionStore | null = null
 let isAdminSessionUnlocked = false
@@ -326,6 +338,7 @@ const GENERIC_TRUSTED_LABEL_DOMAIN_COUNT_THRESHOLD = 3
 const SECURITY_EVENT_RETENTION_DAYS = 30
 const SECURITY_EVENT_RETENTION_MS = SECURITY_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000
 const SECURITY_EVENT_LIST_LIMIT = 500
+const SSO_NAVIGATION_FLOW_TTL_MS = 5 * 60 * 1000
 const DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT = '2026-07-08T00:00:00.000Z'
 const DEFAULT_TRUSTED_DOMAIN_SOURCES: TrustedDomainSource[] = [
   {
@@ -381,6 +394,72 @@ const DEFAULT_DOMAIN_BLOCKLIST_SOURCES: DomainBlocklistSource[] = [
     isDefault: true,
     createdAt: DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT,
     updatedAt: DEFAULT_DOMAIN_BLOCKLIST_CREATED_AT
+  }
+]
+const DEFAULT_SSO_PROVIDER_CREATED_AT = '2026-08-02T00:00:00.000Z'
+const DEFAULT_SSO_PROVIDERS: SsoProvider[] = [
+  {
+    id: 'default-sso-login-gov-pl',
+    name: 'Login.gov.pl',
+    hostname: 'login.gov.pl',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-google-accounts',
+    name: 'Google Accounts',
+    hostname: 'accounts.google.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-microsoft-login',
+    name: 'Microsoft Entra ID',
+    hostname: 'login.microsoftonline.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-apple-id',
+    name: 'Apple ID',
+    hostname: 'appleid.apple.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-facebook',
+    name: 'Facebook Login',
+    hostname: 'www.facebook.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-auth0',
+    name: 'Auth0',
+    hostname: 'auth0.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
+  },
+  {
+    id: 'default-sso-okta',
+    name: 'Okta',
+    hostname: 'okta.com',
+    enabled: true,
+    isDefault: true,
+    createdAt: DEFAULT_SSO_PROVIDER_CREATED_AT,
+    updatedAt: DEFAULT_SSO_PROVIDER_CREATED_AT
   }
 ]
 
@@ -932,6 +1011,111 @@ function normalizeDomainBlocklistSources(value: unknown): DomainBlocklistSource[
   return normalizedEntries
 }
 
+function normalizeSsoProviderHostname(value: string): string | null {
+  const trimmed = value.trim()
+
+  if (trimmed.length === 0) {
+    return null
+  }
+
+  try {
+    const parsedUrl = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`)
+    const normalizedHostname = normalizeHostname(parsedUrl.hostname)
+
+    if (!normalizedHostname || isIP(normalizedHostname) !== 0) {
+      return null
+    }
+
+    return normalizedHostname
+  } catch {
+    return null
+  }
+}
+
+function normalizeSsoProvider(value: unknown, fallback: SsoProvider): SsoProvider {
+  if (!value || typeof value !== 'object') {
+    return fallback
+  }
+
+  const nextValue = value as Partial<SsoProvider>
+  const normalizedHostname =
+    typeof nextValue.hostname === 'string'
+      ? normalizeSsoProviderHostname(nextValue.hostname)
+      : normalizeSsoProviderHostname(fallback.hostname)
+
+  return {
+    id:
+      typeof nextValue.id === 'string' && nextValue.id.trim().length > 0
+        ? nextValue.id.trim()
+        : fallback.id,
+    name:
+      typeof nextValue.name === 'string' && nextValue.name.trim().length > 0
+        ? nextValue.name.trim()
+        : fallback.name,
+    hostname: normalizedHostname ?? fallback.hostname,
+    enabled: typeof nextValue.enabled === 'boolean' ? nextValue.enabled : fallback.enabled,
+    isDefault: typeof nextValue.isDefault === 'boolean' ? nextValue.isDefault : fallback.isDefault,
+    createdAt:
+      typeof nextValue.createdAt === 'string' && nextValue.createdAt.length > 0
+        ? nextValue.createdAt
+        : fallback.createdAt,
+    updatedAt:
+      typeof nextValue.updatedAt === 'string' && nextValue.updatedAt.length > 0
+        ? nextValue.updatedAt
+        : fallback.updatedAt
+  }
+}
+
+function normalizeSsoProviders(value: unknown): SsoProvider[] {
+  const normalizedEntries: SsoProvider[] = []
+  const hostnameToIndex = new Map<string, number>()
+
+  for (const defaultProvider of DEFAULT_SSO_PROVIDERS) {
+    hostnameToIndex.set(defaultProvider.hostname, normalizedEntries.length)
+    normalizedEntries.push({ ...defaultProvider })
+  }
+
+  if (Array.isArray(value)) {
+    for (const rawEntry of value) {
+      const fallbackProvider: SsoProvider = {
+        id: `sso-provider-${randomUUID()}`,
+        name: 'Własny SSO provider',
+        hostname: 'example.com',
+        enabled: true,
+        isDefault: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+      const nextProvider = normalizeSsoProvider(rawEntry, fallbackProvider)
+      const normalizedHostname = normalizeSsoProviderHostname(nextProvider.hostname)
+
+      if (!normalizedHostname) {
+        continue
+      }
+
+      const existingIndex = hostnameToIndex.get(normalizedHostname)
+
+      if (typeof existingIndex === 'number') {
+        const existingProvider = normalizedEntries[existingIndex]
+        normalizedEntries[existingIndex] = {
+          ...existingProvider,
+          enabled: nextProvider.enabled,
+          updatedAt: nextProvider.updatedAt
+        }
+        continue
+      }
+
+      hostnameToIndex.set(normalizedHostname, normalizedEntries.length)
+      normalizedEntries.push({
+        ...nextProvider,
+        hostname: normalizedHostname
+      })
+    }
+  }
+
+  return normalizedEntries
+}
+
 function normalizeBrowserSettings(value: unknown): BrowserSettings {
   if (!value || typeof value !== 'object') {
     return {
@@ -939,7 +1123,8 @@ function normalizeBrowserSettings(value: unknown): BrowserSettings {
       adminSecurity: normalizeAdminSecurityStore(null),
       domainBlocklistSources: normalizeDomainBlocklistSources(null),
       googleSafeBrowsingApiKey: null,
-      reputation: normalizeReputationSettings(null)
+      reputation: normalizeReputationSettings(null),
+      ssoProviders: normalizeSsoProviders(null)
     }
   }
 
@@ -949,6 +1134,7 @@ function normalizeBrowserSettings(value: unknown): BrowserSettings {
     domainBlocklistSources?: unknown
     googleSafeBrowsingApiKey?: unknown
     reputation?: unknown
+    ssoProviders?: unknown
   }
 
   return {
@@ -960,7 +1146,8 @@ function normalizeBrowserSettings(value: unknown): BrowserSettings {
       nextValue.googleSafeBrowsingApiKey.trim().length > 0
         ? nextValue.googleSafeBrowsingApiKey.trim()
         : null,
-    reputation: normalizeReputationSettings(nextValue.reputation)
+    reputation: normalizeReputationSettings(nextValue.reputation),
+    ssoProviders: normalizeSsoProviders(nextValue.ssoProviders)
   }
 }
 
@@ -1042,7 +1229,8 @@ function loadBrowserSettings(): BrowserSettings {
       youngDomainMaxAgeDays:
         Number(reputationRow[3]) || DEFAULT_YOUNG_DOMAIN_MAX_AGE_DAYS,
       googleSafeBrowsingApiKeyConfigured: typeof reputationRow[4] === 'string'
-    }
+    },
+    ssoProviders: getAppSetting(database, 'ssoProviders', normalizeSsoProviders(null))
   })
 }
 
@@ -1112,6 +1300,7 @@ function saveBrowserSettings(value: BrowserSettings): BrowserSettings {
   }
 
   saveDomainBlocklistSourcesToDatabase(database, normalizedValue.domainBlocklistSources)
+  setAppSetting(database, 'ssoProviders', normalizedValue.ssoProviders)
   saveTrustedDomainsDatabase(database)
   return loadBrowserSettings()
 }
@@ -1141,6 +1330,77 @@ function saveDomainBlocklistSources(value: DomainBlocklistSource[]): DomainBlock
   saveDomainBlocklistSourcesToDatabase(database, normalizedSources)
   saveTrustedDomainsDatabase(database)
   return getDomainBlocklistSourceRows(database)
+}
+
+function loadSsoProviders(): SsoProvider[] {
+  return loadBrowserSettings().ssoProviders
+}
+
+function saveSsoProviders(value: SsoProvider[]): SsoProvider[] {
+  const nextBrowserSettings = saveBrowserSettings({
+    ...loadBrowserSettings(),
+    ssoProviders: normalizeSsoProviders(value)
+  })
+
+  return nextBrowserSettings.ssoProviders
+}
+
+function addSsoProvider(value: string): SsoProvider[] {
+  const normalizedHostname = normalizeSsoProviderHostname(value)
+
+  if (!normalizedHostname) {
+    throw new Error('Podaj poprawną domenę providera SSO.')
+  }
+
+  const currentProviders = loadSsoProviders()
+  const existingProvider = currentProviders.find(
+    (provider) => provider.hostname === normalizedHostname
+  )
+
+  if (existingProvider) {
+    return saveSsoProviders(
+      currentProviders.map((provider) =>
+        provider.hostname === normalizedHostname
+          ? { ...provider, enabled: true, updatedAt: new Date().toISOString() }
+          : provider
+      )
+    )
+  }
+
+  const now = new Date().toISOString()
+
+  return saveSsoProviders([
+    ...currentProviders,
+    {
+      id: `sso-provider-${randomUUID()}`,
+      name: normalizedHostname,
+      hostname: normalizedHostname,
+      enabled: true,
+      isDefault: false,
+      createdAt: now,
+      updatedAt: now
+    }
+  ])
+}
+
+function setSsoProviderEnabled(id: string, enabled: boolean): SsoProvider[] {
+  const currentProviders = loadSsoProviders()
+  return saveSsoProviders(
+    currentProviders.map((provider) =>
+      provider.id === id ? { ...provider, enabled, updatedAt: new Date().toISOString() } : provider
+    )
+  )
+}
+
+function removeSsoProvider(id: string): SsoProvider[] {
+  const currentProviders = loadSsoProviders()
+  const provider = currentProviders.find((entry) => entry.id === id)
+
+  if (provider?.isDefault) {
+    throw new Error('Domyślnego providera SSO można wyłączyć, ale nie usunąć.')
+  }
+
+  return saveSsoProviders(currentProviders.filter((entry) => entry.id !== id))
 }
 
 function getDomainBlocklistSourceRows(database: SqlJsDatabase): DomainBlocklistSource[] {
@@ -2193,6 +2453,41 @@ async function isTrustedDomain(hostname: string): Promise<boolean> {
   }
 }
 
+function isTrustedDomainSync(hostname: string): boolean {
+  const normalizedHostname = normalizeHostname(hostname)
+
+  if (!normalizedHostname || isIP(normalizedHostname) !== 0 || !appDatabase) {
+    return false
+  }
+
+  const statement = appDatabase.prepare(
+    `
+      SELECT td.domain
+      FROM trusted_domains td
+      INNER JOIN trusted_sources ts ON ts.id = td.source_id
+      WHERE ts.enabled = 1 AND (td.domain = $hostname OR $hostname LIKE '%.' || td.domain)
+      ORDER BY td.domain = $hostname DESC, length(td.domain) DESC
+    `,
+    {
+      $hostname: normalizedHostname
+    }
+  )
+
+  try {
+    while (statement.step()) {
+      const row = statement.getAsObject() as Record<string, unknown>
+
+      if (isTrustedDomainMatchAllowed(normalizedHostname, String(row.domain))) {
+        return true
+      }
+    }
+
+    return false
+  } finally {
+    statement.free()
+  }
+}
+
 function validateDomainBlocklistSourceUrl(value: string): string {
   const normalizedUrl = normalizeDomainBlocklistSourceUrl(value)
 
@@ -2555,6 +2850,164 @@ function isSafeBrowserUrl(rawUrl: string): boolean {
   } catch {
     return false
   }
+}
+
+function getBlobNavigationOrigin(rawUrl: string): string | null {
+  if (!rawUrl.startsWith('blob:')) {
+    return null
+  }
+
+  const embeddedUrl = rawUrl.slice('blob:'.length)
+
+  try {
+    const parsedUrl = new URL(embeddedUrl)
+
+    if (!ALLOWED_BROWSER_PROTOCOLS.has(parsedUrl.protocol)) {
+      return null
+    }
+
+    return parsedUrl.origin
+  } catch {
+    return null
+  }
+}
+
+function isSameOriginBlobNavigation(navigationUrl: string, currentUrl: string): boolean {
+  const blobOrigin = getBlobNavigationOrigin(navigationUrl)
+
+  if (!blobOrigin || !isSafeBrowserUrl(currentUrl)) {
+    return false
+  }
+
+  try {
+    return new URL(currentUrl).origin === blobOrigin
+  } catch {
+    return false
+  }
+}
+
+function isSafeNavigationFromSameOriginBlob(navigationUrl: string, currentUrl: string): boolean {
+  const currentBlobOrigin = getBlobNavigationOrigin(currentUrl)
+
+  if (!currentBlobOrigin || !isSafeBrowserUrl(navigationUrl)) {
+    return false
+  }
+
+  try {
+    return new URL(navigationUrl).origin === currentBlobOrigin
+  } catch {
+    return false
+  }
+}
+
+function getSsoProviderForHostname(hostname: string): SsoProvider | null {
+  const normalizedHostname = normalizeHostname(hostname)
+
+  if (!normalizedHostname) {
+    return null
+  }
+
+  return (
+    loadSsoProviders().find((provider) => {
+      if (!provider.enabled) {
+        return false
+      }
+
+      return (
+        normalizedHostname === provider.hostname ||
+        normalizedHostname.endsWith(`.${provider.hostname}`)
+      )
+    }) ?? null
+  )
+}
+
+function getSsoProviderForUrl(rawUrl: string): SsoProvider | null {
+  if (!isSafeBrowserUrl(rawUrl)) {
+    return null
+  }
+
+  try {
+    const parsedUrl = new URL(rawUrl)
+    return getSsoProviderForHostname(parsedUrl.hostname)
+  } catch {
+    return null
+  }
+}
+
+function getSsoProviderForBlobNavigation(rawUrl: string): SsoProvider | null {
+  const blobOrigin = getBlobNavigationOrigin(rawUrl)
+
+  if (!blobOrigin) {
+    return null
+  }
+
+  return getSsoProviderForUrl(blobOrigin)
+}
+
+function getActiveSsoNavigationFlow(): typeof activeSsoNavigationFlow {
+  if (!activeSsoNavigationFlow) {
+    return null
+  }
+
+  if (Date.now() - activeSsoNavigationFlow.updatedAt > SSO_NAVIGATION_FLOW_TTL_MS) {
+    activeSsoNavigationFlow = null
+    return null
+  }
+
+  return activeSsoNavigationFlow
+}
+
+function rememberSsoNavigation(providerHostname: string): void {
+  const now = Date.now()
+  const currentFlow = getActiveSsoNavigationFlow()
+  const shouldReuseFlow = currentFlow?.providerHostname === providerHostname
+
+  activeSsoNavigationFlow = {
+    providerHostname,
+    startedAt: shouldReuseFlow ? currentFlow.startedAt : now,
+    updatedAt: now
+  }
+}
+
+function shouldAllowNativeSsoNavigation(
+  navigationUrl: string,
+  currentUrl: string
+): boolean {
+  if (!isSafeBrowserUrl(navigationUrl)) {
+    return false
+  }
+
+  const nextProvider = getSsoProviderForUrl(navigationUrl)
+
+  if (nextProvider) {
+    rememberSsoNavigation(nextProvider.hostname)
+    return true
+  }
+
+  const currentProvider = getSsoProviderForUrl(currentUrl)
+
+  if (currentProvider) {
+    rememberSsoNavigation(currentProvider.hostname)
+    return true
+  }
+
+  const currentBlobProvider = getSsoProviderForBlobNavigation(currentUrl)
+
+  if (currentBlobProvider && getActiveSsoNavigationFlow()) {
+    rememberSsoNavigation(currentBlobProvider.hostname)
+    return true
+  }
+
+  return false
+}
+
+function isTrustedNativeNavigationUrl(rawUrl: string): boolean {
+  if (!isSafeBrowserUrl(rawUrl)) {
+    return false
+  }
+
+  const candidate = normalizeSiteCandidate(rawUrl)
+  return isGovernmentDomainCandidate(candidate) || isTrustedDomainSync(candidate.asciiHostname)
 }
 
 function loadReputationSettings(): ReputationSettings {
@@ -3968,6 +4421,15 @@ async function assessNavigationReputation(rawUrl: string): Promise<ReputationAss
     }
   }
 
+  if (getSsoProviderForUrl(rawUrl)) {
+    return {
+      candidate,
+      score: 0,
+      decision: 'allow',
+      matchedRules: []
+    }
+  }
+
   const rules = [
     {
       id: 'insecure-http' as const,
@@ -4995,9 +5457,36 @@ function wireBrowserView(view: WebContentsView): void {
     }
   }
 
-  view.webContents.setWindowOpenHandler(({ url }: { url: string }) => {
+  view.webContents.setWindowOpenHandler((details) => {
+    const { url, postBody, referrer } = details
+
+    if (isSameOriginBlobNavigation(url, view.webContents.getURL())) {
+      setReputationIntervention(null)
+      setDnsFailure(null)
+      lastError = null
+      allowedBrowserNavigationUrl = url
+      void view.webContents
+        .loadURL(url)
+        .catch((error) => {
+          allowedBrowserNavigationUrl = null
+          lastError =
+            error instanceof Error ? error.message : 'Nie udało się otworzyć strony logowania.'
+          sendBrowserState()
+        })
+        .finally(() => {
+          if (allowedBrowserNavigationUrl === url) {
+            allowedBrowserNavigationUrl = null
+          }
+        })
+      return { action: 'deny' }
+    }
+
     if (isSafeBrowserUrl(url)) {
-      void openExternalUrlIfAllowed(url)
+      void navigateBrowser(url, {
+        httpReferrer: referrer,
+        postData: postBody?.data,
+        extraHeaders: postBody?.contentType ? `content-type: ${postBody.contentType}` : undefined
+      })
     }
 
     return { action: 'deny' }
@@ -5009,9 +5498,13 @@ function wireBrowserView(view: WebContentsView): void {
       return
     }
 
+    const currentUrl = view.webContents.getURL()
+
     if (
-      isSafeBrowserUrl(navigationUrl) &&
-      isGovernmentDomainCandidate(normalizeSiteCandidate(navigationUrl))
+      isSameOriginBlobNavigation(navigationUrl, currentUrl) ||
+      isSafeNavigationFromSameOriginBlob(navigationUrl, currentUrl) ||
+      shouldAllowNativeSsoNavigation(navigationUrl, currentUrl) ||
+      isTrustedNativeNavigationUrl(navigationUrl)
     ) {
       setReputationIntervention(null)
       setDnsFailure(null)
@@ -5142,7 +5635,7 @@ function ensureBrowserView(): WebContentsView {
   return nextBrowserView
 }
 
-async function navigateBrowser(rawValue: string): Promise<void> {
+async function navigateBrowser(rawValue: string, options?: Electron.LoadURLOptions): Promise<void> {
   const view = ensureBrowserView()
   const destination = normalizeAddress(rawValue)
   browserMode = 'browser'
@@ -5159,7 +5652,7 @@ async function navigateBrowser(rawValue: string): Promise<void> {
     setReputationIntervention(null)
     setDnsFailure(null)
     allowedBrowserNavigationUrl = destination
-    await view.webContents.loadURL(destination)
+    await view.webContents.loadURL(destination, options)
     if (allowedBrowserNavigationUrl === destination) {
       allowedBrowserNavigationUrl = null
     }
@@ -5493,6 +5986,22 @@ ipcMain.handle('trusted-domains:add-custom-domain', (_event, value: string) => {
 
 ipcMain.handle('trusted-domains:remove-custom-domain', (_event, domain: string) => {
   return removeCustomTrustedDomain(domain)
+})
+
+ipcMain.handle('sso-providers:get', () => {
+  return loadSsoProviders()
+})
+
+ipcMain.handle('sso-providers:add', (_event, value: string) => {
+  return addSsoProvider(value)
+})
+
+ipcMain.handle('sso-providers:set-enabled', (_event, id: string, enabled: boolean) => {
+  return setSsoProviderEnabled(id, enabled)
+})
+
+ipcMain.handle('sso-providers:remove', (_event, id: string) => {
+  return removeSsoProvider(id)
 })
 
 ipcMain.handle('browser:toggle-maximize', () => {

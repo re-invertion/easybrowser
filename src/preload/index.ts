@@ -158,6 +158,15 @@ type CustomTrustedDomain = {
   domain: string
   createdAt: string
 }
+type SsoProvider = {
+  id: string
+  name: string
+  hostname: string
+  enabled: boolean
+  isDefault: boolean
+  createdAt: string
+  updatedAt: string
+}
 type SecurityTooltipPayload = {
   anchor: {
     left: number
@@ -248,6 +257,13 @@ contextBridge.exposeInMainWorld('easybrowser', {
     ipcRenderer.invoke('trusted-domains:add-custom-domain', value) as Promise<CustomTrustedDomain[]>,
   removeCustomTrustedDomain: (domain: string) =>
     ipcRenderer.invoke('trusted-domains:remove-custom-domain', domain) as Promise<CustomTrustedDomain[]>,
+  getSsoProviders: () => ipcRenderer.invoke('sso-providers:get') as Promise<SsoProvider[]>,
+  addSsoProvider: (value: string) =>
+    ipcRenderer.invoke('sso-providers:add', value) as Promise<SsoProvider[]>,
+  setSsoProviderEnabled: (id: string, enabled: boolean) =>
+    ipcRenderer.invoke('sso-providers:set-enabled', id, enabled) as Promise<SsoProvider[]>,
+  removeSsoProvider: (id: string) =>
+    ipcRenderer.invoke('sso-providers:remove', id) as Promise<SsoProvider[]>,
   toggleMaximize: () => ipcRenderer.invoke('browser:toggle-maximize'),
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),

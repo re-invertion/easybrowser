@@ -535,6 +535,7 @@ function AppBrandMenu({
 function App() {
   const browserChromeRef = useRef<HTMLElement | null>(null)
   const isEditingAddressRef = useRef(false)
+  const previousModeRef = useRef<ViewMode>('home')
   const [mode, setMode] = useState<ViewMode>('home')
   const [users, setUsers] = useState<UserProfile[]>([])
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([])
@@ -585,6 +586,7 @@ function App() {
   const [domainBlocklistSources, setDomainBlocklistSources] = useState<DomainBlocklistSource[]>([])
   const [trustedDomainSources, setTrustedDomainSources] = useState<TrustedDomainSource[]>([])
   const [customTrustedDomains, setCustomTrustedDomains] = useState<CustomTrustedDomain[]>([])
+  const [ssoProviders, setSsoProviders] = useState<SsoProvider[]>([])
   const [securityEventLogs, setSecurityEventLogs] = useState<SecurityEventLog[]>([])
   const [isLoadingSecurityEventLogs, setIsLoadingSecurityEventLogs] = useState(false)
   const [isSecurityEventsPanelOpen, setIsSecurityEventsPanelOpen] = useState(false)
@@ -602,6 +604,7 @@ function App() {
   const [domainBlocklistSourcesDraft, setDomainBlocklistSourcesDraft] = useState<DomainBlocklistSource[]>([])
   const [newDomainBlocklistUrl, setNewDomainBlocklistUrl] = useState('')
   const [newCustomTrustedDomain, setNewCustomTrustedDomain] = useState('')
+  const [newSsoProviderHostname, setNewSsoProviderHostname] = useState('')
   const [googleSafeBrowsingApiKeyInput, setGoogleSafeBrowsingApiKeyInput] = useState('')
   const [shouldClearGoogleSafeBrowsingApiKey, setShouldClearGoogleSafeBrowsingApiKey] =
     useState(false)
@@ -717,6 +720,7 @@ function App() {
           nextDomainBlocklistSources,
           nextTrustedDomainSources,
           nextCustomTrustedDomains,
+          nextSsoProviders,
           nextSecurityEventLogs
         ] =
           await Promise.all([
@@ -727,6 +731,7 @@ function App() {
           window.easybrowser.getDomainBlocklistSources(),
           window.easybrowser.getTrustedDomainSources(),
           window.easybrowser.getCustomTrustedDomains(),
+          window.easybrowser.getSsoProviders(),
           window.easybrowser.getSecurityEventLogs()
         ])
         setUsers(state.users)
@@ -738,6 +743,7 @@ function App() {
         setDomainBlocklistSources(nextDomainBlocklistSources)
         setTrustedDomainSources(nextTrustedDomainSources)
         setCustomTrustedDomains(nextCustomTrustedDomains)
+        setSsoProviders(nextSsoProviders)
         setSecurityEventLogs(nextSecurityEventLogs)
       } catch (error) {
         setErrorMessage(
@@ -749,10 +755,14 @@ function App() {
     }
 
     const unsubscribe = window.easybrowser.onBrowserStateChange((state: BrowserState) => {
+      const previousMode = previousModeRef.current
+      previousModeRef.current = state.mode
       setMode(state.mode)
       setCurrentUrl(state.url || DEFAULT_SEARCH_HOME_URL)
       if (state.mode !== 'browser') {
-        setInputValue('')
+        if (previousMode === 'browser') {
+          setInputValue('')
+        }
       } else if (!isEditingAddressRef.current) {
         setInputValue(state.url || '')
       }
@@ -1385,6 +1395,45 @@ function App() {
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : 'Nie udało się dodać domeny do allowlisty.'
+      )
+    }
+  }
+
+  const handleAddSsoProvider = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    try {
+      const nextProviders = await window.easybrowser.addSsoProvider(newSsoProviderHostname)
+      setSsoProviders(nextProviders)
+      setNewSsoProviderHostname('')
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się dodać providera SSO.'
+      )
+    }
+  }
+
+  const handleToggleSsoProvider = async (id: string, enabled: boolean) => {
+    try {
+      const nextProviders = await window.easybrowser.setSsoProviderEnabled(id, enabled)
+      setSsoProviders(nextProviders)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się zmienić providera SSO.'
+      )
+    }
+  }
+
+  const handleRemoveSsoProvider = async (id: string) => {
+    try {
+      const nextProviders = await window.easybrowser.removeSsoProvider(id)
+      setSsoProviders(nextProviders)
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Nie udało się usunąć providera SSO.'
       )
     }
   }
@@ -3381,6 +3430,97 @@ function App() {
                       >
                         {isSavingFilterSettings ? 'Zapisywanie...' : 'Zapisz'}
                       </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 rounded-[28px] border border-app-tile-border bg-app-tile p-6 shadow-[0_14px_34px_rgba(148,163,184,0.12)]">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="max-w-3xl">
+                        <p className="text-sm font-bold tracking-[0.14em] text-slate-500 uppercase">
+                          SSO
+                        </p>
+                        <h2 className="mt-2 text-2xl font-bold text-app-text">
+                          Znani providerzy logowania
+                        </h2>
+                        <p className="mt-3 text-sm leading-6 text-slate-500">
+                          Te domeny są traktowane jako kontrolowane punkty logowania SSO. Podczas
+                          takiego flow przeglądarka przepuszcza nawigację natywnie, żeby nie zgubić
+                          formularzy POST, tokenów `state` ani artefaktów SAML.
+                        </p>
+                      </div>
+                    </div>
+
+                    <form
+                      className="mt-5 flex flex-col gap-3 lg:flex-row"
+                      onSubmit={(event) => {
+                        void handleAddSsoProvider(event)
+                      }}
+                    >
+                      <input
+                        type="text"
+                        inputMode="url"
+                        value={newSsoProviderHostname}
+                        onChange={(event) => setNewSsoProviderHostname(event.target.value)}
+                        placeholder="login.example.com"
+                        className="focus-ring min-w-0 flex-1 rounded-2xl border border-app-tile-border bg-white px-4 py-3 text-base text-app-text placeholder:text-slate-400 focus:outline-none"
+                      />
+                      <button
+                        type="submit"
+                        disabled={newSsoProviderHostname.trim().length === 0}
+                        className="focus-ring rounded-full bg-app-primary px-5 py-3 text-sm font-bold text-app-primary-text disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        Dodaj providera
+                      </button>
+                    </form>
+
+                    <div className="mt-5 space-y-3">
+                      {ssoProviders.map((provider) => (
+                        <div
+                          key={provider.id}
+                          className="flex flex-col gap-4 rounded-[24px] border border-app-tile-border bg-slate-50/70 p-5 lg:flex-row lg:items-center lg:justify-between"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="text-sm font-bold text-app-text">{provider.name}</p>
+                              {provider.isDefault ? (
+                                <span className="rounded-full bg-slate-200 px-3 py-1 text-[11px] font-bold tracking-[0.12em] text-slate-600 uppercase">
+                                  Domyślny
+                                </span>
+                              ) : null}
+                            </div>
+                            <p className="mt-2 break-all text-sm text-slate-500">
+                              {provider.hostname}
+                            </p>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-3 lg:justify-end">
+                            <label className="app-no-drag flex items-center gap-3 rounded-full border border-app-tile-border bg-white px-4 py-3 text-sm font-bold text-app-text">
+                              <input
+                                type="checkbox"
+                                className="focus-ring h-5 w-5 rounded border border-app-tile-border accent-[#1e3a8a]"
+                                checked={provider.enabled}
+                                onChange={(event) => {
+                                  void handleToggleSsoProvider(provider.id, event.target.checked)
+                                }}
+                              />
+                              <span>{provider.enabled ? 'Włączony' : 'Wyłączony'}</span>
+                            </label>
+
+                            {!provider.isDefault ? (
+                              <button
+                                type="button"
+                                className="focus-ring flex h-11 w-11 items-center justify-center rounded-full border border-red-200 bg-red-50 text-red-600 transition hover:bg-red-100"
+                                aria-label={`Usuń providera SSO ${provider.hostname}`}
+                                onClick={() => {
+                                  void handleRemoveSsoProvider(provider.id)
+                                }}
+                              >
+                                <FiTrash2 aria-hidden="true" className="h-4 w-4" />
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   </div>
 

@@ -167,6 +167,16 @@ declare global {
     createdAt: string
   }
 
+  type SsoProvider = {
+    id: string
+    name: string
+    hostname: string
+    enabled: boolean
+    isDefault: boolean
+    createdAt: string
+    updatedAt: string
+  }
+
   type SecurityTooltipPayload = {
     anchor: {
       left: number
@@ -243,6 +253,10 @@ declare global {
       getCustomTrustedDomains: () => Promise<CustomTrustedDomain[]>
       addCustomTrustedDomain: (value: string) => Promise<CustomTrustedDomain[]>
       removeCustomTrustedDomain: (domain: string) => Promise<CustomTrustedDomain[]>
+      getSsoProviders: () => Promise<SsoProvider[]>
+      addSsoProvider: (value: string) => Promise<SsoProvider[]>
+      setSsoProviderEnabled: (id: string, enabled: boolean) => Promise<SsoProvider[]>
+      removeSsoProvider: (id: string) => Promise<SsoProvider[]>
       toggleMaximize: () => Promise<void>
       minimizeWindow: () => Promise<void>
       closeWindow: () => Promise<void>
