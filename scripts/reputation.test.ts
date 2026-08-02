@@ -721,6 +721,9 @@ test('analyzePageContent ignores generic CDN and infrastructure brands', () => {
       <script src="https://cdn.jsdelivr.net/npm/example/index.js"></script>
       <script src="https://cdnjs.cloudflare.com/ajax/libs/example.js"></script>
       <img src="https://d111111abcdef8.cloudfront.net/logo.png" alt="">
+      <img src="https://stats.g.doubleclick.net/activityi" alt="">
+      <script src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+      <img src="https://www.googleadservices.com/pagead/conversion/123" alt="">
     `,
     normalizeSiteCandidate('https://cmp.med.pl/portal-pacjenta/'),
     [
@@ -728,7 +731,10 @@ test('analyzePageContent ignores generic CDN and infrastructure brands', () => {
       { domain: 'googleapis.com', label: 'googleapis' },
       { domain: 'jsdelivr.net', label: 'jsdelivr' },
       { domain: 'cloudflare.com', label: 'cloudflare' },
-      { domain: 'cloudfront.net', label: 'cloudfront' }
+      { domain: 'cloudfront.net', label: 'cloudfront' },
+      { domain: 'doubleclick.net', label: 'doubleclick' },
+      { domain: 'googlesyndication.com', label: 'googlesyndication' },
+      { domain: 'googleadservices.com', label: 'googleadservices' }
     ]
   )
 
@@ -1158,7 +1164,16 @@ test('scenario scoring ignores platform brands on healthcare portal pages', () =
 test('scenario scoring ignores CDN infrastructure brands on healthcare portal pages', () => {
   const result = getRuleIdsForScenario({
     url: 'https://cmp.med.pl/portal-pacjenta/',
-    trustedDomains: ['gstatic.com', 'googleapis.com', 'jsdelivr.net', 'cloudflare.com', 'cloudfront.net'],
+    trustedDomains: [
+      'gstatic.com',
+      'googleapis.com',
+      'jsdelivr.net',
+      'cloudflare.com',
+      'cloudfront.net',
+      'doubleclick.net',
+      'googlesyndication.com',
+      'googleadservices.com'
+    ],
     html: `
       <header><button>Zaloguj</button></header>
       <script src="https://www.gstatic.com/recaptcha/releases/app.js"></script>
@@ -1166,6 +1181,9 @@ test('scenario scoring ignores CDN infrastructure brands on healthcare portal pa
       <script src="https://cdn.jsdelivr.net/npm/example/index.js"></script>
       <script src="https://cdnjs.cloudflare.com/ajax/libs/example.js"></script>
       <img src="https://d111111abcdef8.cloudfront.net/logo.png" alt="">
+      <img src="https://stats.g.doubleclick.net/activityi" alt="">
+      <script src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+      <img src="https://www.googleadservices.com/pagead/conversion/123" alt="">
     `
   })
 
