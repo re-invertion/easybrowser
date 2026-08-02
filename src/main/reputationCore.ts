@@ -60,6 +60,18 @@ const KNOWN_TELEMETRY_IFRAME_HOSTS = new Set([
   'www.google-analytics.com',
   'google-analytics.com'
 ])
+const GENERIC_CONTENT_BRAND_DOMAINS = new Set([
+  'apple.com',
+  'apps.apple.com',
+  'facebook.com',
+  'google.com',
+  'instagram.com',
+  'linkedin.com',
+  'play.google.com',
+  'twitter.com',
+  'x.com',
+  'youtube.com'
+])
 
 const URGENT_LANGUAGE_PATTERNS = [
   /\bverify (?:your )?(?:account|identity|payment|card|login)\b/i,
@@ -239,16 +251,16 @@ function containsBrand(value: string, brand: ContentTrustedBrand): boolean {
   const domain = brand.domain.toLowerCase()
   const lowerValue = value.toLowerCase()
 
+  if (brand.isGenericLabel || GENERIC_CONTENT_BRAND_DOMAINS.has(domain)) {
+    return false
+  }
+
   if (label.length < 5) {
     return lowerValue.includes(domain)
   }
 
   if (lowerValue.includes(domain)) {
     return true
-  }
-
-  if (brand.isGenericLabel) {
-    return false
   }
 
   return new RegExp(`(^|[^a-z0-9])${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(value)

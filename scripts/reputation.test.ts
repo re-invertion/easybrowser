@@ -690,6 +690,28 @@ test('analyzePageContent ignores government service labels on healthcare portals
   assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
 })
 
+test('analyzePageContent ignores generic social and app-store platform brands', () => {
+  const findings = analyzePageContent(
+    `
+      <header><button>Zaloguj</button></header>
+      <main>Portal Pacjenta</main>
+      <a href="https://play.google.com/store/apps/details?id=example">Google Play</a>
+      <a href="https://www.facebook.com/example">Facebook</a>
+      <a href="https://www.linkedin.com/company/example">LinkedIn</a>
+      <a href="https://www.youtube.com/@example">YouTube</a>
+    `,
+    normalizeSiteCandidate('https://cmp.med.pl/portal-pacjenta/'),
+    [
+      { domain: 'google.com', label: 'google' },
+      { domain: 'facebook.com', label: 'facebook' },
+      { domain: 'linkedin.com', label: 'linkedin' },
+      { domain: 'youtube.com', label: 'youtube' }
+    ]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
 test('analyzePageContent ignores trusted brand on official domain', () => {
   const findings = analyzePageContent(
     '<title>PayPal Login</title><main>Verify your PayPal account</main><form><input type="password"></form>',
@@ -1083,6 +1105,25 @@ test('scenario scoring ignores government service labels on first-party healthca
         <h1>Usługi dla pacjenta</h1>
         <p>Portal Pacjenta LUX MED umożliwia sprawdzenie wizyt i badań.</p>
       </main>
+    `
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
+test('scenario scoring ignores platform brands on healthcare portal pages', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://cmp.med.pl/portal-pacjenta/',
+    trustedDomains: ['google.com', 'facebook.com', 'linkedin.com', 'youtube.com'],
+    html: `
+      <header><button>Zaloguj</button></header>
+      <main>Portal Pacjenta</main>
+      <a href="https://play.google.com/store/apps/details?id=example">Google Play</a>
+      <a href="https://www.facebook.com/example">Facebook</a>
+      <a href="https://www.linkedin.com/company/example">LinkedIn</a>
+      <a href="https://www.youtube.com/@example">YouTube</a>
     `
   })
 
