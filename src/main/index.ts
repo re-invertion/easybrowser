@@ -3124,6 +3124,11 @@ function getRuleScoreDelta(
 async function findLookalikeTrustedDomain(candidateDomain: string): Promise<string | null> {
   const database = await getTrustedDomainsDatabase()
   const metadata = getTrustedDomainLookalikeMetadata(candidateDomain)
+
+  if (metadata.labelLength < 4) {
+    return null
+  }
+
   const exactSkeletonStatement = database.prepare(
     `
       SELECT td.domain
@@ -3132,6 +3137,7 @@ async function findLookalikeTrustedDomain(candidateDomain: string): Promise<stri
       WHERE ts.enabled = 1
         AND td.domain != $domain
         AND td.skeleton = $skeleton
+        AND td.label_length >= 4
       ORDER BY ts.kind = 'manual' DESC, td.rank IS NULL ASC, td.rank ASC
       LIMIT 1
     `,
