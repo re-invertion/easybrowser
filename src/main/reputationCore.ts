@@ -130,6 +130,7 @@ const THREAT_CATALOG_CATEGORY_PATTERNS: Array<[string, RegExp]> = [
 ]
 const THREAT_CATALOG_ACTION_PATTERN =
   /\b(?:should show|should trigger|should return|should create|warning|blocked|malicious|dangerous|harmful)\b/gi
+const BRAND_IMPERSONATION_MANY_BRANDS_THRESHOLD = 5
 const BRAND_IMPERSONATION_CONTEXT_PATTERNS = [
   /type\s*=\s*["']?password/i,
   /\blogin\b/i,
@@ -297,6 +298,41 @@ function containsBrand(value: string, brand: ContentTrustedBrand): boolean {
   return new RegExp(`(^|[^a-z0-9])${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(value)
 }
 
+function isContentBrandIgnored(brand: ContentTrustedBrand): boolean {
+  const domain = brand.domain.toLowerCase()
+
+  return (
+    brand.isGenericLabel === true ||
+    Array.from(GENERIC_CONTENT_BRAND_DOMAINS).some(
+      (genericDomain) => domain === genericDomain || domain.endsWith(`.${genericDomain}`)
+    )
+  )
+}
+
+function isTrustedBrandFirstParty(candidate: NormalizedSiteCandidate, brand: ContentTrustedBrand): boolean {
+  return (
+    brand.domain === candidate.registrableDomain ||
+    brand.domain === candidate.asciiHostname ||
+    isTrustedDomainMatchAllowed(candidate.asciiHostname, brand.domain)
+  )
+}
+
+function getContentBrandMentions(
+  visibleText: string,
+  html: string,
+  candidate: NormalizedSiteCandidate,
+  trustedBrands: ContentTrustedBrand[]
+): Array<ContentTrustedBrand & { hasVisibleMention: boolean; hasAnyMention: boolean }> {
+  return trustedBrands
+    .filter((brand) => !isTrustedBrandFirstParty(candidate, brand) && !isContentBrandIgnored(brand))
+    .map((brand) => ({
+      ...brand,
+      hasVisibleMention: containsBrand(visibleText, brand),
+      hasAnyMention: containsBrand(html, brand)
+    }))
+    .filter((brand) => brand.hasVisibleMention || brand.hasAnyMention)
+}
+
 export function analyzePageContent(
   html: string,
   candidate: NormalizedSiteCandidate,
@@ -305,6 +341,7 @@ export function analyzePageContent(
   const findings: ContentAnalysisFinding[] = []
   const analysisHtml = removeLowRiskConsentBlocks(html)
   const text = stripHtml(analysisHtml)
+  const visibleText = text.slice(0, 250_000)
   const searchable = `${text} ${analysisHtml}`.slice(0, 250_000)
   const forms = extractForms(analysisHtml)
   const sensitiveForm = forms.find((form) => form.hasSensitiveInput)
@@ -335,18 +372,12 @@ export function analyzePageContent(
     })
   }
 
-  const matchedBrand = trustedBrands.find((brand) => {
-    if (
-      brand.domain === candidate.registrableDomain ||
-      brand.domain === candidate.asciiHostname ||
-      isTrustedDomainMatchAllowed(candidate.asciiHostname, brand.domain)
-    ) {
-      return false
-    }
-
-    return containsBrand(searchable, brand)
-  })
-
+  const brandMentions = getContentBrandMentions(visibleText, analysisHtml, candidate, trustedBrands)
+  const visibleBrandMentionCount = brandMentions.filter((brand) => brand.hasVisibleMention).length
+  const hasManyBrandMentions = visibleBrandMentionCount >= BRAND_IMPERSONATION_MANY_BRANDS_THRESHOLD
+  const matchedBrand = hasManyBrandMentions
+    ? null
+    : brandMentions.find((brand) => brand.hasVisibleMention) ?? null
   const hasBrandImpersonationContext =
     Boolean(sensitiveForm) || BRAND_IMPERSONATION_CONTEXT_PATTERNS.some((pattern) => pattern.test(searchable))
 

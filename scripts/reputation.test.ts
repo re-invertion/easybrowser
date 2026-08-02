@@ -664,6 +664,41 @@ test('analyzePageContent detects trusted brand mentioned on unofficial domain', 
   assert(findings.some((finding) => finding.id === 'content-brand-impersonation'))
 })
 
+test('analyzePageContent ignores trusted brands mentioned only in resource URLs', () => {
+  const findings = analyzePageContent(
+    `
+      <main>Zaloguj się do sklepu.</main>
+      <script src="https://www.paypal.com/sdk/js?client-id=abc"></script>
+      <form><input type="password"></form>
+    `,
+    normalizeSiteCandidate('https://shop.example'),
+    [{ domain: 'paypal.com', label: 'paypal' }]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
+test('analyzePageContent ignores pages mentioning many different trusted brands', () => {
+  const findings = analyzePageContent(
+    `
+      <main>
+        Zaloguj się, aby sprawdzić integracje: PayPal, Stripe, Amazon, Microsoft i Netflix.
+      </main>
+      <form><input type="password"></form>
+    `,
+    normalizeSiteCandidate('https://marketplace.example'),
+    [
+      { domain: 'paypal.com', label: 'paypal' },
+      { domain: 'stripe.com', label: 'stripe' },
+      { domain: 'amazon.com', label: 'amazon' },
+      { domain: 'microsoft.com', label: 'microsoft' },
+      { domain: 'netflix.com', label: 'netflix' }
+    ]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
 test('analyzePageContent ignores generic trusted service label mentions', () => {
   const findings = analyzePageContent(
     '<title>Portal pacjenta</title><main>Zaloguj się do portalu pacjenta.</main><form><input type="password"></form>',
