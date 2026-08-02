@@ -712,6 +712,29 @@ test('analyzePageContent ignores generic social and app-store platform brands', 
   assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
 })
 
+test('analyzePageContent ignores generic CDN and infrastructure brands', () => {
+  const findings = analyzePageContent(
+    `
+      <header><button>Zaloguj</button></header>
+      <script src="https://www.gstatic.com/recaptcha/releases/app.js"></script>
+      <link href="https://fonts.googleapis.com/css2?family=Inter" rel="stylesheet">
+      <script src="https://cdn.jsdelivr.net/npm/example/index.js"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/example.js"></script>
+      <img src="https://d111111abcdef8.cloudfront.net/logo.png" alt="">
+    `,
+    normalizeSiteCandidate('https://cmp.med.pl/portal-pacjenta/'),
+    [
+      { domain: 'gstatic.com', label: 'gstatic' },
+      { domain: 'googleapis.com', label: 'googleapis' },
+      { domain: 'jsdelivr.net', label: 'jsdelivr' },
+      { domain: 'cloudflare.com', label: 'cloudflare' },
+      { domain: 'cloudfront.net', label: 'cloudfront' }
+    ]
+  )
+
+  assert(!findings.some((finding) => finding.id === 'content-brand-impersonation'))
+})
+
 test('analyzePageContent ignores trusted brand on official domain', () => {
   const findings = analyzePageContent(
     '<title>PayPal Login</title><main>Verify your PayPal account</main><form><input type="password"></form>',
@@ -1124,6 +1147,25 @@ test('scenario scoring ignores platform brands on healthcare portal pages', () =
       <a href="https://www.facebook.com/example">Facebook</a>
       <a href="https://www.linkedin.com/company/example">LinkedIn</a>
       <a href="https://www.youtube.com/@example">YouTube</a>
+    `
+  })
+
+  assert.equal(result.score, 0)
+  assert.equal(result.decision, 'allow')
+  assert.deepEqual(result.ruleIds, [])
+})
+
+test('scenario scoring ignores CDN infrastructure brands on healthcare portal pages', () => {
+  const result = getRuleIdsForScenario({
+    url: 'https://cmp.med.pl/portal-pacjenta/',
+    trustedDomains: ['gstatic.com', 'googleapis.com', 'jsdelivr.net', 'cloudflare.com', 'cloudfront.net'],
+    html: `
+      <header><button>Zaloguj</button></header>
+      <script src="https://www.gstatic.com/recaptcha/releases/app.js"></script>
+      <link href="https://fonts.googleapis.com/css2?family=Inter" rel="stylesheet">
+      <script src="https://cdn.jsdelivr.net/npm/example/index.js"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/example.js"></script>
+      <img src="https://d111111abcdef8.cloudfront.net/logo.png" alt="">
     `
   })
 

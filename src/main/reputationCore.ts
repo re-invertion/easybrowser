@@ -63,12 +63,30 @@ const KNOWN_TELEMETRY_IFRAME_HOSTS = new Set([
 const GENERIC_CONTENT_BRAND_DOMAINS = new Set([
   'apple.com',
   'apps.apple.com',
+  'akamaihd.net',
+  'bootstrapcdn.com',
+  'cloudflare.com',
+  'cloudflareinsights.com',
+  'cloudfront.net',
+  'cdnjs.cloudflare.com',
   'facebook.com',
+  'fontawesome.com',
+  'fonts.googleapis.com',
+  'fonts.gstatic.com',
   'google.com',
+  'google-analytics.com',
+  'googleapis.com',
+  'googletagmanager.com',
+  'gstatic.com',
   'instagram.com',
+  'jsdelivr.net',
   'linkedin.com',
+  'newrelic.com',
   'play.google.com',
+  'polyfill.io',
+  'sentry.io',
   'twitter.com',
+  'unpkg.com',
   'x.com',
   'youtube.com'
 ])
@@ -251,7 +269,12 @@ function containsBrand(value: string, brand: ContentTrustedBrand): boolean {
   const domain = brand.domain.toLowerCase()
   const lowerValue = value.toLowerCase()
 
-  if (brand.isGenericLabel || GENERIC_CONTENT_BRAND_DOMAINS.has(domain)) {
+  if (
+    brand.isGenericLabel ||
+    Array.from(GENERIC_CONTENT_BRAND_DOMAINS).some(
+      (genericDomain) => domain === genericDomain || domain.endsWith(`.${genericDomain}`)
+    )
+  ) {
     return false
   }
 
