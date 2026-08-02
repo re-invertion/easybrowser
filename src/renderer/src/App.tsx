@@ -53,6 +53,18 @@ function getFavoriteFaviconUrl(rawUrl: string): string | null {
   }
 }
 
+function getSecurityRuleDetail(rule: { ruleId: string; code: string }): string | null {
+  if (rule.ruleId === 'content-brand-impersonation') {
+    const matchedBrand = rule.code.startsWith('content-brand-impersonation:')
+      ? rule.code.slice('content-brand-impersonation:'.length)
+      : ''
+
+    return matchedBrand ? `Marka: ${matchedBrand}` : null
+  }
+
+  return null
+}
+
 function getSecurityLevelIndicatorState(status: BrowserState['reputationStatus']) {
   if (!status) {
     return {
@@ -3653,14 +3665,25 @@ function App() {
                             </p>
                             {entry.matchedRules.length > 0 ? (
                               <div className="mt-2 flex flex-wrap gap-2">
-                                {entry.matchedRules.map((rule) => (
-                                  <span
-                                    key={`${entry.id}-${rule.ruleId}-${rule.code}`}
-                                    className="rounded-full border border-app-tile-border bg-white px-3 py-1 text-xs font-bold text-slate-600"
-                                  >
-                                    {rule.ruleId} +{rule.scoreDelta}
-                                  </span>
-                                ))}
+                                {entry.matchedRules.map((rule) => {
+                                  const ruleDetail = getSecurityRuleDetail(rule)
+
+                                  return (
+                                    <span
+                                      key={`${entry.id}-${rule.ruleId}-${rule.code}`}
+                                      className="rounded-2xl border border-app-tile-border bg-white px-3 py-1.5 text-xs font-bold text-slate-600"
+                                    >
+                                      <span>
+                                        {rule.ruleId} +{rule.scoreDelta}
+                                      </span>
+                                      {ruleDetail ? (
+                                        <span className="mt-0.5 block font-medium text-slate-500">
+                                          {ruleDetail}
+                                        </span>
+                                      ) : null}
+                                    </span>
+                                  )
+                                })}
                               </div>
                             ) : (
                               <p className="mt-2 text-sm text-slate-500">
